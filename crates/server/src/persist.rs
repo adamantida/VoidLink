@@ -20,6 +20,10 @@ pub struct Persisted {
     /// (`RotationLink::to_bytes`), от старых к новым. Пишет `rotate-key`.
     #[serde(default)]
     pub rotations: Vec<String>,
+    /// hex pubkey → адрес оверлея identity (v4: один на все группы). В
+    /// файле сервера v3 поля нет: адреса берутся из групп (`PGroup::members`).
+    #[serde(default)]
+    pub user_ips: BTreeMap<String, u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,7 +34,7 @@ pub struct PGroup {
     #[serde(default)]
     pub private: bool,
     pub key: [u8; 32],
-    /// (hex pubkey, ip)
+    /// (hex pubkey, ip). С v4 ip равен `Persisted::user_ips` этой identity.
     pub members: Vec<(String, u32)>,
     #[serde(default)]
     pub banned: Vec<String>,

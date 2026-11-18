@@ -32,6 +32,7 @@
 //!   чаще раза в `HOUSEKEEPING_EVERY`, а не на каждую команду;
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
+pub mod leases;
 pub mod metrics;
 pub mod persist;
 pub mod signals;
@@ -56,9 +57,10 @@ use rand::Rng;
 use tunnel_protocol as proto;
 
 const GID_MIN: u32 = 1;
-const GID_MAX: u32 = 254; // 100.66.<gid>.0/24
-const HOST_MIN: u32 = 2;
-const HOST_MAX: u32 = 254;
+const GID_MAX: u32 = 254;
+/// Участников в группе не больше (адреса — общие на сервер, см. `leases`;
+/// предел прежний — из /24 группы протокола v3).
+const MAX_MEMBERS: usize = 253;
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(2);
 /// Пауза между LEAVE и повторным JOIN той же identity в ту же группу.
 const REJOIN_COOLDOWN: Duration = Duration::from_secs(3);
@@ -102,7 +104,7 @@ const RETIRED_EPH_TTL: Duration = Duration::from_secs(2 * hs::COOKIE_BUCKET_SECS
 /// Порог, после которого `retired_eph` чистится от истёкших записей.
 const RETIRED_EPH_PURGE: usize = 256;
 
-const UNSUPPORTED_TEXT: &str = "сервер VoidLink v3: обновите клиент";
+const UNSUPPORTED_TEXT: &str = "сервер VoidLink v4: обновите клиент";
 
 // ---------- конфигурация и запуск ----------
 
@@ -239,6 +241,7 @@ impl Server {
                 sessions: HashMap::new(),
                 by_pub: HashMap::new(),
                 groups: loaded.groups,
+                leases: loaded.leases,
                 next_gid: loaded.next_gid,
                 invite_ttl_ms: duration_ms(cfg.limits.invite_ttl),
                 retired_eph: HashMap::new(),
@@ -639,10 +642,8 @@ impl Group {
         }
     }
 
-    fn next_free_ip(&self) -> Option<u32> {
-        (HOST_MIN..=HOST_MAX)
-            .map(|h| gid_subnet_base(self.id) + h)
-            .find(|ip| !self.by_ip.contains_key(ip))
+    fn full(&self) -> bool {
+        self.members.len() >= MAX_MEMBERS
     }
 
     /// Новый случайный ключ, `epoch += 1`. `revoke_prev` — получатели сразу
@@ -667,6 +668,8 @@ struct State {
     /// Индекс: identity → адрес её сессии.
     by_pub: HashMap<[u8; 32], SocketAddr>,
     groups: HashMap<u32, Group>,
+    /// Адрес оверлея identity — один на все её группы.
+    leases: leases::Leases,
     next_gid: u32,
     /// `Limits::invite_ttl` в мс (нужен почти всем спискам приглашений).
     invite_ttl_ms: u64,
@@ -722,6 +725,14 @@ impl State {
 
     fn owned_by(&self, pk: &[u8; 32]) -> usize {
         self.groups.values().filter(|g| g.owner == *pk).count()
+    }
+
+    /// Адрес оверлея identity: закреплённый или новый (`leases`). Пул
+    /// исчерпан — забирается у identity вне групп; `None` — и таких нет.
+    fn ip_for(&mut self, pk: [u8; 32]) -> Option<u32> {
+        let groups = &self.groups;
+        self.leases
+            .get_or_alloc(pk, |k| groups.values().any(|g| g.members.contains_key(k)))
     }
 
     /// Свободный gid: начиная с next_gid по кругу (удалённые gid переиспользуются;
@@ -999,10 +1010,6 @@ fn ip_str(ip: u32) -> String {
     Ipv4Addr::from(ip).to_string()
 }
 
-fn gid_subnet_base(gid: u32) -> u32 {
-    (100 << 24) | (66 << 16) | (gid << 8)
-}
-
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1045,6 +1052,32 @@ struct Loaded {
     links: Vec<RotationLink>,
     next_gid: u32,
     groups: HashMap<u32, Group>,
+    leases: leases::Leases,
+}
+
+/// Адреса identity из `server.json`: сначала `user_ips` (v4), затем — для
+/// identity без него — адрес из её группы с меньшим gid (файл сервера v3,
+/// где у участника в каждой группе свой `100.66.<gid>.<host>`; такие
+/// адреса не пересекаются между identity, и первый же годится в общий).
+fn load_leases(p: &persist::Persisted) -> leases::Leases {
+    let mut l = leases::Leases::default();
+    for (k, ip) in &p.user_ips {
+        if let Ok(pk) = unhex(k) {
+            l.assign(pk, *ip);
+        }
+    }
+    let mut groups: Vec<&persist::PGroup> = p.groups.iter().collect();
+    groups.sort_unstable_by_key(|g| g.id);
+    for g in groups {
+        for (k, ip) in &g.members {
+            if let Ok(pk) = unhex(k)
+                && l.get(&pk).is_none()
+            {
+                l.assign(pk, *ip);
+            }
+        }
+    }
+    l
 }
 
 fn load_state(store: &persist::Store) -> Result<Loaded> {
@@ -1055,6 +1088,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             links: Vec::new(),
             next_gid: GID_MIN,
             groups: HashMap::new(),
+            leases: leases::Leases::default(),
         });
     };
     let links = p
@@ -1063,6 +1097,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         .map(|l| parse_link(l))
         .collect::<Result<Vec<_>>>()?;
     let now = unix_ms();
+    let mut leases = load_leases(&p);
     let mut groups = HashMap::new();
     for g in p.groups {
         let banned = g
@@ -1101,21 +1136,25 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             joins: Bucket::full(),
             left: HashMap::new(),
         };
-        for (k, ip) in g.members {
-            if let Ok(pk) = unhex(&k) {
-                group.insert_member(
-                    pk,
-                    Member {
-                        ip,
-                        name: g
-                            .member_names
-                            .get(&k)
-                            .cloned()
-                            .unwrap_or_else(|| "…".into()),
-                        status: g.member_status.get(&k).cloned().unwrap_or_default(),
-                    },
-                );
-            }
+        for (k, _) in g.members {
+            // Адрес участника — адрес его identity (`load_leases`); не
+            // досталось (адрес из файла занят или вне пула) — новый.
+            let Ok(pk) = unhex(&k) else { continue };
+            let Some(ip) = leases.get_or_alloc(pk, |_| true) else {
+                continue;
+            };
+            group.insert_member(
+                pk,
+                Member {
+                    ip,
+                    name: g
+                        .member_names
+                        .get(&k)
+                        .cloned()
+                        .unwrap_or_else(|| "…".into()),
+                    status: g.member_status.get(&k).cloned().unwrap_or_default(),
+                },
+            );
         }
         // Старый сервер не снимал приглашение при входе в публичную группу и
         // не отказывал в INVITE участнику: такие записи после кика/выхода
@@ -1138,6 +1177,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         links,
         next_gid: p.next_gid.clamp(GID_MIN, GID_MAX),
         groups,
+        leases,
     })
 }
 
@@ -1151,6 +1191,7 @@ fn snapshot(
         x_seed: sh_identity.x_seed,
         next_gid: s.next_gid,
         rotations: links.iter().map(|l| hex(&l.to_bytes())).collect(),
+        user_ips: s.leases.iter().map(|(k, ip)| (hex(k), ip)).collect(),
         groups: s
             .groups
             .values()
@@ -2383,9 +2424,10 @@ fn handle_mutation(
                 owned < max,
                 "лимит групп: во владении уже {owned} (максимум {max})"
             );
+            let ip = s.ip_for(me).context("нет свободных адресов на сервере")?;
             let gid = s
                 .alloc_gid()
-                .context("нет свободных подсетей (все 254 группы заняты)")?;
+                .context("нет свободных номеров групп (все 254 заняты)")?;
             let mut key = [0u8; 32];
             rand::rng().fill_bytes(&mut key);
             let mut g = Group {
@@ -2407,7 +2449,7 @@ fn handle_mutation(
             g.insert_member(
                 me,
                 Member {
-                    ip: gid_subnet_base(gid) + HOST_MIN,
+                    ip,
                     name: uname.clone(),
                     status: ustatus,
                 },
@@ -2451,7 +2493,7 @@ fn handle_mutation(
                 push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
                 return Ok(());
             }
-            let ip = g.next_free_ip().context("группа заполнена")?;
+            anyhow::ensure!(!g.full(), "группа заполнена");
             // Одна identity не крутит LEAVE/JOIN (каждый — ротация) и не
             // выбирает общий лимит входов группы: после выхода — пауза.
             // Вход по приглашению владельца — без паузы.
@@ -2463,6 +2505,9 @@ fn handle_mutation(
             {
                 anyhow::bail!("недавно вышли из группы — повторите вход позже");
             }
+            // Адрес — тот же, что у identity в остальных группах.
+            let ip = s.ip_for(me).context("нет свободных адресов на сервере")?;
+            let g = s.groups.get_mut(&gid).unwrap();
             // Каждый вход — ротация, а выход за ним — ротация с отзывом:
             // чехарда JOIN/LEAVE (новые identity бесплатны) ломала бы трафик
             // группы. Владельцу — без лимита.
@@ -2787,6 +2832,7 @@ mod tests {
             sessions: HashMap::new(),
             by_pub: HashMap::new(),
             groups: HashMap::new(),
+            leases: leases::Leases::default(),
             next_gid: GID_MIN,
             invite_ttl_ms: duration_ms(Limits::default().invite_ttl),
             retired_eph: HashMap::new(),
@@ -3798,15 +3844,15 @@ mod tests {
             recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none(),
             "ответ на 7 байт"
         );
-        // HELLO3 с версией 4 — с текстом; HELLO3 из одного байта версии — без ответа.
+        // HELLO3 клиента v3 — с текстом; HELLO3 из одного байта версии — без ответа.
         let id = proto::Identity::generate();
         let mut h = Hello3::encode(&id, &[5; 32], "x", 0, None);
-        h[0] = 4;
+        h[0] = 3;
         sock.send_to(&proto::plain_frame(ctrl::HELLO3, &h), server.addr)
             .unwrap();
         let (body, _) = recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_secs(3)).unwrap();
         assert!(!hs::dec_unsupported(&body).unwrap().1.is_empty());
-        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &[4]), server.addr)
+        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &[3]), server.addr)
             .unwrap();
         assert!(recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none());
         server.stop();
@@ -4264,8 +4310,8 @@ mod tests {
                         .unwrap()
                 };
                 let addr = v6(0xffff);
+                let ip = s.ip_for(pk).unwrap();
                 let g = s.groups.get_mut(&gid).unwrap();
-                let ip = g.next_free_ip().unwrap();
                 g.insert_member(
                     pk,
                     Member {
@@ -4565,7 +4611,7 @@ mod tests {
         };
         let (owner, member, banned, invited) = ([9u8; 32], [1u8; 32], [2u8; 32], [3u8; 32]);
         let arr = |b: [u8; 32]| serde_json::to_string(&b).unwrap();
-        let ip = gid_subnet_base(5) + HOST_MIN;
+        let ip = u32::from(Ipv4Addr::new(100, 66, 5, 2));
         // Ровно так писал server.json сервер v2.
         let json = format!(
             r#"{{"ed_seed":{},"x_seed":{},"next_gid":6,"groups":[{{"id":5,"name":"old","owner":"{}",
@@ -4944,7 +4990,7 @@ mod tests {
         g.insert_member(
             member,
             Member {
-                ip: gid_subnet_base(5) + HOST_MIN,
+                ip: u32::from(Ipv4Addr::new(100, 66, 5, 2)),
                 name: "b".into(),
                 status: "st".into(),
             },
@@ -5187,6 +5233,103 @@ mod tests {
                 .contains_key(&a.pk)
         });
         server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GROUP_STATE группы `gid` (прочие GROUP_STATE пропускаются).
+    fn state_of(r: &Raw, gid: u32) -> GroupState {
+        loop {
+            let st = r.state();
+            if st.gid == gid {
+                return st;
+            }
+        }
+    }
+
+    #[test]
+    fn адрес_один_на_identity_во_всех_группах_и_после_выхода() {
+        let (server, dir) = test_server("peruserip");
+        let a = Raw::connect(server.addr, "alpha");
+        let one = a.create("one", false);
+        let two = a.create("two", false);
+        assert_eq!(one.my_ip, two.my_ip, "у владельца один адрес на группы");
+        assert!(leases::valid(one.my_ip));
+
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(one.gid));
+        let b1 = state_of(&b, one.gid);
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(two.gid));
+        let b2 = state_of(&b, two.gid);
+        assert_eq!(b1.my_ip, b2.my_ip, "у участника один адрес на группы");
+        assert_ne!(b1.my_ip, one.my_ip);
+        // Участники видят друг друга под тем же адресом в обеих группах.
+        for st in [&b1, &b2] {
+            let a_ip = st.members.iter().find(|m| m.pubkey == a.pk).unwrap().ip;
+            assert_eq!(a_ip, one.my_ip);
+        }
+
+        // Выход из обеих групп и повторный вход — адрес тот же.
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(one.gid));
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(two.gid));
+        b.sync();
+        thread::sleep(REJOIN_COOLDOWN + Duration::from_millis(100));
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(two.gid));
+        assert_eq!(state_of(&b, two.gid).my_ip, b1.my_ip, "адрес закреплён");
+
+        // И переживает перезапуск сервера (server.json).
+        server.stop();
+        let l = load_state(&persist::Store::new(&dir)).unwrap();
+        assert_eq!(l.leases.get(&b.pk), Some(b1.my_ip));
+        assert_eq!(l.leases.get(&a.pk), Some(one.my_ip));
+        assert_eq!(l.groups[&two.gid].members[&b.pk].ip, b1.my_ip);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_json_v3_адреса_групп_сводятся_в_один() {
+        let dir = temp_dir("v3ips");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip = |c: u8, d: u8| u32::from(Ipv4Addr::new(100, 66, c, d));
+        let (x, y) = ([1u8; 32], [2u8; 32]);
+        let arr = |b: [u8; 32]| serde_json::to_string(&b).unwrap();
+        // Сервер v3: у X в группе 5 — 100.66.5.2, в группе 7 — 100.66.7.3;
+        // у Y в группе 7 — 100.66.7.2; поля user_ips нет.
+        let group = |id: u32, members: &[([u8; 32], u32)]| {
+            let m: Vec<String> = members
+                .iter()
+                .map(|(k, a)| format!(r#"["{}",{a}]"#, hex(k)))
+                .collect();
+            format!(
+                r#"{{"id":{id},"name":"g{id}","owner":"{}","key":{},"members":[{}]}}"#,
+                hex(&x),
+                arr([7; 32]),
+                m.join(",")
+            )
+        };
+        let json = format!(
+            r#"{{"ed_seed":{},"x_seed":{},"next_gid":8,"groups":[{},{}]}}"#,
+            arr([1; 32]),
+            arr([2; 32]),
+            group(7, &[(x, ip(7, 3)), (y, ip(7, 2))]),
+            group(5, &[(x, ip(5, 2))]),
+        );
+        std::fs::write(dir.join("server.json"), json).unwrap();
+        let store = persist::Store::new(&dir);
+        let l = load_state(&store).unwrap();
+        // X — адрес из группы с меньшим gid, во всех группах.
+        assert_eq!(l.leases.get(&x), Some(ip(5, 2)));
+        assert_eq!(l.leases.get(&y), Some(ip(7, 2)));
+        assert_eq!(l.groups[&5].members[&x].ip, ip(5, 2));
+        assert_eq!(l.groups[&7].members[&x].ip, ip(5, 2));
+        assert_eq!(l.groups[&7].members[&y].ip, ip(7, 2));
+        assert_eq!(l.groups[&7].by_ip.get(&ip(5, 2)), Some(&x));
+        assert!(!l.groups[&7].by_ip.contains_key(&ip(7, 3)));
+        // Сервер стартует на таком файле и пишет user_ips.
+        let server = start_in(&dir, Limits::default());
+        server.stop();
+        let p = store.load().unwrap().unwrap();
+        assert_eq!(p.user_ips.get(&hex(&x)), Some(&ip(5, 2)));
+        assert_eq!(p.user_ips.get(&hex(&y)), Some(&ip(7, 2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

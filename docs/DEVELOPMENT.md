@@ -94,7 +94,7 @@ graph LR
 
 | Крейт | Путь | Роль | Версия |
 |-------|------|------|--------|
-| `tunnel-protocol` | `crates/protocol` | Проводной формат v3: заголовок, рукопожатие, ctrl-фреймы, FRAG, окно повторов, кодеки payload | 0.2.0 |
+| `tunnel-protocol` | `crates/protocol` | Проводной формат v4: заголовок, рукопожатие, ctrl-фреймы, FRAG, окно повторов, кодеки payload | 0.2.0 |
 | `tunnel-server` | `crates/server` | Сервер: UDP-релей, группы, выдача IP, лимиты, персистентность `server.json`, TCP-фолбэк (`tcp.rs`) | 0.2.0 |
 | `tunnel-client` | `crates/client` | Библиотека (`lib.rs`: движок `engine.rs`, хранилище `store.rs`, DNS `dns.rs`, IPv6 `ipv6.rs`, TCP-канал `tcp_link.rs`, TUN `tun.rs` / `tun_linux.rs` / `tun_macos.rs`, TUI `tui/`) и CLI (`main.rs`) | 0.2.0 |
 | `tunnel-ipc` | `crates/ipc` | Протокол локального IPC между демоном и фронтендами: сообщения (`proto.rs`), кодек (`codec.rs`), клиент (`client.rs`), транспорт (пайп на Windows, Unix-сокет на Unix) | 0.1.0 |
@@ -522,7 +522,7 @@ cargo audit
 
 * [README.md](../README.md) — обзор проекта и запуск
 * [docs/PLAN.md](PLAN.md) — этапы развития и принятые решения
-* [docs/PROTOCOL.md](PROTOCOL.md) — спецификация протокола v3
+* [docs/PROTOCOL.md](PROTOCOL.md) — спецификация протокола v4
 * [docs/SERVER.md](SERVER.md) — сервер: сборка, флаги, systemd
 * [docs/INSTALL.md](INSTALL.md) — установка клиента
 * [docs/IPC.md](IPC.md) — IPC между демоном и фронтендами

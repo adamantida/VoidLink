@@ -96,15 +96,28 @@ fn link_up_args(name: &str, mtu: usize) -> Vec<String> {
     ]
 }
 
-/// Аргументы `ip -4 addr replace <ip>/24 dev <name>` — replace идемпотентен,
-/// повторный вызов с тем же адресом не падает с «File exists».
+/// Аргументы `ip -4 addr flush dev <name>`: снять все IPv4 адаптера
+/// (адреса прошлого запуска или прошлого сервера) перед назначением своего.
+fn flush4_args(name: &str) -> Vec<String> {
+    vec![
+        "-4".into(),
+        "addr".into(),
+        "flush".into(),
+        "dev".into(),
+        name.into(),
+    ]
+}
+
+/// Аргументы `ip -4 addr replace <ip>/16 dev <name>` — replace идемпотентен,
+/// повторный вызов с тем же адресом не падает с «File exists». Маска — вся
+/// сеть оверлея 100.66.0.0/16 (протокол v4: один адрес на все группы).
 fn addr4_args(name: &str, ip: u32) -> Vec<String> {
     let addr = Ipv4Addr::from(ip);
     vec![
         "-4".into(),
         "addr".into(),
         "replace".into(),
-        format!("{addr}/24"),
+        format!("{addr}/{}", tunnel_protocol::OVERLAY_PREFIX_LEN),
         "dev".into(),
         name.into(),
     ]
@@ -147,8 +160,9 @@ pub struct LinuxTun {
     file: File,
     name: String,
     mtu: usize,
-    /// Уже назначенные IPv4-адреса групп (чтобы не дёргать `ip` повторно).
-    used4: Mutex<HashSet<u32>>,
+    /// Назначенный адрес оверлея (один: протокол v4), чтобы не дёргать `ip`
+    /// повторно.
+    used4: Mutex<Option<u32>>,
     used6: Mutex<HashSet<(Ipv6Addr, u8)>>,
 }
 
@@ -179,7 +193,7 @@ impl LinuxTun {
             file,
             name,
             mtu,
-            used4: Mutex::new(HashSet::new()),
+            used4: Mutex::new(None),
             used6: Mutex::new(HashSet::new()),
         })
     }
@@ -216,14 +230,17 @@ impl LinuxTun {
         }
     }
 
-    /// Назначает IPv4-адрес группы с маской /24 (идемпотентно).
+    /// Назначает адрес оверлея с маской /16 вместо прежних (идемпотентно):
+    /// сначала снимает все IPv4 интерфейса — адреса прошлого запуска или
+    /// прошлого сервера.
     pub fn ensure_address(&self, ip: u32) -> Result<()> {
         let mut used = self.used4.lock().unwrap_or_else(|e| e.into_inner());
-        if used.contains(&ip) {
+        if *used == Some(ip) {
             return Ok(());
         }
+        run_ip(&flush4_args(&self.name)).context("снятие прежних IPv4-адресов")?;
         run_ip(&addr4_args(&self.name, ip)).context("назначение IPv4-адреса")?;
-        used.insert(ip);
+        *used = Some(ip);
         Ok(())
     }
 
@@ -393,11 +410,12 @@ mod tests {
             link_up_args("vl0", 1400).join(" "),
             "link set dev vl0 mtu 1400 up"
         );
-        let ip = u32::from(Ipv4Addr::new(10, 66, 3, 7));
+        let ip = u32::from(Ipv4Addr::new(100, 66, 3, 7));
         assert_eq!(
             addr4_args("vl0", ip).join(" "),
-            "-4 addr replace 10.66.3.7/24 dev vl0"
+            "-4 addr replace 100.66.3.7/16 dev vl0"
         );
+        assert_eq!(flush4_args("vl0").join(" "), "-4 addr flush dev vl0");
         let ip6: Ipv6Addr = "fd00:766c::1".parse().unwrap();
         assert_eq!(
             addr6_args("vl0", ip6, 64).join(" "),

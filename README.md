@@ -9,7 +9,7 @@
 
 [![CI](https://github.com/adamantida/VoidLink2/actions/workflows/ci.yml/badge.svg)](https://github.com/adamantida/VoidLink2/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
-![Protocol](https://img.shields.io/badge/протокол-v3-6f42c1)
+![Protocol](https://img.shields.io/badge/протокол-v4-6f42c1)
 ![Platforms](https://img.shields.io/badge/Windows%20·%20Linux%20·%20macOS-0a7bbb)
 ![Tests](https://img.shields.io/badge/тесты-439-2ea44f)
 ![Self-hosted](https://img.shields.io/badge/self--hosted-100%25-111)
@@ -28,7 +28,7 @@
 
 Игры по LAN, общий доступ к домашнему NAS, SSH до машин за NAT, тестовый стенд
 команды — всё это требует, чтобы устройства «видели» друг друга. VoidLink даёт
-каждому участнику постоянный адрес `100.66.<группа>.<хост>` и доставляет между
+каждому участнику постоянный адрес `100.66.<a>.<b>` (один на сервере для всех его групп) и доставляет между
 ними любой IP-трафик: `ping`, TCP, UDP, игровые протоколы.
 
 |  | |
@@ -53,7 +53,7 @@
 - LAN-кандидаты: соседи за одним NAT общаются локально
 - TCP-фолбэк, если UDP режется провайдером
 - DNS-имена пиров: `alpha.vl`, `alpha.mynet.vl`
-- IPv6 внутри туннеля: `fd66:766c:696e:<gid>::<host>`
+- IPv6 внутри туннеля: `fd66:766c:696e::<a>:<b>`
 
 </td>
 <td width="50%" valign="top">
@@ -84,7 +84,7 @@
 
 ```text
 ┌ VoidLink · демон ── сервер 203.0.113.10:5555 ── ● в сети ── ✉ 1 ── ◆ 2 прямых / ◇ 1 через релей ┐
-├ Группы ────────────────┬ Участники «mynet» · 100.66.3.x ───────────────────────────────────────┤
+├ Группы ────────────────┬ Участники «mynet»─────────────────────────────────────────────────────┤
 │ ▸ mynet       pub   4  │  IP            связь      RTT    имя                                  │
 │   home        prv   2  │  100.66.3.2    ◆ прямая   12 мс  alpha     «на связи»                 │
 │ Друзья                 │  100.66.3.3    ◇ релей    48 мс  bravo                                │
@@ -151,7 +151,7 @@ sudo ./target/release/tunnel-client --dir "$HOME/.tunnel-client" tui
 ### 4. Проверка
 
 ```bash
-ping 100.66.<gid>.3      # по адресу
+ping 100.66.<a>.<b>       # по адресу
 ping bravo.vl            # по имени участника
 ```
 
@@ -192,7 +192,7 @@ Workspace на Rust 2024, семь крейтов:
 
 | Крейт | Роль |
 |---|---|
-| [`protocol`](crates/protocol) | Протокол v3: фреймы, рукопожатие, identity, шифрование, окна повторов, фрагментация |
+| [`protocol`](crates/protocol) | Протокол v4: фреймы, рукопожатие, identity, шифрование, окна повторов, фрагментация |
 | [`server`](crates/server) | `tunnel-server`: группы, адреса, приглашения, релей, лимиты, метрики, TCP, персистентность |
 | [`client`](crates/client) | `tunnel-client`: движок, CLI, TUI, TUN для трёх ОС, DNS, IPv6, TCP-путь |
 | [`ipc`](crates/ipc) | Протокол и транспорт фронтенд ↔ демон: named pipe, Unix-сокет, общий замок |
@@ -243,7 +243,7 @@ tunnel-daemon console | service | install | uninstall [--purge]
 | Пользователям | Администраторам | Разработчикам |
 |---|---|---|
 | [Установка](docs/INSTALL.md) | [Сервер](docs/SERVER.md) | [Архитектура](docs/ARCHITECTURE.md) |
-| [Клиент и CLI](docs/CLIENT.md) | [Конфигурация](docs/CONFIG.md) | [Протокол v3](docs/PROTOCOL.md) |
+| [Клиент и CLI](docs/CLIENT.md) | [Конфигурация](docs/CONFIG.md) | [Протокол v4](docs/PROTOCOL.md) |
 | [TUI](docs/TUI.md) | [Служба и трей](docs/DAEMON.md) | [IPC](docs/IPC.md) |
 | [FAQ](docs/FAQ.md) | [Сеть и NAT](docs/NETWORKING.md) | [Разработка](docs/DEVELOPMENT.md) |
 | [Решение проблем](docs/TROUBLESHOOTING.md) | [Безопасность](docs/SECURITY.md) | [Тестирование](docs/TESTING.md) |
@@ -262,13 +262,14 @@ tunnel-daemon console | service | install | uninstall [--purge]
 
 ## 🗺️ Статус
 
-**Готово:** протокол v3, клиент для трёх ОС, служба Windows и трей, TUI и CLI
+**Готово:** протокол v4, клиент для трёх ОС, служба Windows и трей, TUI и CLI
 поверх демона, DNS и IPv6, TCP-фолбэк, метрики сервера.
 
 **В работе:** MSI-установщик, кнопки «Принять/Отклонить» в уведомлениях Windows,
 смена сервера внутри демона без перезапуска. Полный план — [PLAN](docs/PLAN.md).
 
-> Протокол v3 несовместим с v2: сервер и клиенты обновляются вместе.
+> Протокол v4 несовместим с v3: сервер и клиенты обновляются вместе. Один адрес на пользователя
+> заменил отдельные адреса по группам.
 
 ## 🤝 Участие
 

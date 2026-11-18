@@ -838,10 +838,12 @@ impl Drop for Engine {
 pub trait TunDev: Send + Sync {
     /// Вбросить IP-пакет «из сети» в систему.
     fn inject(&self, packet: &[u8]) -> Result<()>;
-    /// Назначить адаптеру IP группы (идемпотентно).
+    /// Назначить адаптеру свой адрес оверлея, маска /16 (протокол v4: один
+    /// адрес на все группы; другой адрес — после смены сервера — заменяет
+    /// прежний). Тот же адрес — ничего не делает.
     fn ensure_address(&self, ip: u32) -> Result<()>;
-    /// Назначить адаптеру IPv6 оверлея `fd66:766c:696e:<gid>::<host>/64`
-    /// для IPv4 группы `v4` (идемпотентно). По умолчанию — ничего.
+    /// Назначить адаптеру IPv6 оверлея (`ipv6::v6_of`, префикс /64) для
+    /// своего IPv4 `v4`, заменив прежний. По умолчанию — ничего.
     fn ensure_address6(&self, _v4: u32) -> Result<()> {
         Ok(())
     }
@@ -856,9 +858,10 @@ pub trait TunDev: Send + Sync {
 struct WintunDev {
     adapter: Arc<wintun::Adapter>,
     session: Arc<wintun::Session>,
-    configured: Mutex<HashSet<u32>>,
-    /// IPv4 групп, для которых IPv6 оверлея уже назначен.
-    configured6: Mutex<HashSet<u32>>,
+    /// Назначенный адаптеру адрес оверлея.
+    configured: Mutex<Option<u32>>,
+    /// IPv4, для которого назначен IPv6 оверлея.
+    configured6: Mutex<Option<u32>>,
     /// Маршрут на 100.66.0.53 уже ставили (успешно или нет — не повторяем).
     dns_route: AtomicBool,
 }
@@ -899,14 +902,21 @@ impl TunDev for WintunDev {
     }
 
     fn ensure_address6(&self, v4: u32) -> Result<()> {
-        if self.configured6.lock().unwrap().contains(&v4) {
+        let mut cur = self.configured6.lock().unwrap();
+        if *cur == Some(v4) {
             return Ok(());
         }
         let idx = self.if_index()?;
         let c = crate::ipv6::cmd_add_windows(idx, v4)
             .ok_or_else(|| anyhow::anyhow!("адрес вне 100.66.0.0/16"))?;
+        // Прежний адрес (другой сервер) — снять; не вышло — не страшно.
+        if let Some(old) = *cur
+            && let Some(d) = crate::ipv6::cmd_del_windows(idx, old)
+        {
+            let _ = run_cmd(d.to_command(), "netsh delete ipv6 address");
+        }
         run_cmd(c.to_command(), "netsh add ipv6 address")?;
-        self.configured6.lock().unwrap().insert(v4);
+        *cur = Some(v4);
         Ok(())
     }
 
@@ -964,7 +974,7 @@ impl TunDev for crate::tun_linux::LinuxTun {
     }
 
     fn ensure_address(&self, ip: u32) -> Result<()> {
-        // `ip addr replace <ip>/24` сам добавляет маршрут на /24 группы.
+        // `ip addr replace <ip>/16` сам добавляет маршрут на 100.66.0.0/16.
         crate::tun_linux::LinuxTun::ensure_address(self, ip)
     }
 }
@@ -977,13 +987,13 @@ impl TunDev for crate::tun_macos::Utun {
     }
 
     fn ensure_address(&self, ip: u32) -> Result<()> {
-        // ifconfig inet + route add на /24 группы.
+        // ifconfig inet + route add на 100.66.0.0/16.
         crate::tun_macos::Utun::ensure_address(self, ip)
     }
 
     fn ensure_dns_route(&self) -> Result<()> {
-        // 100.66.0.53 вне /24 групп: без host-маршрута запросы `.vl` из
-        // /etc/resolver ушли бы мимо utun.
+        // Явный host-маршрут на 100.66.0.53: запросы `.vl` из /etc/resolver
+        // идут в utun, даже пока маршрута на 100.66.0.0/16 ещё нет.
         crate::tun_macos::Utun::ensure_dns_route(self)
     }
 }
@@ -1673,8 +1683,8 @@ pub fn start(
         let dev = Arc::new(WintunDev {
             adapter,
             session: session.clone(),
-            configured: Mutex::new(HashSet::new()),
-            configured6: Mutex::new(HashSet::new()),
+            configured: Mutex::new(None),
+            configured6: Mutex::new(None),
             dns_route: AtomicBool::new(false),
         });
         let dns_on = cfg.lock().unwrap().dns;
@@ -3395,6 +3405,20 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32
     None
 }
 
+/// Через какую группу слать пакет участнику `dst` (протокол v4: адрес один
+/// на все группы, и общих с получателем групп может быть несколько). Любая
+/// из них доставит — порядок лишь выбирает лучшую: с живым прямым каналом,
+/// затем с получателем онлайн, затем меньший gid (стабильный выбор, пока
+/// ничего не меняется). `None` — общих групп нет или `dst` — мы сами.
+fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
+    groups
+        .iter()
+        .filter(|(_, gs)| gs.my_ip != dst)
+        .filter_map(|(gid, gs)| gs.members.get(&dst).map(|p| (*gid, p)))
+        .min_by_key(|(gid, p)| (p.direct_addr.is_none(), !p.online, *gid))
+        .map(|(gid, _)| gid)
+}
+
 /// IP-пакет из адаптера → пиру. Напрямую — только если прямой канал жив;
 /// иначе через релей сервера.
 fn route_packet(env: &Env, bytes: &[u8]) {
@@ -3410,13 +3434,12 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    let gid = proto::group_of_ip(dst);
     let (key, h, ctr, target) = {
         let mut g = env.groups.lock().unwrap();
-        let Some(gs) = g.get_mut(&gid) else { return };
-        if dst == gs.my_ip {
+        let Some(gid) = pick_group(&g, dst) else {
             return;
-        }
+        };
+        let gs = g.get_mut(&gid).expect("pick_group вернул свою группу");
         let target = gs
             .members
             .get(&dst)
@@ -4098,6 +4121,50 @@ mod tests {
         g.set_key(6, [2; 32], false, now);
         g.set_key(8, [2; 32], false, now);
         assert!(g.prev.is_none());
+    }
+
+    #[test]
+    fn группа_для_пакета_выбирается_по_получателю() {
+        let t0 = Instant::now();
+        let (me, peer, other) = (0x6442_0102, 0x6442_0103, 0x6442_0104);
+        let peer_sess = |ip: u32, online: bool, direct: bool| PeerSess {
+            pubkey: [ip as u8; 32],
+            name: "p".into(),
+            status: String::new(),
+            online,
+            ip,
+            endpoint: None,
+            candidates: Vec::new(),
+            direct_addr: direct.then(|| "10.0.0.2:4000".parse().unwrap()),
+            last_rx: t0,
+            last_direct: None,
+            rtt_ms: None,
+        };
+        let mut groups: HashMap<u32, GroupSess> = HashMap::new();
+        for gid in [3, 5, 9] {
+            let gs = GroupSess::new(&state(gid, 1, 1), t0, KeyLog::default());
+            groups.insert(gid, gs);
+        }
+        let put = |groups: &mut HashMap<u32, GroupSess>, gid: u32, p: PeerSess| {
+            groups.get_mut(&gid).unwrap().members.insert(p.ip, p);
+        };
+        // Адрес один на все группы: получатель — в 5 и 9, не в 3.
+        put(&mut groups, 5, peer_sess(peer, true, false));
+        put(&mut groups, 9, peer_sess(peer, true, false));
+        put(&mut groups, 3, peer_sess(other, true, false));
+        assert_eq!(pick_group(&groups, peer), Some(5), "меньший gid");
+        assert_eq!(pick_group(&groups, other), Some(3));
+        assert_eq!(pick_group(&groups, 0x6442_0199), None, "общих групп нет");
+        assert_eq!(pick_group(&groups, me), None, "сами себе не шлём");
+        // Живой прямой канал важнее gid, онлайн — важнее офлайн.
+        put(&mut groups, 9, peer_sess(peer, true, true));
+        assert_eq!(pick_group(&groups, peer), Some(9));
+        put(&mut groups, 9, peer_sess(peer, false, false));
+        assert_eq!(pick_group(&groups, peer), Some(5));
+        // Вышли из группы 5 — пакет идёт через 9 (раньше адрес получателя в
+        // группе 5 указывал только на неё).
+        groups.remove(&5);
+        assert_eq!(pick_group(&groups, peer), Some(9));
     }
 
     #[test]

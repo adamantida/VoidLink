@@ -553,7 +553,7 @@ mod tests {
 
         // 1. Первый HELLO3 без cookie.
         let h1 = Hello3::encode(&client, &c_eph.public(), "alpha", 0, None);
-        assert_eq!(hello_version(&h1), Some(3));
+        assert_eq!(hello_version(&h1), Some(PROTOCOL_VERSION));
         let p1 = Hello3::decode(&h1).unwrap();
         assert!(p1.cookie.is_none());
         p1.verify().unwrap();
@@ -740,12 +740,12 @@ mod tests {
         assert_eq!(dec_challenge(&ch).unwrap(), [3; 16]);
         assert!(dec_challenge(&ch[..16]).is_err());
         let mut v = ch.clone();
-        v[0] = 4;
+        v[0] = PROTOCOL_VERSION - 1;
         assert!(dec_challenge(&v).is_err());
         let u = enc_unsupported("обновите клиент");
         assert_eq!(
             dec_unsupported(&u).unwrap(),
-            (3, "обновите клиент".to_string())
+            (PROTOCOL_VERSION, "обновите клиент".to_string())
         );
         assert!(dec_unsupported(&u[..3]).is_err());
         assert!(dec_unsupported(&[]).is_err());

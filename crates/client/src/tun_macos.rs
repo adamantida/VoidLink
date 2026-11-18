@@ -39,8 +39,8 @@ const MAX_PACKET: usize = 65535;
 pub struct Utun {
     fd: OwnedFd,
     name: String,
-    /// Уже назначенные IPv4-адреса (host order).
-    v4: Mutex<HashSet<u32>>,
+    /// Назначенный адрес оверлея (host order; один: протокол v4).
+    v4: Mutex<Option<u32>>,
     /// Уже назначенные IPv6-адреса.
     v6: Mutex<HashSet<Ipv6Addr>>,
     /// Маршрут на встроенный DNS уже стоит.
@@ -56,7 +56,7 @@ impl Utun {
         let dev = Utun {
             fd,
             name,
-            v4: Mutex::new(HashSet::new()),
+            v4: Mutex::new(None),
             v6: Mutex::new(HashSet::new()),
             dns_route: AtomicBool::new(false),
         };
@@ -167,24 +167,23 @@ impl Utun {
         }
     }
 
-    /// Назначает IPv4-адрес группы (host order) и маршрут на её /24.
+    /// Назначает адрес оверлея (host order) и маршрут на 100.66.0.0/16.
+    /// `ifconfig inet` без `alias` заменяет прежний адрес (прошлый сервер).
     /// Идемпотентно: повторный вызов с тем же IP ничего не делает.
     pub fn ensure_address(&self, ip: u32) -> Result<()> {
         let mut used = self.v4.lock().unwrap();
-        if used.contains(&ip) {
+        if *used == Some(ip) {
             return Ok(());
         }
-        let first = used.is_empty();
-        run(&ifconfig_inet_args(&self.name, ip, !first)).context("ifconfig inet")?;
-        let route = route_add_args(&self.name, ip);
-        if let Err(e) = run(&route) {
+        run(&ifconfig_inet_args(&self.name, ip)).context("ifconfig inet")?;
+        if let Err(e) = run(&route_add_args(&self.name)) {
             // Маршрут уже есть (например, после перезапуска) — это нормально.
             if !route_exists_error(&e.to_string()) {
                 return Err(e).context("route add");
             }
         }
-        used.insert(ip);
-        eprintln!("[tun] {} += {}", self.name, Ipv4Addr::from(ip));
+        *used = Some(ip);
+        eprintln!("[tun] {} = {}", self.name, Ipv4Addr::from(ip));
         Ok(())
     }
 
@@ -333,11 +332,6 @@ fn parse_ifname(raw: &[u8]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Сеть /24 группы: 100.66.<gid>.0.
-fn group_net(ip: u32) -> Ipv4Addr {
-    Ipv4Addr::from(ip & 0xFFFF_FF00)
-}
-
 fn s(x: impl Into<String>) -> String {
     x.into()
 }
@@ -350,32 +344,32 @@ fn mtu_args(ifname: &str, mtu: usize) -> Vec<String> {
     vec![s("ifconfig"), s(ifname), s("mtu"), mtu.to_string()]
 }
 
-/// `ifconfig utunN inet <ip> <ip> netmask 255.255.255.0 [alias]`.
-fn ifconfig_inet_args(ifname: &str, ip: u32, alias: bool) -> Vec<String> {
+/// `ifconfig utunN inet <ip> <ip> netmask 255.255.0.0`.
+fn ifconfig_inet_args(ifname: &str, ip: u32) -> Vec<String> {
     let a = Ipv4Addr::from(ip).to_string();
-    let mut v = vec![
+    vec![
         s("ifconfig"),
         s(ifname),
         s("inet"),
         a.clone(),
         a,
         s("netmask"),
-        s("255.255.255.0"),
-    ];
-    if alias {
-        v.push(s("alias"));
-    }
-    v
+        Ipv4Addr::from(tunnel_protocol::OVERLAY_MASK).to_string(),
+    ]
 }
 
-/// `route -n add -net 100.66.<gid>.0/24 -interface utunN`.
-fn route_add_args(ifname: &str, ip: u32) -> Vec<String> {
+/// `route -n add -net 100.66.0.0/16 -interface utunN`.
+fn route_add_args(ifname: &str) -> Vec<String> {
     vec![
         s("route"),
         s("-n"),
         s("add"),
         s("-net"),
-        format!("{}/24", group_net(ip)),
+        format!(
+            "{}/{}",
+            Ipv4Addr::from(tunnel_protocol::OVERLAY_NET),
+            tunnel_protocol::OVERLAY_PREFIX_LEN
+        ),
         s("-interface"),
         s(ifname),
     ]
@@ -443,18 +437,13 @@ mod tests {
     #[test]
     fn command_args() {
         let a = ip(100, 66, 3, 17);
-        assert_eq!(group_net(a), Ipv4Addr::new(100, 66, 3, 0));
         assert_eq!(
-            ifconfig_inet_args("utun4", a, false).join(" "),
-            "ifconfig utun4 inet 100.66.3.17 100.66.3.17 netmask 255.255.255.0"
+            ifconfig_inet_args("utun4", a).join(" "),
+            "ifconfig utun4 inet 100.66.3.17 100.66.3.17 netmask 255.255.0.0"
         );
         assert_eq!(
-            ifconfig_inet_args("utun4", a, true).join(" "),
-            "ifconfig utun4 inet 100.66.3.17 100.66.3.17 netmask 255.255.255.0 alias"
-        );
-        assert_eq!(
-            route_add_args("utun4", a).join(" "),
-            "route -n add -net 100.66.3.0/24 -interface utun4"
+            route_add_args("utun4").join(" "),
+            "route -n add -net 100.66.0.0/16 -interface utun4"
         );
         assert_eq!(mtu_args("utun4", 1280).join(" "), "ifconfig utun4 mtu 1280");
         assert_eq!(

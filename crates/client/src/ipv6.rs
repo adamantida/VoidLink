@@ -1,10 +1,10 @@
-//! IPv6-оверлей поверх IPv4-адресации групп.
+//! IPv6-оверлей поверх IPv4-адресации участников.
 //!
-//! ULA-префикс `fd66:766c:696e::/48`. Участник группы `gid` с IPv4
-//! `100.66.<gid>.<host>` получает IPv6 `fd66:766c:696e:<gid>::<host>`:
-//! 16 бит под группу (сейчас используются 8), на адаптере — `/64` на каждую
-//! группу. Обратное отображение работает только внутри нашего префикса и
-//! только для адресов вида `::<host>`.
+//! ULA-префикс `fd66:766c:696e::/48`. Участник с IPv4 `100.66.<a>.<b>` (один
+//! адрес на все группы, протокол v4) получает IPv6 `fd66:766c:696e::<a>:<b>`
+//! из подсети `fd66:766c:696e::/64`; на адаптере — один такой адрес с
+//! префиксом /64. Обратное отображение работает только внутри этой подсети
+//! и только для адресов вида `::<a>:<b>` с `a, b <= 255`.
 // подключается при интеграции
 #![allow(dead_code)]
 
@@ -12,8 +12,8 @@ use std::net::Ipv6Addr;
 
 /// Первые 48 бит ULA-префикса: fd66:766c:696e.
 pub const PREFIX: [u16; 3] = [0xfd66, 0x766c, 0x696e];
-/// Длина префикса на адаптере для одной группы.
-pub const GROUP_PREFIX_LEN: u8 = 64;
+/// Длина префикса адреса оверлея на адаптере.
+pub const PREFIX_LEN: u8 = 64;
 /// IPv4-сеть участников: 100.66.0.0/16.
 const V4_NET: u32 = 0x6442_0000;
 const V4_MASK: u32 = 0xFFFF_0000;
@@ -43,25 +43,25 @@ pub fn v6_of(v4: u32) -> Option<Ipv6Addr> {
     if v4 & V4_MASK != V4_NET {
         return None;
     }
-    let gid = ((v4 >> 8) & 0xFF) as u16;
-    let host = (v4 & 0xFF) as u16;
+    let a = ((v4 >> 8) & 0xFF) as u16;
+    let b = (v4 & 0xFF) as u16;
     Some(Ipv6Addr::new(
-        PREFIX[0], PREFIX[1], PREFIX[2], gid, 0, 0, 0, host,
+        PREFIX[0], PREFIX[1], PREFIX[2], 0, 0, 0, a, b,
     ))
 }
 
-/// IPv6 оверлея → IPv4 участника. Только внутри нашего префикса, только
-/// `gid <= 255`, интерфейсный идентификатор строго `::<host>` с `host <= 255`.
+/// IPv6 оверлея → IPv4 участника. Только внутри `fd66:766c:696e::/64`,
+/// интерфейсный идентификатор строго `::<a>:<b>` с `a, b <= 255`.
 pub fn v4_of(v6: Ipv6Addr) -> Option<u32> {
     let s = v6.segments();
-    if s[..3] != PREFIX {
+    if s[..3] != PREFIX || s[3..6] != [0, 0, 0] {
         return None;
     }
-    let (gid, host) = (s[3], s[7]);
-    if gid > 0xFF || host > 0xFF || s[4..7] != [0, 0, 0] {
+    let (a, b) = (s[6], s[7]);
+    if a > 0xFF || b > 0xFF {
         return None;
     }
-    Some(V4_NET | (u32::from(gid) << 8) | u32::from(host))
+    Some(V4_NET | (u32::from(a) << 8) | u32::from(b))
 }
 
 /// Принадлежит ли адрес нашему /48.
@@ -69,9 +69,9 @@ pub fn in_prefix(v6: Ipv6Addr) -> bool {
     v6.segments()[..3] == PREFIX
 }
 
-/// Префикс группы на адаптере: `fd66:766c:696e:<gid>::`.
-pub fn group_prefix(gid: u16) -> Ipv6Addr {
-    Ipv6Addr::new(PREFIX[0], PREFIX[1], PREFIX[2], gid, 0, 0, 0, 0)
+/// Подсеть адресов оверлея: `fd66:766c:696e::` (/64).
+pub fn overlay_prefix() -> Ipv6Addr {
+    Ipv6Addr::new(PREFIX[0], PREFIX[1], PREFIX[2], 0, 0, 0, 0, 0)
 }
 
 /// Проверка заголовка IPv6: версия 6, полный фиксированный заголовок и
@@ -192,7 +192,7 @@ pub fn cmd_add_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     let a = v6_of(v4)?;
     let mut args = strs(&["interface", "ipv6", "add", "address"]);
     args.push(if_index.to_string());
-    args.push(format!("{a}/{GROUP_PREFIX_LEN}"));
+    args.push(format!("{a}/{PREFIX_LEN}"));
     args.push("store=active".into());
     Some(Cmd {
         program: "netsh",
@@ -200,7 +200,7 @@ pub fn cmd_add_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     })
 }
 
-/// Windows: удалить адрес при выходе из группы
+/// Windows: снять прежний адрес (смена сервера)
 /// (`netsh interface ipv6 delete address <idx> <a>`).
 pub fn cmd_del_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     let a = v6_of(v4)?;
@@ -232,7 +232,7 @@ fn linux(op: &str, ifname: &str, v4: u32) -> Option<Cmd> {
     }
     let a = v6_of(v4)?;
     let mut args = strs(&["-6", "addr", op]);
-    args.push(format!("{a}/{GROUP_PREFIX_LEN}"));
+    args.push(format!("{a}/{PREFIX_LEN}"));
     args.push("dev".into());
     args.push(ifname.into());
     Some(Cmd {
@@ -339,15 +339,15 @@ mod tests {
     fn отображение_туда_и_обратно() {
         let v4 = ip4(100, 66, 7, 42);
         let v6 = v6_of(v4).unwrap();
-        assert_eq!(v6.to_string(), "fd66:766c:696e:7::2a");
+        assert_eq!(v6.to_string(), "fd66:766c:696e::7:2a");
         assert_eq!(v4_of(v6), Some(v4));
-        for gid in [0u8, 1, 255] {
-            for host in [1u8, 128, 254] {
-                let a = ip4(100, 66, gid, host);
-                assert_eq!(v4_of(v6_of(a).unwrap()), Some(a));
+        for a in [0u8, 1, 255] {
+            for b in [0u8, 1, 128, 254, 255] {
+                let ip = ip4(100, 66, a, b);
+                assert_eq!(v4_of(v6_of(ip).unwrap()), Some(ip));
             }
         }
-        assert_eq!(group_prefix(7).to_string(), "fd66:766c:696e:7::");
+        assert_eq!(overlay_prefix().to_string(), "fd66:766c:696e::");
     }
 
     #[test]
@@ -356,9 +356,11 @@ mod tests {
         assert_eq!(v6_of(ip4(100, 67, 1, 1)), None);
         assert_eq!(v4_of(p6("fd66:766c:696f:1::1")), None);
         assert_eq!(v4_of(p6("fe80::1")), None);
-        assert_eq!(v4_of(p6("fd66:766c:696e:100::1")), None); // gid > 255
-        assert_eq!(v4_of(p6("fd66:766c:696e:1::100")), None); // host > 255
-        assert_eq!(v4_of(p6("fd66:766c:696e:1:0:0:1:1")), None);
+        assert_eq!(v4_of(p6("fd66:766c:696e::100:1")), None); // a > 255
+        assert_eq!(v4_of(p6("fd66:766c:696e::1:100")), None); // b > 255
+        assert_eq!(v4_of(p6("fd66:766c:696e:1::1:1")), None); // не наша /64
+        assert_eq!(v4_of(p6("fd66:766c:696e:0:1::1:1")), None);
+        assert_eq!(v4_of(p6("fd66:766c:696e:7::2a")), None, "схема v3");
         assert!(in_prefix(p6("fd66:766c:696e:ffff::1")));
         assert!(!in_prefix(p6("ff02::1")));
     }
@@ -437,7 +439,7 @@ mod tests {
                 "add",
                 "address",
                 "17",
-                "fd66:766c:696e:5::9/64",
+                "fd66:766c:696e::5:9/64",
                 "store=active"
             ]
         );
@@ -450,7 +452,7 @@ mod tests {
                 "delete",
                 "address",
                 "17",
-                "fd66:766c:696e:5::9"
+                "fd66:766c:696e::5:9"
             ]
         );
         let l = cmd_add_linux("vl0", v4).unwrap();
@@ -461,7 +463,7 @@ mod tests {
                 "-6",
                 "addr",
                 "add",
-                "fd66:766c:696e:5::9/64",
+                "fd66:766c:696e::5:9/64",
                 "dev",
                 "vl0",
                 "nodad"
@@ -475,7 +477,7 @@ mod tests {
             [
                 "utun7",
                 "inet6",
-                "fd66:766c:696e:5::9",
+                "fd66:766c:696e::5:9",
                 "prefixlen",
                 "64",
                 "alias"

@@ -2541,3 +2541,67 @@ fn e2e_udp_заблокирован_движок_уходит_на_tcp() {
     drop(b);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Протокол v4: адрес участника один на все группы. Сценарий тестировщика:
+/// двое в двух общих группах, трафик идёт через первую; выход из неё не
+/// рвёт связь — пакеты на тот же адрес идут через вторую (приватная группа
+/// или публичная — для адресов не важно). Раньше у участника в каждой
+/// группе был свой адрес `100.66.<gid>.x`, и адрес покинутой группы
+/// становился мёртвым.
+#[test]
+fn e2e_адрес_один_на_все_группы_выход_из_одной_не_рвёт_связь() {
+    let dir = temp_dir("peruserip");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    let mut b = Node::start("bravo", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+
+    let first = a.create("first", false);
+    let second = a.create("second", false);
+    b.join(first);
+    b.join(second);
+    wait_until("A видит B в обеих группах", T, || {
+        a.sees_online(first, 1) && a.sees_online(second, 1)
+    });
+    wait_until("B видит A в обеих группах", T, || {
+        b.sees_online(first, 1) && b.sees_online(second, 1)
+    });
+    let (ip_a, ip_b) = (a.my_ip(first), b.my_ip(first));
+    assert_eq!(a.my_ip(second), ip_a, "у A один адрес");
+    assert_eq!(b.my_ip(second), ip_b, "у B один адрес");
+    assert_ne!(ip_a, ip_b);
+    assert_eq!(
+        *a.tun.addrs.lock().unwrap(),
+        HashSet::from([ip_a]),
+        "на адаптере один адрес"
+    );
+
+    deliver(&a, &b, first, "A→B до выхода", T);
+    deliver(&b, &a, first, "B→A до выхода", T);
+
+    // B выходит из первой: адреса те же, связь — через вторую.
+    b.eng.cmds.send(Cmd::Leave(first)).unwrap();
+    b.wait(
+        "B вышел из первой",
+        T,
+        |e| matches!(e, Event::GroupLeft { gid, .. } if *gid == first),
+    );
+    wait_until("A видит выход B", T, || a.members(first) == 0);
+    assert_eq!(b.my_ip(second), ip_b);
+    deliver(&a, &b, second, "A→B после выхода", T);
+    deliver(&b, &a, second, "B→A после выхода", T);
+
+    // Повторный вход — тот же адрес.
+    std::thread::sleep(Duration::from_millis(3100));
+    b.join(first);
+    assert_eq!(b.my_ip(first), ip_b, "адрес закреплён за identity");
+    drop(a);
+    drop(b);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -54,7 +54,10 @@ pub const PUBKEY_LEN: usize = 32;
 /// Счётчик фрейма в открытой части (u64 LE).
 pub const COUNTER_LEN: usize = 8;
 
-pub const PROTOCOL_VERSION: u8 = 3;
+/// v4: адрес оверлея закреплён за identity на сервере (один на все группы),
+/// а не выдаётся каждой группой из её `/24` — раскладка фреймов та же, но
+/// клиент v3 выводил группу из адреса и с сервером v4 работать не может.
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Прошлый ключ группы принимается на приём ещё столько после ротации без
 /// `revoke_prev` (участники получают новый ключ не одновременно).
@@ -697,9 +700,16 @@ pub fn ipv4_src(packet: &[u8]) -> Result<u32> {
     Ok(u32::from_be_bytes(packet[12..16].try_into().unwrap()))
 }
 
-/// Группа по адресу `100.66.<gid>.<host>`: октет №2 (индекс 2).
-pub fn group_of_ip(ip: u32) -> u32 {
-    (ip >> 8) & 0xFF
+/// Сеть оверлея `100.66.0.0/16`: у каждой identity на сервере один адрес
+/// из неё, общий для всех групп.
+pub const OVERLAY_NET: u32 = 0x6442_0000;
+pub const OVERLAY_MASK: u32 = 0xFFFF_0000;
+/// Длина префикса оверлея (маска адаптера).
+pub const OVERLAY_PREFIX_LEN: u8 = 16;
+
+/// Адрес из сети оверлея `100.66.0.0/16`.
+pub fn is_overlay_ip(ip: u32) -> bool {
+    ip & OVERLAY_MASK == OVERLAY_NET
 }
 
 pub fn ip_str(ip: u32) -> String {

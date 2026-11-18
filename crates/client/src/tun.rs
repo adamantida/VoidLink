@@ -1,6 +1,5 @@
 //! Управление Wintun-адаптером: загрузка dll, создание, адреса, файрвол.
 
-use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::sync::Arc;
@@ -41,35 +40,20 @@ pub fn create_adapter(wintun: &wintun::Wintun, name: &str) -> Result<Arc<wintun:
     }
 }
 
-/// Назначает IP группы на адаптер. Первый IP — netsh set, остальные — add.
-pub fn ensure_address(adapter: &wintun::Adapter, used: &mut HashSet<u32>, ip: u32) -> Result<()> {
-    if !used.insert(ip) {
+/// Назначает адаптеру адрес оверлея с маской /16 (протокол v4: один адрес
+/// на все группы). `netsh set address` заменяет все IPv4-адреса адаптера —
+/// заодно снимает адреса прошлого запуска и прошлого сервера. `current` —
+/// уже назначенный адрес (тот же — ничего не делаем).
+pub fn ensure_address(adapter: &wintun::Adapter, current: &mut Option<u32>, ip: u32) -> Result<()> {
+    if *current == Some(ip) {
         return Ok(());
     }
     let addr: Ipv4Addr = ip.into();
-    if used.len() == 1 {
-        adapter
-            .set_network_addresses_tuple(addr.into(), "255.255.255.0".parse().unwrap(), None)
-            .context("set adapter address")?;
-    } else {
-        let name = adapter.get_name().context("adapter name")?;
-        let out = Command::new("netsh")
-            .args([
-                "interface",
-                "ipv4",
-                "add",
-                "address",
-                &format!("name={name}"),
-                &format!("address={addr}"),
-                "mask=255.255.255.0",
-            ])
-            .output()
-            .context("netsh add address")?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow::anyhow!("netsh add address failed: {err}"));
-        }
-    }
+    let mask = Ipv4Addr::from(tunnel_protocol::OVERLAY_MASK);
+    adapter
+        .set_network_addresses_tuple(addr.into(), mask.into(), None)
+        .context("set adapter address")?;
+    *current = Some(ip);
     Ok(())
 }
 
