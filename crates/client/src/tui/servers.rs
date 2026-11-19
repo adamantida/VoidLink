@@ -489,6 +489,7 @@ impl ServersView {
                         Span::styled(" ", th.dim)
                     };
                     let key = proto::hex_of(&s.pubkey);
+                    let ping_str = s.ping_ms.map_or("—".to_string(), |p| format!("{} ms", p));
                     Row::new(vec![
                         Cell::from(mark),
                         Cell::from(Span::styled(
@@ -500,6 +501,7 @@ impl ServersView {
                             if cur { th.ok } else { th.base },
                         )),
                         Cell::from(Span::styled(s.addr.clone(), th.base)),
+                        Cell::from(Span::styled(ping_str, th.dim)),
                         Cell::from(Span::styled(format!("{}…", &key[..12]), th.dim)),
                     ])
                 })
@@ -510,10 +512,11 @@ impl ServersView {
                     Constraint::Length(1),
                     Constraint::Fill(1),
                     Constraint::Fill(2),
+                    Constraint::Length(8),
                     Constraint::Length(13),
                 ],
             )
-            .header(Row::new(vec!["", "имя", "адрес", "ключ"]).style(th.dim))
+            .header(Row::new(vec!["", "имя", "адрес", "пинг", "ключ"]).style(th.dim))
             .row_highlight_style(th.selected)
             .highlight_symbol("▌");
             let mut state = TableState::default();

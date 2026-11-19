@@ -940,24 +940,53 @@ fn main() -> Result<()> {
                 cfg.dll = dll.clone().unwrap_or_default();
                 save(&cfg)?;
             }
-            if cfg.name.is_empty() {
-                bail!(
-                    "задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)"
-                );
-            }
-            let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
-            save(&cfg)?;
-            let cfg = Arc::new(cfg);
-            let store = Arc::new(store::Store::new(&dir));
-            if !tui_mode {
-                // Автовход, ротация ключа сервера, невидимка — в client.json.
-                let save_store = store.clone();
-                let save = Arc::new(move |c: &Config| {
-                    let _ = save_store.save(c);
-                });
-                engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll, save)?;
+            // Offline mode: TUI without server connection
+            if tui_mode && g.offline {
+                if cfg.name.is_empty() {
+                    bail!(
+                        "задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)"
+                    );
+                }
+                // Первичная настройка если нет серверов (адаптер и dll всё равно спрашиваем).
+                if cfg.servers.is_empty() {
+                    if !tui::setup::run(
+                        &mut cfg,
+                        &mut adapter,
+                        &mut dll,
+                        true,
+                        &identity.friend_code(),
+                    )? {
+                        bail!(
+                            "настройка не завершена; запусти ещё раз или задай параметры командами CLI"
+                        );
+                    }
+                    cfg.adapter = adapter.clone();
+                    cfg.dll = dll.clone().unwrap_or_default();
+                    save(&cfg)?;
+                }
+                let cfg = Arc::new(cfg);
+                let store = Arc::new(store::Store::new(&dir));
+                tui::run_offline(cfg, identity.clone(), store)?;
             } else {
-                tui::run(cfg, server, pub_key, identity.clone(), &adapter, dll, store)?;
+                if cfg.name.is_empty() {
+                    bail!(
+                        "задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)"
+                    );
+                }
+                let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
+                save(&cfg)?;
+                let cfg = Arc::new(cfg);
+                let store = Arc::new(store::Store::new(&dir));
+                if !tui_mode {
+                    // Автовход, ротация ключа сервера, невидимка — в client.json.
+                    let save_store = store.clone();
+                    let save = Arc::new(move |c: &Config| {
+                        let _ = save_store.save(c);
+                    });
+                    engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll, save)?;
+                } else {
+                    tui::run(cfg, server, pub_key, identity.clone(), &adapter, dll, store)?;
+                }
             }
         }
         other => {
