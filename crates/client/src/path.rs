@@ -672,6 +672,187 @@ mod tests {
         assert!((score_symmetric - score_open - 50.0).abs() < 1.0);
     }
 
+    // Mock DHT node for testing ProtocolDhtWrapper integration
+    struct MockDhtNode {
+        relay_tickets: HashMap<NodeId, RelayTicket>,
+    }
+
+    impl MockDhtNode {
+        fn new() -> Self {
+            Self {
+                relay_tickets: HashMap::new(),
+            }
+        }
+
+        fn add_relay(&mut self, target: NodeId, ticket: RelayTicket) {
+            self.relay_tickets.insert(target, ticket);
+        }
+    }
+
+    impl DhtNode for MockDhtNode {
+        fn get_relay_ticket(&self, target: NodeId) -> Option<RelayTicket> {
+            self.relay_tickets.get(&target).cloned()
+        }
+
+        fn get_nat_type(&self, _target: NodeId) -> Option<NatType> {
+            None
+        }
+
+        fn get_bandwidth_estimate(&self, target: NodeId) -> Option<u32> {
+            self.relay_tickets.get(&target).map(|t| {
+                // Estimate bandwidth from latency: lower latency = higher bandwidth
+                if t.latency_ms < 20 { 100 } else if t.latency_ms < 50 { 50 } else { 10 }
+            })
+        }
+    }
+
+    #[test]
+    fn test_path_selector_dht_relay_integration() {
+        let selector = PathSelector::new();
+        let mut mock_dht = MockDhtNode::new();
+        let target = make_node_id(1);
+        let server = make_addr(5000);
+
+        // Add a valid DHT relay ticket for the target
+        let relay_ticket = RelayTicket {
+            relay_addr: make_addr(6000),
+            latency_ms: 30,
+            expires_at: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now + 60_000 // Valid for 60 seconds
+            },
+            relay_pubkey: make_node_id(2),
+        };
+        mock_dht.add_relay(target, relay_ticket.clone());
+
+        // No direct address, but DHT relay available -> DhtRelay
+        let path = selector.select_path(
+            target,
+            Some(&mock_dht),
+            server,
+            None,
+            NatType::Unknown,
+        );
+        assert!(matches!(path, Path::DhtRelay { relay_addr, est_rtt_ms, .. } 
+            if relay_addr == make_addr(6000) && est_rtt_ms == 40));
+
+        // Direct address available -> should prefer direct (Auto strategy)
+        let direct_addr = make_addr(4000);
+        let path = selector.select_path(
+            target,
+            Some(&mock_dht),
+            server,
+            Some(direct_addr),
+            NatType::Open,
+        );
+        assert!(matches!(path, Path::Direct { peer_addr, .. } if peer_addr == direct_addr));
+    }
+
+    #[test]
+    fn test_path_selector_dht_relay_vs_server_relay() {
+        let selector = PathSelector::new();
+        let mut mock_dht = MockDhtNode::new();
+        let target = make_node_id(1);
+        let server = make_addr(5000);
+
+        // No direct, no DHT -> server relay
+        let path = selector.select_path(target, Some(&mock_dht), server, None, NatType::Unknown);
+        assert!(matches!(path, Path::ServerRelay { .. }));
+
+        // Add DHT relay -> should prefer DHT relay over server relay
+        let relay_ticket = RelayTicket {
+            relay_addr: make_addr(6000),
+            latency_ms: 40,
+            expires_at: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now + 60_000
+            },
+            relay_pubkey: make_node_id(2),
+        };
+        mock_dht.add_relay(target, relay_ticket);
+
+        let path = selector.select_path(target, Some(&mock_dht), server, None, NatType::Unknown);
+        assert!(matches!(path, Path::DhtRelay { .. }));
+    }
+
+    #[test]
+    fn test_path_selector_expired_dht_ticket() {
+        let selector = PathSelector::new();
+        let mut mock_dht = MockDhtNode::new();
+        let target = make_node_id(1);
+        let server = make_addr(5000);
+
+        // Add an expired DHT relay ticket
+        let expired_ticket = RelayTicket {
+            relay_addr: make_addr(6000),
+            latency_ms: 30,
+            expires_at: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now - 1000 // Expired 1 second ago
+            },
+            relay_pubkey: make_node_id(2),
+        };
+        mock_dht.add_relay(target, expired_ticket);
+
+        // Expired ticket should be ignored -> server relay
+        let path = selector.select_path(target, Some(&mock_dht), server, None, NatType::Unknown);
+        assert!(matches!(path, Path::ServerRelay { .. }));
+    }
+
+    #[test]
+    fn test_path_selector_dht_relay_bandwidth_estimate() {
+        let selector = PathSelector::new();
+        let mut mock_dht = MockDhtNode::new();
+        let target = make_node_id(1);
+        let server = make_addr(5000);
+
+        // Add relay with low latency (high bandwidth)
+        let relay_ticket = RelayTicket {
+            relay_addr: make_addr(6000),
+            latency_ms: 10,
+            expires_at: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now + 60_000
+            },
+            relay_pubkey: make_node_id(2),
+        };
+        mock_dht.add_relay(target, relay_ticket);
+
+        let bw = mock_dht.get_bandwidth_estimate(target);
+        assert_eq!(bw, Some(100)); // High bandwidth for low latency
+
+        // Add relay with high latency (low bandwidth)
+        let target2 = make_node_id(3);
+        let relay_ticket2 = RelayTicket {
+            relay_addr: make_addr(7000),
+            latency_ms: 100,
+            expires_at: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now + 60_000
+            },
+            relay_pubkey: make_node_id(4),
+        };
+        mock_dht.add_relay(target2, relay_ticket2);
+
+        let bw2 = mock_dht.get_bandwidth_estimate(target2);
+        assert_eq!(bw2, Some(10)); // Low bandwidth for high latency
+    }
+
     #[test]
     fn test_clear_target() {
         let selector = PathSelector::new();
