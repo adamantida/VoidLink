@@ -7,8 +7,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tunnel_protocol as proto;
 
-use proto::dht::NodeContact;
-
 /// MTU адаптера по умолчанию: 1500 минус заголовки IP/UDP и фрейма группы
 /// с запасом под IPv6 и PPPoE.
 pub const DEFAULT_MTU: usize = 1400;
@@ -76,12 +74,6 @@ pub struct Config {
     /// важнее). Применяется после перезапуска.
     #[serde(default)]
     pub dll: String,
-    /// Сохранённые DHT-пиры для бутстрапа при перезапуске.
-    #[serde(default)]
-    pub dht_peers: Vec<NodeContact>,
-    /// Путь к файлу состояния DHT (по умолчанию: `%APPDATA%\tunnel\dht_state.bin`).
-    #[serde(default)]
-    pub dht_state_path: String,
 }
 
 /// Выбор транспорта до сервера.
@@ -116,8 +108,6 @@ impl Default for Config {
             transport: TransportMode::Auto,
             adapter: String::new(),
             dll: String::new(),
-            dht_peers: Vec::new(),
-            dht_state_path: String::new(),
         }
     }
 }
@@ -200,11 +190,6 @@ pub fn default_dir() -> PathBuf {
         return Path::new(&home).join(".tunnel-client");
     }
     PathBuf::from("tunnel-client-data")
-}
-
-/// Путь к файлу состояния DHT по умолчанию.
-pub fn default_dht_state_path() -> PathBuf {
-    default_dir().join("dht_state.bin")
 }
 
 impl Store {

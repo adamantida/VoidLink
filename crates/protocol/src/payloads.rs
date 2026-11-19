@@ -711,46 +711,6 @@ pub fn dec_ping(p: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(p.try_into().unwrap()))
 }
 
-/// DHT_BOOTSTRAP_REQ: пустой запрос (клиент → сервер).
-pub fn enc_dht_bootstrap_req() -> Vec<u8> {
-    Vec::new()
-}
-
-pub fn dec_dht_bootstrap_req(p: &[u8]) -> Result<()> {
-    ensure!(p.is_empty(), "DHT_BOOTSTRAP_REQ must be empty");
-    Ok(())
-}
-
-/// DHT_BOOTSTRAP: подписанный список DHT-пиров (сервер → клиент).
-/// Формат: n × NodeContact (каждый сериализован через NodeContact::to_bytes).
-pub fn enc_dht_bootstrap(peers: &[crate::dht::NodeContact]) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend_from_slice(&(peers.len() as u16).to_be_bytes());
-    for peer in peers {
-        v.extend_from_slice(&peer.to_bytes());
-    }
-    v
-}
-
-pub fn dec_dht_bootstrap(p: &[u8]) -> Result<Vec<crate::dht::NodeContact>> {
-    let mut r = Reader::new(p);
-    let n = r.u16()? as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let remaining = r.remaining();
-        if remaining == 0 {
-            bail!("truncated DHT_BOOTSTRAP");
-        }
-        // Read the rest as a single contact
-        let contact_bytes = r.tail();
-        let contact = crate::dht::NodeContact::from_bytes(contact_bytes)?;
-        out.push(contact);
-        // Advance past this contact
-        r.p = r.b.len();
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

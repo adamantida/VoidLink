@@ -35,7 +35,6 @@
 pub mod leases;
 pub mod metrics;
 pub mod persist;
-pub mod s2s;
 pub mod signals;
 pub mod tcp;
 
@@ -183,12 +182,6 @@ pub struct Config {
     pub tcp: bool,
     /// Адрес HTTP-эндпоинта метрик (`--metrics`); `None` — выключен.
     pub metrics: Option<SocketAddr>,
-    /// S2S (server-to-server) UDP порт (default 5556).
-    pub s2s_port: u16,
-    /// Объявленная пропускная способность релея в Мбит/с.
-    pub relay_capacity_mbps: u32,
-    /// Bootstrap S2S peers: "pubkey_hex:addr" список известных серверов.
-    pub s2s_bootstrap: Vec<String>,
 }
 
 impl Default for Config {
@@ -201,9 +194,6 @@ impl Default for Config {
             limits: Limits::default(),
             tcp: true,
             metrics: None,
-            s2s_port: 0,
-            relay_capacity_mbps: 1000,
-            s2s_bootstrap: Vec::new(),
         }
     }
 }
@@ -221,8 +211,6 @@ pub struct Server {
     pub tcp_addr: Option<SocketAddr>,
     /// Адрес эндпоинта метрик, если включён.
     pub metrics_addr: Option<SocketAddr>,
-    /// S2S node для межсерверного релея.
-    pub s2s: Option<Arc<s2s::S2sNode>>,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
     tcp: Option<tcp::TcpTransport>,
@@ -246,14 +234,6 @@ impl Server {
             .last()
             .is_none_or(|l| l.new_ed == pubkey && l.new_x == loaded.identity.x_pub());
         let n_links = loaded.links.len();
-
-        // Create S2S identity before moving loaded.identity into shared
-        let s2s_identity = s2s::ServerIdentity::from_proto(&loaded.identity);
-        let s2s_config = s2s::S2sConfig {
-            s2s_port: cfg.s2s_port,
-            relay_capacity_mbps: cfg.relay_capacity_mbps,
-            s2s_bootstrap: cfg.s2s_bootstrap.clone(),
-        };
 
         let shared = Arc::new(Shared {
             sock,
@@ -408,29 +388,12 @@ impl Server {
             shared.log(format!("метрики: http://{m}/metrics"));
         }
         shared.log(format!("Server code: {code}"));
-
-        // Get initial peer and group counts
-        let peer_count = shared.state.read().unwrap().sessions.len() as u32;
-        let group_count = shared.state.read().unwrap().groups.len() as u32;
-
-        // Start S2S node (identity and config created before shared to avoid move)
-        let s2s = s2s::S2sNode::start(
-            s2s_identity,
-            s2s_config,
-            cfg.data_dir.clone(),
-            addr,
-            peer_count,
-            group_count,
-        )?;
-        shared.log(format!("S2S listening on port {}", cfg.s2s_port));
-
         Ok(Server {
             addr,
             code,
             pubkey,
             tcp_addr,
             metrics_addr,
-            s2s: Some(s2s),
             shared,
             threads,
             tcp,
@@ -459,10 +422,6 @@ impl Server {
         // TCP — раньше воркеров: читатели соединений тоже вызывают обработку.
         if let Some(mut t) = self.tcp.take() {
             t.stop();
-        }
-        // Stop S2S node
-        if let Some(s2s) = self.s2s.take() {
-            s2s.stop();
         }
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -2932,6 +2891,37 @@ mod tests {
         None
     }
 
+    /// Просит у ядра увеличенный буфер приёма UDP: длинное сообщение сервера
+    /// (GROUP_STATE группы на 253 участника — ~215 КБ, ~175 кусков FRAG)
+    /// приходит залпом, дефолтных 64 КБ на Windows не хватает и лишние
+    /// датаграммы ядро выбрасывает — сборка не завершается никогда. Ошибка не
+    /// критична: остаётся дефолт.
+    ///
+    /// Только Windows: на Linux (`net.core.rmem_default`) и macOS дефолт уже
+    /// ≥ 128 КБ, тест там исторически зелёный, а `libc` в этом крейте нет —
+    /// лишнюю зависимость ради одного теста не тянем.
+    #[cfg(unix)]
+    fn set_recv_buffer(_sock: &UdpSocket, _bytes: usize) {}
+
+    /// Windows-вариант: `SO_RCVBUF` через Winsock (`std` сеттера не даёт).
+    #[cfg(windows)]
+    fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{SO_RCVBUF, SOL_SOCKET, setsockopt};
+        // SAFETY: `sock` жив всё время вызова, `len` — корректный `i32`,
+        // размер переданного значения совпадает с `optlen`.
+        unsafe {
+            let len = bytes as i32;
+            let _ = setsockopt(
+                sock.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                (&raw const len).cast(),
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+
     /// «Сырой» клиент поверх протокола — без движка клиента.
     struct Raw {
         sock: UdpSocket,
@@ -2962,6 +2952,7 @@ mod tests {
         /// Полное рукопожатие: HELLO3 → CHALLENGE → HELLO3 с cookie → WELCOME.
         fn connect_with(srv: SocketAddr, name: &str, id: &proto::Identity, flags: u8) -> Raw {
             let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            set_recv_buffer(&sock, 4 << 20);
             sock.set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
             let eph = proto::EphemeralKey::generate();

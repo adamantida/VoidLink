@@ -31,7 +31,6 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-pub mod dht;
 pub mod frag;
 pub mod handshake;
 pub mod payloads;
@@ -40,10 +39,6 @@ pub mod replay;
 #[cfg(test)]
 mod fuzz_tests;
 
-pub use dht::{
-    NodeId, NodeContact, RelayTicket, DhtMessage, Token, RoutingTable, DhtNode, DhtState,
-    distance, bucket_index, encode_dht_msg, decode_dht_msg, K, NUM_BUCKETS,
-};
 pub use frag::{FRAG_MAX_COUNT, FRAG_MAX_PAYLOAD, FRAG_THRESHOLD, Reassembler};
 pub use handshake::{
     CookieSecret, DirKeys, EphemeralKey, Hello3, PinResolution, Role, RotationLink, SessionKeys,
@@ -109,8 +104,6 @@ pub mod ctrl {
     pub const CANDIDATES: u8 = 0x15;
     /// invisible bool (`enc_presence`).
     pub const PRESENCE: u8 = 0x16;
-    /// DHT bootstrap request (client → server, empty body).
-    pub const DHT_BOOTSTRAP_REQ: u8 = 0x17;
 
     /// Открытым текстом, `handshake::Welcome`.
     pub const WELCOME: u8 = 0x81;
@@ -145,8 +138,6 @@ pub mod ctrl {
     /// сервере после обработки (`enc_presence`). Шлётся на каждый PRESENCE,
     /// и на повтор без изменения: клиент повторяет PRESENCE, пока не получит.
     pub const PRESENCE_ACK: u8 = 0x91;
-    /// DHT bootstrap response (server → client): signed list of NodeContacts.
-    pub const DHT_BOOTSTRAP: u8 = 0x92;
 
     /// Фреймы, которые ходят открытым текстом (всё прочее — шифрованные ctrl
     /// или фреймы группы).
@@ -154,7 +145,6 @@ pub mod ctrl {
         matches!(
             typ,
             HELLO | HELLO3 | WELCOME | CHALLENGE | RESET | UNSUPPORTED
-                | DHT_BOOTSTRAP_REQ | DHT_BOOTSTRAP
         )
     }
 }

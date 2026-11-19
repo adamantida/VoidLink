@@ -9,7 +9,6 @@ pub mod engine;
 mod engine_e2e;
 pub mod invites;
 pub mod ipv6;
-pub mod path;
 pub mod profile;
 pub mod remote;
 pub mod remote_cli;

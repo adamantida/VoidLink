@@ -449,34 +449,22 @@ impl Inner {
             Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
             Cmd::DelServer { idx } => format!("сервер №{idx} удалён"),
             Cmd::SetPrimaryServer { idx } => format!("сервер по умолчанию: №{idx}"),
-            Cmd::SwitchServer { addr, pubkey, label } => {
-                // Validate IPv4/IPv6 family match (same as client engine)
-                let family_ok = this
-                    .cfg
-                    .lock()
-                    .unwrap()
+            Cmd::SwitchServer { addr, label, .. } => {
+                // Сервер должен быть в конфиге; адрес разбираем без `unwrap`:
+                // строка могла быть поправлена руками.
+                let known = lock(&this.cfg)
                     .servers
                     .iter()
-                    .find(|s| s.addr.parse::<SocketAddr>().ok() == Some(*addr))
-                    .map(|s| s.addr.parse::<SocketAddr>().unwrap().is_ipv6() == addr.is_ipv6())
-                    .unwrap_or(false);
-                if !family_ok {
-                    return Err(format!(
-                        "сервер {addr}: другое семейство адресов (IPv4/IPv6) — перезапустите клиент с этим сервером"
-                    ));
-                }
-                // Update config: activate server (handles autojoin_by_server)
-                let mut cfg = lock(&this.cfg);
-                if cfg.activate_server(*addr) {
-                    // Save will be done below
-                }
-                // Verify server exists in config
-                let server_exists = cfg.servers.iter().any(|s| s.addr.parse::<SocketAddr>().ok() == Some(*addr));
-                if !server_exists {
+                    .any(|s| s.addr.parse::<SocketAddr>().ok() == Some(*addr));
+                if !known {
                     return Err(format!("сервер {addr} не найден в конфиге"));
                 }
-                drop(cfg);
-                format!("переключение на сервер {addr} ({label})")
+                // `activate_server` (и сохранение) — в `apply_offline`, ниже.
+                if label.is_empty() {
+                    format!("переключение на сервер {addr}")
+                } else {
+                    format!("переключение на сервер {addr} ({label})")
+                }
             }
             Cmd::Reconnect => {
                 Inner::retry_now(this);
@@ -485,7 +473,12 @@ impl Inner {
             Cmd::Quit => return Err("демон не завершается по команде фронтенда".into()),
             _ => return Err(reason.to_string()),
         };
-        let start = matches!(cmd, Cmd::AddServer { .. } | Cmd::SetPrimaryServer { .. });
+        // Смена сервера — тоже повод запустить движок сразу: без него новые
+        // группы/автовход нового сервера не подхватятся до следующей попытки.
+        let start = matches!(
+            cmd,
+            Cmd::AddServer { .. } | Cmd::SetPrimaryServer { .. } | Cmd::SwitchServer { .. }
+        );
         let saved = {
             let mut c = lock(&this.cfg);
             apply_offline(&mut c, cmd);
@@ -579,7 +572,9 @@ fn apply_offline(c: &mut Config, cmd: Cmd) {
             c.servers.insert(0, s);
         }
         Cmd::SwitchServer { addr, .. } => {
-            // activate_server handles autojoin_by_server (like client engine's switch_server)
+            // Автовход: список прежнего сервера уходит в `autojoin_by_server`,
+            // поднимается список нового — как в `switch_server` движка.
+            // Единственный вызов `activate_server` на этом пути.
             c.activate_server(addr);
         }
         _ => {}
