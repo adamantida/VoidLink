@@ -114,6 +114,7 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
         server_sel: None,
         debug: false,
         ui_mode: None,
+        offline: false,
         args: Vec::new(),
     };
     let mut i = 0;

@@ -22,7 +22,7 @@ use tunnel_protocol as proto;
 use crate::engine::{self, Cmd, Engine, Event, Groups, Meta, Stats};
 use crate::invites::{IncomingInvite, InviteOutcome, PendingInvites};
 use crate::snapshot::{CfgView, GroupSnap, MetaSnap, Snapshot, StatsSnap};
-use crate::store::Config;
+use crate::store::{Config, StoredFriend, StoredServer};
 
 /// Кто я: pubkey и friend code (секретов нет).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,14 +259,16 @@ impl EngineApi for LocalEngine {
     }
 
     fn save_theme(&self, theme: &str) -> Result<()> {
-        self.edit_cfg(|c| c.theme = theme.to_string())
+        self.edit_cfg(|c| c.theme = theme.to_string());
+        Ok(())
     }
 
     fn save_adapter(&self, name: &str, dll: &str) -> Result<()> {
         self.edit_cfg(|c| {
             c.adapter = name.to_string();
             c.dll = dll.to_string();
-        })
+        });
+        Ok(())
     }
 }
 
@@ -279,13 +281,13 @@ pub struct OfflineEngine {
 }
 
 impl OfflineEngine {
-    pub fn new(cfg: Arc<Mutex<Config>>, identity: &tunnel_protocol::Identity) -> Self {
+    pub fn new(cfg: Arc<Config>, identity: &tunnel_protocol::Identity) -> Self {
         let me = Me {
             my_pub: identity.ed_pub(),
             my_code: identity.friend_code(),
         };
         OfflineEngine {
-            cfg,
+            cfg: Arc::new(Mutex::new((*cfg).clone())),
             me,
             changed: AtomicBool::new(true),
         }
@@ -296,13 +298,12 @@ impl OfflineEngine {
         let groups = Vec::new(); // No groups in offline mode
         let meta = MetaSnap {
             connected: false,
-            transport: Transport::Udp,
-            server: "0.0.0.0:0".parse().unwrap(),
+            server: "0.0.0.0:0".to_string(),
             server_label: String::new(),
             group_list: Vec::new(),
             rx_hist: Vec::new(),
             tx_hist: Vec::new(),
-            started: now,
+            uptime_s: 0,
         };
         let cfg = CfgView::from_cfg(&lock(&self.cfg));
         Snapshot {
@@ -347,7 +348,7 @@ impl EngineApi for OfflineEngine {
                 let hex = proto::hex_of(&pubkey);
                 match cfg.friends.iter_mut().find(|f| f.pubkey == hex) {
                     Some(f) => f.alias = alias,
-                    None => cfg.friends.push(store::StoredFriend { pubkey: hex, alias }),
+                    None => cfg.friends.push(StoredFriend { pubkey: hex, alias }),
                 }
             }
             Cmd::DelFriend(pubkey) => {
@@ -372,7 +373,7 @@ impl EngineApi for OfflineEngine {
                         s.pubkey = hex;
                         s.label = label;
                     }
-                    None => cfg.servers.push(store::StoredServer {
+                    None => cfg.servers.push(StoredServer {
                         addr: sa.map(|a| a.to_string()).unwrap_or(addr),
                         pubkey: hex,
                         label,
@@ -411,14 +412,16 @@ impl EngineApi for OfflineEngine {
     }
 
     fn save_theme(&self, theme: &str) -> Result<()> {
-        self.edit_cfg(|c| c.theme = theme.to_string())
+        self.edit_cfg(|c| c.theme = theme.to_string());
+        Ok(())
     }
 
     fn save_adapter(&self, name: &str, dll: &str) -> Result<()> {
         self.edit_cfg(|c| {
             c.adapter = name.to_string();
             c.dll = dll.to_string();
-        })
+        });
+        Ok(())
     }
 
     fn unavailable(&self) -> bool {
