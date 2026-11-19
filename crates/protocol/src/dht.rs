@@ -39,6 +39,50 @@ pub const MAX_PENDING_LOOKUPS: usize = 32;
 /// State file name
 pub const STATE_FILE: &str = "dht_state.bin";
 
+/// DHT frame magic bytes
+pub const DHT_MAGIC: [u8; 4] = *b"DHT1";
+/// DHT frame type byte
+pub const DHT_FRAME_TYPE: u8 = 0x17;
+
+/// Result of a FindValue query
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValueResult {
+    Found(RelayTicket),
+    Nodes(Vec<NodeContact>),
+}
+
+/// Encode a DHT message into a UDP frame (magic + type + bincode payload)
+pub fn encode_dht_frame(msg: &DhtMessage) -> Vec<u8> {
+    let payload = bincode::serialize(msg).expect("encode DhtMessage");
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.extend_from_slice(&DHT_MAGIC);
+    frame.push(DHT_FRAME_TYPE);
+    frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Decode a DHT frame into a message
+pub fn decode_dht_frame(bytes: &[u8]) -> Result<DhtMessage> {
+    ensure!(bytes.len() >= 7, "DHT frame too short");
+    ensure!(bytes[..4] == DHT_MAGIC, "bad DHT magic");
+    ensure!(bytes[4] == DHT_FRAME_TYPE, "bad DHT frame type");
+    let len = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+    let payload = &bytes[7..];
+    ensure!(payload.len() == len, "DHT frame length mismatch");
+    bincode::deserialize(payload).map_err(|e| anyhow!("decode DhtMessage: {}", e))
+}
+
+/// Encode a DHT message for UDP sending (alias for encode_dht_frame)
+pub fn encode_dht_msg(msg: &DhtMessage) -> Vec<u8> {
+    encode_dht_frame(msg)
+}
+
+/// Decode a DHT message from UDP payload (alias for decode_dht_frame)
+pub fn decode_dht_msg(bytes: &[u8]) -> Result<DhtMessage> {
+    decode_dht_frame(bytes)
+}
+
 /// Serialize [u8; 64] as bytes
 fn serialize_signature<S>(sig: &[u8; 64], serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
@@ -209,6 +253,93 @@ impl NodeContact {
     /// Bucket index for this node relative to target
     pub fn bucket_index_for(&self, target: &NodeId) -> usize {
         bucket_index(&self.id, target)
+    }
+
+    /// Serialize NodeContact to bytes for DHT_BOOTSTRAP payload.
+    /// Format: id(32) | addr_type(1) | addr(4 or 16) | port(2) | last_seen(8) | tcp_addr_flag(1) | tcp_addr(optional)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(32 + 1 + 18 + 8 + 1 + 18);
+        v.extend_from_slice(&self.id);
+        match self.addr {
+            SocketAddr::V4(v4) => {
+                v.push(4);
+                v.extend_from_slice(&v4.ip().octets());
+                v.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            SocketAddr::V6(v6) => {
+                v.push(6);
+                v.extend_from_slice(&v6.ip().octets());
+                v.extend_from_slice(&v6.port().to_be_bytes());
+            }
+        }
+        v.extend_from_slice(&self.last_seen.to_be_bytes());
+        v.push(0); // tcp_addr not used, but kept for compatibility
+        v
+    }
+
+    /// Deserialize NodeContact from bytes.
+    pub fn from_bytes(mut data: &[u8]) -> Result<Self> {
+        ensure!(data.len() >= 33, "NodeContact too short");
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&data[..32]);
+        data = &data[32..];
+
+        ensure!(!data.is_empty(), "missing addr type");
+        let addr = match data[0] {
+            4 => {
+                ensure!(data.len() >= 1 + 4 + 2, "IPv4 addr too short");
+                let ip = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&data[1..5])?);
+                let port = u16::from_be_bytes(<[u8; 2]>::try_from(&data[5..7])?);
+                data = &data[7..];
+                SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))
+            }
+            6 => {
+                ensure!(data.len() >= 1 + 16 + 2, "IPv6 addr too short");
+                let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[1..17])?);
+                let port = u16::from_be_bytes(<[u8; 2]>::try_from(&data[17..19])?);
+                data = &data[19..];
+                SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))
+            }
+            _ => anyhow::bail!("invalid addr type"),
+        };
+
+        ensure!(data.len() >= 8, "missing last_seen");
+        let last_seen = u64::from_be_bytes(<[u8; 8]>::try_from(&data[..8])?);
+        data = &data[8..];
+
+        // tcp_addr flag (0 = none, 1 = present)
+        let _tcp_addr = if !data.is_empty() && data[0] == 1 {
+            data = &data[1..];
+            ensure!(!data.is_empty(), "missing tcp addr type");
+            match data[0] {
+                4 => {
+                    ensure!(data.len() >= 1 + 4 + 2, "TCP IPv4 addr too short");
+                    let ip = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&data[1..5])?);
+                    let port = u16::from_be_bytes(<[u8; 2]>::try_from(&data[5..7])?);
+                    data = &data[7..];
+                    Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+                }
+                6 => {
+                    ensure!(data.len() >= 1 + 16 + 2, "TCP IPv6 addr too short");
+                    let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[1..17])?);
+                    let port = u16::from_be_bytes(<[u8; 2]>::try_from(&data[17..19])?);
+                    data = &data[19..];
+                    Some(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0)))
+                }
+                _ => anyhow::bail!("invalid tcp addr type"),
+            }
+        } else {
+            None
+        };
+        // _tcp_addr intentionally unused for now (reserved for future TCP DHT connections)
+
+        Ok(Self {
+            id,
+            addr,
+            last_seen,
+            relay_capacity: 0,
+            relay_ticket: None,
+        })
     }
 }
 
@@ -755,15 +886,7 @@ impl DhtNode {
     }
 }
 
-/// Encode a DHT message for UDP sending
-pub fn encode_dht_msg(msg: &DhtMessage) -> Vec<u8> {
-    msg.encode()
-}
 
-/// Decode a DHT message from UDP payload
-pub fn decode_dht_msg(bytes: &[u8]) -> Result<DhtMessage> {
-    DhtMessage::decode(bytes)
-}
 
 #[cfg(test)]
 mod tests {

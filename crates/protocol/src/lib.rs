@@ -109,6 +109,8 @@ pub mod ctrl {
     pub const CANDIDATES: u8 = 0x15;
     /// invisible bool (`enc_presence`).
     pub const PRESENCE: u8 = 0x16;
+    /// DHT bootstrap request (client → server, empty body).
+    pub const DHT_BOOTSTRAP_REQ: u8 = 0x17;
 
     /// Открытым текстом, `handshake::Welcome`.
     pub const WELCOME: u8 = 0x81;
@@ -143,6 +145,8 @@ pub mod ctrl {
     /// сервере после обработки (`enc_presence`). Шлётся на каждый PRESENCE,
     /// и на повтор без изменения: клиент повторяет PRESENCE, пока не получит.
     pub const PRESENCE_ACK: u8 = 0x91;
+    /// DHT bootstrap response (server → client): signed list of NodeContacts.
+    pub const DHT_BOOTSTRAP: u8 = 0x92;
 
     /// Фреймы, которые ходят открытым текстом (всё прочее — шифрованные ctrl
     /// или фреймы группы).
@@ -150,6 +154,7 @@ pub mod ctrl {
         matches!(
             typ,
             HELLO | HELLO3 | WELCOME | CHALLENGE | RESET | UNSUPPORTED
+                | DHT_BOOTSTRAP_REQ | DHT_BOOTSTRAP
         )
     }
 }

@@ -31,14 +31,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use proto::ctrl;
-use proto::dht::{NodeId, RelayTicket};
+use proto::dht::{NodeId, RelayTicket, DhtNode as ProtoDhtNode, DhtMessage, encode_dht_msg, decode_dht_msg, NodeContact};
 use proto::handshake;
 use proto::payloads;
 use tunnel_protocol as proto;
 
-use crate::dht::DhtNode;
 use crate::store::{Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
+use crate::path::{Path, PathSelector, NatType};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
