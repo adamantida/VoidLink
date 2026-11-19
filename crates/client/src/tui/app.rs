@@ -920,7 +920,11 @@ impl App {
                 // Ответ на чужой запрос из истории — карточку не открываем.
                 E::FriendGroups { .. } if self.replaying => {}
                 E::FriendGroups { pubkey, items } => self.on_friend_groups(pubkey, items),
-                E::ServerPingResult { addr, rtt_ms, success } => {
+                E::ServerPingResult {
+                    addr,
+                    rtt_ms,
+                    success,
+                } => {
                     // Update server ping in servers screen if visible
                     if let Some(Popup::Servers(s)) = self.stack.last_mut() {
                         s.update_ping(addr, rtt_ms);
@@ -2616,7 +2620,9 @@ impl App {
             }),
             ServersAction::Delete(i) => Then::Cmd(Cmd::DelServer { idx: *i }),
             ServersAction::SetAdapter { name, dll } => Then::Adapter(name.clone(), dll.clone()),
-            ServersAction::Close | ServersAction::Switch(_) | ServersAction::Ping(_) => Then::Nothing,
+            ServersAction::Close | ServersAction::Switch(_) | ServersAction::Ping(_) => {
+                Then::Nothing
+            }
         };
         let (cmd, save) = self.servers_apply(act, &mut cfg);
         if save {
@@ -2724,10 +2730,7 @@ impl App {
                         self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
                         return (None, false);
                     };
-                    (
-                        Some(Cmd::PingServer { addr }),
-                        false,
-                    )
+                    (Some(Cmd::PingServer { addr }), false)
                 } else {
                     (None, false)
                 }

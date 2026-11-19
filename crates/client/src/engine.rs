@@ -31,73 +31,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use proto::ctrl;
-use proto::dht::{NodeId, RelayTicket, DhtNode as ProtoDhtNode};
 use proto::handshake;
 use proto::payloads;
 use tunnel_protocol as proto;
 
 use crate::store::{Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
-use crate::path::{NatType, PathSelector, RelayTicket as PathRelayTicket, DhtNode as PathDhtNode};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
-
-/// Wrapper around protocol DHT node implementing PathDhtNode trait.
-/// Converts protocol DHT types to path selection types.
-struct ProtocolDhtWrapper {
-    inner: Arc<Mutex<ProtoDhtNode>>,
-    // Cache RTT estimates for relays (optional, could be extended)
-    relay_rtt: Mutex<HashMap<NodeId, u32>>,
-}
-
-impl ProtocolDhtWrapper {
-    fn new(inner: Arc<Mutex<ProtoDhtNode>>) -> Self {
-        Self {
-            inner,
-            relay_rtt: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl PathDhtNode for ProtocolDhtWrapper {
-    /// Get a relay ticket for the target peer by finding the best relay via DHT.
-    fn get_relay_ticket(&self, target: NodeId) -> Option<PathRelayTicket> {
-        // Use DHT's select_relay to find closest relay with sufficient capacity
-        // Minimum 1 Mbps capacity for a viable relay
-        let dht = self.inner.lock().unwrap();
-        let contact = dht.select_relay(&target, 1)?;
-        
-        // Convert NodeContact to path::RelayTicket
-        // Estimate latency from cached RTT or use a default
-        let latency_ms = self.relay_rtt
-            .lock()
-            .unwrap()
-            .get(&contact.id)
-            .copied()
-            .unwrap_or(50); // Default 50ms if unknown
-
-        Some(PathRelayTicket {
-            relay_addr: contact.addr,
-            latency_ms,
-            expires_at: contact.relay_ticket.as_ref().map(|t| t.expires_at).unwrap_or(u64::MAX),
-            relay_pubkey: contact.id,
-        })
-    }
-
-    /// NAT type not available from DHT - return None.
-    fn get_nat_type(&self, _target: NodeId) -> Option<NatType> {
-        None
-    }
-
-    /// Get estimated bandwidth to a peer via relay.
-    /// Returns the relay's advertised capacity if we have a relay for this target.
-    fn get_bandwidth_estimate(&self, target: NodeId) -> Option<u32> {
-        let dht = self.inner.lock().unwrap();
-        let contact = dht.select_relay(&target, 1)?;
-        Some(contact.relay_capacity)
-    }
-}
 
 /// Имя адаптера по умолчанию: Windows — имя wintun-адаптера, Linux — имя
 /// TUN-интерфейса, macOS — игнорируется (ядро само выдаёт utunN).
@@ -1068,17 +1010,6 @@ impl TunDev for crate::tun_macos::Utun {
 
 // ---------- общий контекст потоков ----------
 
-/// Кандидат для релей-маршрута к пиру.
-#[derive(Debug, Clone)]
-pub enum RelayCandidate {
-    /// Прямое соединение (есть direct_addr).
-    Direct,
-    /// Через DHT-релей (имеем RelayTicket).
-    DhtRelay(RelayTicket),
-    /// Через серверный релей (fallback).
-    ServerRelay,
-}
-
 struct Env {
     groups: Groups,
     meta: Arc<Mutex<Meta>>,
@@ -1096,13 +1027,6 @@ struct Env {
     tun: Arc<dyn TunDev>,
     quit: AtomicBool,
     key_log: KeyLog,
-    /// DHT узел (protocol implementation) для peer discovery и relay routing.
-    /// Wrapped in Arc<Mutex<>> to allow mutable access from multiple places.
-    dht: Mutex<Option<Arc<Mutex<ProtoDhtNode>>>>,
-    /// DHT wrapper implementing PathDhtNode trait.
-    dht_wrapper: Mutex<Option<Arc<ProtocolDhtWrapper>>>,
-    /// Path selector for optimal route selection (Direct -> DHT Relay -> Server Relay).
-    path_selector: Mutex<PathSelector>,
 }
 
 impl Env {
@@ -1158,40 +1082,6 @@ impl Env {
         f(&mut cfg);
         (self.save)(&cfg);
     }
-
-    /// Получить кандидатов релей для целевого пира по его NodeId (pubkey).
-    /// Используется при отправке DATA пиру без прямого соединения.
-    fn get_relay_candidates(&self, target_pubkey: NodeId) -> Vec<RelayCandidate> {
-        let mut candidates = Vec::new();
-
-        // 1. Проверяем прямой канал - ищем пира по pubkey во всех группах
-        let has_direct = {
-            let groups = self.groups.lock().unwrap();
-            groups.values().any(|g| {
-                g.members.values().any(|p| p.pubkey == target_pubkey && p.direct_addr.is_some())
-            })
-        };
-        if has_direct {
-            candidates.push(RelayCandidate::Direct);
-        }
-
-        // 2. Пытаемся получить DHT relay ticket через select_relay
-        if let Some(dht_arc) = self.dht.lock().unwrap().as_ref() {
-            let dht = dht_arc.lock().unwrap();
-            if let Some(contact) = dht.select_relay(&target_pubkey, 1) {
-                if let Some(ticket) = contact.relay_ticket {
-                    candidates.push(RelayCandidate::DhtRelay(ticket));
-                }
-            }
-        }
-
-        // 3. Fallback: серверный релей (всегда доступен, если подключены к серверу)
-        if !self.quitting() {
-            candidates.push(RelayCandidate::ServerRelay);
-        }
-
-        candidates
-    }
 }
 
 fn epoch_ms() -> u64 {
@@ -1230,6 +1120,51 @@ fn unsupported_msg(body: &[u8]) -> String {
             proto::PROTOCOL_VERSION
         ),
         Err(_) => "сервер другой версии протокола".into(),
+    }
+}
+
+/// Сколько просим у ядра под очередь приёма UDP. Длинное сообщение сервера
+/// (GROUP_STATE группы на 253 участника — ~215 КБ, ~175 кусков FRAG) приходит
+/// залпом; дефолтных 64 КБ на Windows не хватает, и часть датаграмм ядро
+/// выбрасывает — сборка FRAG не завершается никогда. 4 МиБ — с запасом на
+/// несколько таких сообщений подряд.
+const UDP_RECV_BUF: usize = 4 << 20;
+
+/// Просит у ядра увеличенный буфер приёма UDP. Ошибка не критична: остаётся
+/// дефолт, и длинные сообщения могут теряться (см. [`UDP_RECV_BUF`]).
+#[cfg(unix)]
+fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `sock` жив всё время вызова, `len` — корректный `c_int`,
+    // размер переданного значения совпадает с `optlen`.
+    unsafe {
+        let len = bytes as libc::c_int;
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw const len).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Windows-вариант: `SO_RCVBUF` через Winsock (`std` такого сеттера не даёт).
+#[cfg(windows)]
+fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SO_RCVBUF, SOL_SOCKET, setsockopt};
+    // SAFETY: `sock` жив всё время вызова, `len` — корректный `i32`,
+    // размер переданного значения совпадает с `optlen`.
+    unsafe {
+        let len = bytes as i32;
+        let _ = setsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (&raw const len).cast(),
+            size_of::<i32>() as i32,
+        );
     }
 }
 
@@ -1508,6 +1443,7 @@ impl CtrlConn {
     ) -> Result<Self> {
         let sock = Arc::new(UdpSocket::bind(bind_addr(server)).context("bind udp")?);
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+        set_recv_buffer(&sock, UDP_RECV_BUF);
         let flags = hello_flags(cfg);
         let mut hs = Handshake::new();
         let started = Instant::now();
@@ -1884,48 +1820,6 @@ pub fn start(
     }
 }
 
-/// Инициализировать DHT: создать узел, загрузить сохранённые пиры,
-/// запросить bootstrap у сервера.
-fn initialize_dht(env: &Arc<Env>, st: &mut State) {
-    use crate::store::default_dht_state_path;
-
-    let cfg = env.cfg.lock().unwrap();
-    let state_path = if cfg.dht_state_path.is_empty() {
-        default_dht_state_path()
-    } else {
-        std::path::PathBuf::from(&cfg.dht_state_path)
-    };
-    let bootstrap_peers = cfg.dht_peers.clone();
-    drop(cfg);
-
-    // Создаём DHT узел (protocol implementation)
-    let dht_node = Arc::new(Mutex::new(ProtoDhtNode::new(&env.identity, env.sock.local_addr().unwrap(), &state_path)));
-
-    // Загружаем сохранённое состояние
-    {
-        let mut dht = dht_node.lock().unwrap();
-        let _ = dht.load();
-    }
-
-    // Запускаем DHT в фоне с сохранёнными пирами
-    {
-        let mut dht = dht_node.lock().unwrap();
-        dht.bootstrap(bootstrap_peers);
-    }
-
-    // Создаём wrapper для PathSelector
-    let dht_wrapper = Arc::new(ProtocolDhtWrapper::new(dht_node.clone()));
-
-    // Сохраняем в env
-    *env.dht.lock().unwrap() = Some(dht_node);
-    *env.dht_wrapper.lock().unwrap() = Some(dht_wrapper);
-
-    // Запрашиваем bootstrap peers у сервера (DHT_BOOTSTRAP_REQ)
-    // Ответ придёт как DHT_BOOTSTRAP и будет обработан в on_ctrl
-    let req = proto::payloads::enc_dht_bootstrap_req();
-    st.send_ctrl(env, proto::ctrl::DHT_BOOTSTRAP_REQ, &req);
-}
-
 /// Метка сервера из конфига.
 fn server_label(cfg: &Config, server: SocketAddr) -> String {
     cfg.servers
@@ -1970,6 +1864,7 @@ pub fn start_with_tun(
 
     let sock = Arc::new(UdpSocket::bind(bind_addr(server)).context("bind udp")?);
     sock.set_read_timeout(Some(RX_POLL)).ok();
+    set_recv_buffer(&sock, UDP_RECV_BUF);
 
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
     let env = Arc::new(Env {
@@ -1981,14 +1876,11 @@ pub fn start_with_tun(
         save: save.clone(),
         identity,
         server: Mutex::new(server),
-        sock: sock.clone(),
+        sock,
         tcp: Mutex::new(None),
         tun,
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
-        dht: Mutex::new(None),
-        dht_wrapper: Mutex::new(None),
-        path_selector: Mutex::new(PathSelector::new()),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -2023,10 +1915,6 @@ pub fn start_with_tun(
         env.quit.store(true, Ordering::Relaxed);
         return Err(e);
     }
-
-    // Инициализируем DHT после успешного подключения к серверу.
-    // Запрашиваем bootstrap peers у сервера.
-    initialize_dht(&env, &mut st);
 
     spawn_sampler(env.clone());
     {
@@ -2113,15 +2001,6 @@ fn dispatch(
             Some(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
             None => true,
         }
-    } else if typ == proto::dht::DHT_FRAME_TYPE {
-        // DHT фрейм — обрабатываем в DHT узле
-        if let Ok(msg) = proto::dht::decode_dht_frame(datagram) {
-            if let Some(dht_arc) = env.dht.lock().unwrap().as_ref() {
-                let mut dht = dht_arc.lock().unwrap();
-                let _ = dht.handle_message(msg, src);
-            }
-        }
-        true
     } else if src == env.server() {
         in_tx
             .send(Input::Server {
@@ -2939,7 +2818,6 @@ pub fn check_cfg_cmd(cfg: &Config, current: SocketAddr, cmd: &Cmd) -> Option<Str
                 (bad_addr || bad_key).then(|| format!("сервер №{idx}: неверный адрес или ключ"))
             }
         },
-        Cmd::PingServer { .. } => None,
         _ => None,
     }
 }
@@ -3291,21 +3169,6 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 });
             }
         }
-        ctrl::DHT_BOOTSTRAP => {
-            if let Ok(peers) = payloads::dec_dht_bootstrap(payload) {
-                // Обновляем DHT с новыми bootstrap peers
-                if let Some(dht_arc) = env.dht.lock().unwrap().as_ref() {
-                    let mut dht = dht_arc.lock().unwrap();
-                    // Add peers to routing table via bootstrap
-                    dht.bootstrap(peers.clone());
-                    // Сохраняем пиры в конфиг для следующего запуска (берём до 50 известных узлов)
-                    let known_nodes = dht.known_nodes(50);
-                    env.update_cfg(|c| {
-                        c.dht_peers = known_nodes;
-                    });
-                }
-            }
-        }
         ctrl::CTRL_PONG => {
             // Handle ping response for RTT measurement
             if let Some((addr, start)) = st.pending_ping.take() {
@@ -3645,8 +3508,8 @@ fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
         .map(|(gid, _)| gid)
 }
 
-/// IP-пакет из адаптера → пиру. Выбираем оптимальный путь:
-/// Direct (прямой) -> DHT Relay -> Server Relay (fallback).
+/// IP-пакет из адаптера → пиру. Напрямую — только если прямой канал жив;
+/// иначе через релей сервера.
 fn route_packet(env: &Env, bytes: &[u8]) {
     if bytes.len() > proto::MAX_GROUP_PAYLOAD {
         return;
@@ -3660,39 +3523,20 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    
-    // Find the group and member, get pubkey and direct_addr
-    let (_gid, target_pubkey, direct_addr, key, h, ctr) = {
+    let (key, h, ctr, target) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
         };
         let gs = g.get_mut(&gid).expect("pick_group вернул свою группу");
-        let member = match gs.members.get(&dst) {
-            Some(m) => m,
-            None => return,
-        };
-        let target_pubkey = member.pubkey;
-        let direct_addr = member.direct_addr;
+        let target = gs
+            .members
+            .get(&dst)
+            .and_then(|p| p.direct_addr)
+            .unwrap_or_else(|| env.server());
         let (k, h, c) = gs.next_frame(gid, dst);
-        (gid, target_pubkey, direct_addr, k, h, c)
+        (k, h, c, target)
     };
-    
-    // Use PathSelector to choose the best path
-    let path = {
-        let selector = env.path_selector.lock().unwrap();
-        let dht_wrapper = env.dht_wrapper.lock().unwrap();
-        let dht_opt = dht_wrapper.as_ref().map(|w| w.as_ref() as &dyn PathDhtNode);
-        selector.select_path(
-            target_pubkey,
-            dht_opt,
-            env.server(),
-            direct_addr,
-            NatType::Unknown, // Could be improved with actual NAT type detection
-        )
-    };
-    
-    let target = path.target_addr();
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     env.send(&frame, target);
 }

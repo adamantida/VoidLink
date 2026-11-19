@@ -83,7 +83,11 @@ impl TcpLink {
             thread::Builder::new()
                 .name("tcp-link-rx".into())
                 .spawn(move || {
-                    reader_loop(read_half, tx);
+                    // `tx.clone()`: оригинальный `Sender` живёт до конца
+                    // замыкания, поэтому «канал закрыт» виден получателю не
+                    // раньше, чем выставлен `alive = false`. Иначе между
+                    // `Disconnected` и `is_alive()` остаётся окно гонки.
+                    reader_loop(read_half, tx.clone());
                     alive.store(false, Ordering::SeqCst);
                 })?
         };

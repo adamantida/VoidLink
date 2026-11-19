@@ -35,9 +35,6 @@ const USAGE: &str = "\
   --tcp / --no-tcp          TCP-фолбэк на том же порту, что UDP (включён)
   --metrics <addr>          HTTP-метрики: /metrics (Prometheus) и /healthz,
                             например 127.0.0.1:9100 (по умолчанию выключены)
-  --s2s-port <port>         UDP порт для server-to-server (5556)
-  --relay-capacity <mbps>   объявленная пропускная способность релея, Мбит/с (1000)
-  --s2s-bootstrap <list>    bootstrap peers: \"pubkey_hex:addr,pubkey_hex:addr,...\"
 
 SIGTERM/SIGINT (Windows: Ctrl+C, закрытие консоли) — корректная остановка:
 воркеры останавливаются, состояние сохраняется, код выхода 0. Повторный
@@ -129,12 +126,6 @@ fn main() -> Result<()> {
             "--invite-ttl-days" => {
                 let days: u64 = value(&args, i, a)?;
                 l.invite_ttl = Duration::from_secs(days.saturating_mul(24 * 3600));
-            }
-            "--s2s-port" => cfg.s2s_port = value(&args, i, a)?,
-            "--relay-capacity" => cfg.relay_capacity_mbps = value(&args, i, a)?,
-            "--s2s-bootstrap" => {
-                let list: String = value(&args, i, a)?;
-                cfg.s2s_bootstrap = list.split(',').map(|s| s.trim().to_string()).collect();
             }
             "-q" | "--quiet" => {
                 cfg.quiet = true;

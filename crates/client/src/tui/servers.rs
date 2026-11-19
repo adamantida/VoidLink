@@ -250,11 +250,9 @@ impl ServersView {
                     error: None,
                 });
             }
-            KeyCode::Char('p') => {
-                if self.sel < n {
-                    self.notice = None;
-                    return Some(ServersAction::Ping(self.sel));
-                }
+            KeyCode::Char('p') if self.sel < n => {
+                self.notice = None;
+                return Some(ServersAction::Ping(self.sel));
             }
             _ => {}
         }
@@ -489,7 +487,7 @@ impl ServersView {
                         Span::styled(" ", th.dim)
                     };
                     let key = proto::hex_of(&s.pubkey);
-                    let ping_str = s.ping_ms.map_or("—".to_string(), |p| format!("{} ms", p));
+                    let ping_str = s.ping_ms.map_or("—".to_string(), |p| format!("{p} ms"));
                     Row::new(vec![
                         Cell::from(mark),
                         Cell::from(Span::styled(
