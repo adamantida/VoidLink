@@ -145,7 +145,7 @@ enum PathKey {
 }
 
 /// Configuration for path selection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathConfig {
     /// Path selection strategy.
     pub strategy: PathStrategy,
@@ -172,7 +172,7 @@ impl Default for PathConfig {
 }
 
 /// Path selection strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PathStrategy {
     /// Auto select best path (default).
     #[default]

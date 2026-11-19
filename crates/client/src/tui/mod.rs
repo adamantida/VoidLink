@@ -97,6 +97,30 @@ pub fn run_remote(eng: IpcEngine, ui: &Config) -> Result<()> {
     res
 }
 
+/// Offline режим: TUI без подключения к серверу.
+/// Показывает конфиг, позволяет менять сервер (F3), пинговать серверы.
+/// Движок не поднимается, туннель не создаётся.
+pub fn run_offline(
+    cfg: Arc<Config>,
+    identity: tunnel_protocol::Identity,
+    store: Arc<Store>,
+) -> Result<()> {
+    clock::init();
+    let mut term = setup_terminal(true)?;
+    let eng = crate::api::OfflineEngine::new(cfg.clone(), &identity);
+    let mut app = App::new(eng.me().my_pub, &eng.me().my_code, &cfg);
+    // Конфиг передаётся как есть — адаптер и dll из client.json
+    app.adapter_name = cfg.adapter.clone();
+    app.dll_path = cfg.dll.clone();
+    // Сразу открываем экран «Серверы»
+    app.open_servers_with(&cfg);
+    let res = event_loop(&mut term, &mut app, &eng);
+    restore_terminal(&mut term, true)?;
+    // Сохраняем конфиг при выходе
+    let _ = store.save(&cfg);
+    res
+}
+
 /// `mouse` — захват мыши (клики, колесо; выделение текста терминалом — с
 /// Shift). Экрану первичной настройки мышь не нужна: без захвата поток
 /// событий движения не вызывает лишних перерисовок.

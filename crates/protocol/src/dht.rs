@@ -884,6 +884,13 @@ impl DhtNode {
     pub fn node_count(&self) -> usize {
         self.routing.total_nodes()
     }
+
+    /// Get known nodes for persistence (up to limit)
+    pub fn known_nodes(&self, limit: usize) -> Vec<NodeContact> {
+        let mut nodes = self.routing.all_nodes();
+        nodes.truncate(limit);
+        nodes
+    }
 }
 
 

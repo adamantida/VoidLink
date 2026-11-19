@@ -86,6 +86,8 @@ struct Globals {
     debug: bool,
     /// `--embedded` / `--remote` для `tui` (по умолчанию — по наличию демона).
     ui_mode: Option<UiMode>,
+    /// `--offline` для `tui` — запуск без подключения к серверу.
+    offline: bool,
     /// Подкоманда и её аргументы.
     args: Vec<String>,
 }
@@ -161,6 +163,9 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
                 bail!("--embedded и --remote взаимоисключающие");
             }
             g.ui_mode = Some(m);
+            args.remove(i);
+        } else if a == "--offline" {
+            g.offline = true;
             args.remove(i);
         } else {
             i += 1;

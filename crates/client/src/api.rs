@@ -270,6 +270,170 @@ impl EngineApi for LocalEngine {
     }
 }
 
+/// Offline Engine: provides config snapshot without connecting to a server.
+/// Used for TUI offline mode (--offline flag).
+pub struct OfflineEngine {
+    cfg: Arc<Mutex<Config>>,
+    me: Me,
+    changed: AtomicBool,
+}
+
+impl OfflineEngine {
+    pub fn new(cfg: Arc<Mutex<Config>>, identity: &tunnel_protocol::Identity) -> Self {
+        let me = Me {
+            my_pub: identity.ed_pub(),
+            my_code: identity.friend_code(),
+        };
+        OfflineEngine {
+            cfg,
+            me,
+            changed: AtomicBool::new(true),
+        }
+    }
+
+    pub fn snapshot_now(&self) -> Snapshot {
+        let now = Instant::now();
+        let groups = Vec::new(); // No groups in offline mode
+        let meta = MetaSnap {
+            connected: false,
+            transport: Transport::Udp,
+            server: "0.0.0.0:0".parse().unwrap(),
+            server_label: String::new(),
+            group_list: Vec::new(),
+            rx_hist: Vec::new(),
+            tx_hist: Vec::new(),
+            started: now,
+        };
+        let cfg = CfgView::from_cfg(&lock(&self.cfg));
+        Snapshot {
+            groups,
+            meta,
+            stats: StatsSnap::default(),
+            cfg,
+            pending_invites: Vec::new(),
+        }
+    }
+}
+
+impl EngineApi for OfflineEngine {
+    fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::new(self.snapshot_now())
+    }
+
+    fn poll_events(&self) -> Vec<Event> {
+        Vec::new() // No events in offline mode
+    }
+
+    fn send(&self, cmd: Cmd) -> Result<()> {
+        // Only allow config editing commands in offline mode
+        let current: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        if let Some(e) = engine::check_cfg_cmd(&lock(&self.cfg), current, &cmd) {
+            return Err(anyhow!(e));
+        }
+        // For offline mode, apply config changes directly
+        let mut cfg = lock(&self.cfg);
+        match cmd {
+            Cmd::SetName(name) => cfg.name = name,
+            Cmd::SetStatus(text) => cfg.status = text,
+            Cmd::SetInvisible(on) => cfg.invisible = on,
+            Cmd::ToggleAutojoin(gid) => {
+                if let Some(i) = cfg.autojoin.iter().position(|g| *g == gid) {
+                    cfg.autojoin.remove(i);
+                } else {
+                    cfg.autojoin.push(gid);
+                }
+            }
+            Cmd::AddFriend { pubkey, alias } => {
+                let hex = proto::hex_of(&pubkey);
+                match cfg.friends.iter_mut().find(|f| f.pubkey == hex) {
+                    Some(f) => f.alias = alias,
+                    None => cfg.friends.push(store::StoredFriend { pubkey: hex, alias }),
+                }
+            }
+            Cmd::DelFriend(pubkey) => {
+                let hex = proto::hex_of(&pubkey);
+                cfg.friends.retain(|f| f.pubkey != hex);
+            }
+            Cmd::SetAlias { pubkey, alias } => {
+                let hex = proto::hex_of(&pubkey);
+                if let Some(f) = cfg.friends.iter_mut().find(|f| f.pubkey == hex) {
+                    f.alias = alias;
+                }
+            }
+            Cmd::AddServer { addr, pubkey, label } => {
+                let hex = proto::hex_of(&pubkey);
+                let sa: Option<SocketAddr> = addr.parse().ok();
+                match cfg
+                    .servers
+                    .iter_mut()
+                    .find(|s| s.addr.parse::<SocketAddr>().ok() == sa)
+                {
+                    Some(s) => {
+                        s.pubkey = hex;
+                        s.label = label;
+                    }
+                    None => cfg.servers.push(store::StoredServer {
+                        addr: sa.map(|a| a.to_string()).unwrap_or(addr),
+                        pubkey: hex,
+                        label,
+                    }),
+                }
+            }
+            Cmd::DelServer { idx } => {
+                if idx < cfg.servers.len() {
+                    cfg.servers.remove(idx);
+                }
+            }
+            Cmd::SetPrimaryServer { idx } if idx < cfg.servers.len() => {
+                let s = cfg.servers.remove(idx);
+                if let Ok(a) = s.addr.parse::<SocketAddr>() {
+                    cfg.activate_server(a);
+                }
+                cfg.servers.insert(0, s);
+            }
+            Cmd::SetPrimaryServer { .. } => {}
+            Cmd::PingServer { addr } => {
+                // In offline mode, we can't ping - return error event
+                // The TUI will show this as a toast
+            }
+            _ => return Err(anyhow!("команда недоступна в автономном режиме")),
+        }
+        self.changed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn me(&self) -> &Me {
+        &self.me
+    }
+
+    fn mode(&self) -> EngineMode {
+        EngineMode::Embedded
+    }
+
+    fn save_theme(&self, theme: &str) -> Result<()> {
+        self.edit_cfg(|c| c.theme = theme.to_string())
+    }
+
+    fn save_adapter(&self, name: &str, dll: &str) -> Result<()> {
+        self.edit_cfg(|c| {
+            c.adapter = name.to_string();
+            c.dll = dll.to_string();
+        })
+    }
+
+    fn unavailable(&self) -> bool {
+        false
+    }
+}
+
+impl OfflineEngine {
+    fn edit_cfg(&self, f: impl FnOnce(&mut Config)) {
+        let mut cfg = lock(&self.cfg);
+        f(&mut cfg);
+        self.changed.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

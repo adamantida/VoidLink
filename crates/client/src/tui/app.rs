@@ -920,15 +920,27 @@ impl App {
                 // Ответ на чужой запрос из истории — карточку не открываем.
                 E::FriendGroups { .. } if self.replaying => {}
                 E::FriendGroups { pubkey, items } => self.on_friend_groups(pubkey, items),
+                E::ServerPingResult { addr, rtt_ms, success } => {
+                    // Update server ping in servers screen if visible
+                    if let Some(Popup::Servers(s)) = self.stack.last_mut() {
+                        s.update_ping(addr, rtt_ms);
+                    }
+                    if success {
+                        if let Some(rtt) = rtt_ms {
+                            self.toast(MsgKind::Ok, format!("пинг {}: {} мс", addr, rtt));
+                        } else {
+                            self.toast(MsgKind::Ok, format!("пинг {}: OK", addr));
+                        }
+                    } else {
+                        self.toast(MsgKind::Error, format!("пинг {}: таймаут", addr));
+                    }
+                }
                 E::Error(e) => {
                     self.log(MsgKind::Error, e.clone());
                     self.toast(MsgKind::Error, e);
                 }
                 E::Notice(n) => {
                     self.log(MsgKind::Info, n);
-                }
-                E::PathSelected { .. } => {
-                    // Path selection telemetry - could update UI badge here
                 }
             }
         }
@@ -2604,7 +2616,7 @@ impl App {
             }),
             ServersAction::Delete(i) => Then::Cmd(Cmd::DelServer { idx: *i }),
             ServersAction::SetAdapter { name, dll } => Then::Adapter(name.clone(), dll.clone()),
-            ServersAction::Close | ServersAction::Switch(_) => Then::Nothing,
+            ServersAction::Close | ServersAction::Switch(_) | ServersAction::Ping(_) => Then::Nothing,
         };
         let (cmd, save) = self.servers_apply(act, &mut cfg);
         if save {
@@ -2705,6 +2717,20 @@ impl App {
                     "адаптер сохранён — применится после перезапуска".into(),
                 );
                 (None, true)
+            }
+            ServersAction::Ping(i) => {
+                if let Some(s) = cfg.servers.get(i) {
+                    let Some(addr) = resolve_addr(&s.addr) else {
+                        self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
+                        return (None, false);
+                    };
+                    (
+                        Some(Cmd::PingServer { addr }),
+                        false,
+                    )
+                } else {
+                    (None, false)
+                }
             }
         }
     }
@@ -3093,6 +3119,7 @@ fn server_entries(cfg: &Config) -> Vec<ServerEntry> {
             label: s.label.clone(),
             addr: s.addr.clone(),
             pubkey: hex32(&s.pubkey).unwrap_or([0; 32]),
+            ping_ms: None,
         })
         .collect()
 }

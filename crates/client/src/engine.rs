@@ -31,17 +31,73 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use proto::ctrl;
-use proto::dht::{NodeId, RelayTicket, DhtNode as ProtoDhtNode, DhtMessage, encode_dht_msg, decode_dht_msg, NodeContact};
+use proto::dht::{NodeId, RelayTicket, DhtNode as ProtoDhtNode};
 use proto::handshake;
 use proto::payloads;
 use tunnel_protocol as proto;
 
 use crate::store::{Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
-use crate::path::{Path, PathSelector, NatType};
+use crate::path::{NatType, PathSelector, RelayTicket as PathRelayTicket, DhtNode as PathDhtNode};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
+
+/// Wrapper around protocol DHT node implementing PathDhtNode trait.
+/// Converts protocol DHT types to path selection types.
+struct ProtocolDhtWrapper {
+    inner: Arc<Mutex<ProtoDhtNode>>,
+    // Cache RTT estimates for relays (optional, could be extended)
+    relay_rtt: Mutex<HashMap<NodeId, u32>>,
+}
+
+impl ProtocolDhtWrapper {
+    fn new(inner: Arc<Mutex<ProtoDhtNode>>) -> Self {
+        Self {
+            inner,
+            relay_rtt: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl PathDhtNode for ProtocolDhtWrapper {
+    /// Get a relay ticket for the target peer by finding the best relay via DHT.
+    fn get_relay_ticket(&self, target: NodeId) -> Option<PathRelayTicket> {
+        // Use DHT's select_relay to find closest relay with sufficient capacity
+        // Minimum 1 Mbps capacity for a viable relay
+        let dht = self.inner.lock().unwrap();
+        let contact = dht.select_relay(&target, 1)?;
+        
+        // Convert NodeContact to path::RelayTicket
+        // Estimate latency from cached RTT or use a default
+        let latency_ms = self.relay_rtt
+            .lock()
+            .unwrap()
+            .get(&contact.id)
+            .copied()
+            .unwrap_or(50); // Default 50ms if unknown
+
+        Some(PathRelayTicket {
+            relay_addr: contact.addr,
+            latency_ms,
+            expires_at: contact.relay_ticket.as_ref().map(|t| t.expires_at).unwrap_or(u64::MAX),
+            relay_pubkey: contact.id,
+        })
+    }
+
+    /// NAT type not available from DHT - return None.
+    fn get_nat_type(&self, _target: NodeId) -> Option<NatType> {
+        None
+    }
+
+    /// Get estimated bandwidth to a peer via relay.
+    /// Returns the relay's advertised capacity if we have a relay for this target.
+    fn get_bandwidth_estimate(&self, target: NodeId) -> Option<u32> {
+        let dht = self.inner.lock().unwrap();
+        let contact = dht.select_relay(&target, 1)?;
+        Some(contact.relay_capacity)
+    }
+}
 
 /// Имя адаптера по умолчанию: Windows — имя wintun-адаптера, Linux — имя
 /// TUN-интерфейса, macOS — игнорируется (ядро само выдаёт utunN).
@@ -669,6 +725,12 @@ pub enum Event {
         addr: SocketAddr,
         label: String,
     },
+    /// Результат проверки пинга сервера.
+    ServerPingResult {
+        addr: SocketAddr,
+        rtt_ms: Option<u32>,
+        success: bool,
+    },
     Error(String),
     Notice(String),
 }
@@ -739,6 +801,10 @@ pub enum Cmd {
     /// Подсказка «сеть могла смениться» (выход из сна): новое рукопожатие
     /// сразу, без ожидания таймеров и бэкоффа; группы и адаптер — те же.
     Reconnect,
+    /// Проверить пинг до сервера (CTRL_PING/CTRL_PONG).
+    PingServer {
+        addr: SocketAddr,
+    },
     Quit,
 }
 
@@ -1030,8 +1096,13 @@ struct Env {
     tun: Arc<dyn TunDev>,
     quit: AtomicBool,
     key_log: KeyLog,
-    /// DHT узел для peer discovery и relay routing.
-    dht: Mutex<Option<Arc<DhtNode>>>,
+    /// DHT узел (protocol implementation) для peer discovery и relay routing.
+    /// Wrapped in Arc<Mutex<>> to allow mutable access from multiple places.
+    dht: Mutex<Option<Arc<Mutex<ProtoDhtNode>>>>,
+    /// DHT wrapper implementing PathDhtNode trait.
+    dht_wrapper: Mutex<Option<Arc<ProtocolDhtWrapper>>>,
+    /// Path selector for optimal route selection (Direct -> DHT Relay -> Server Relay).
+    path_selector: Mutex<PathSelector>,
 }
 
 impl Env {
@@ -1104,10 +1175,13 @@ impl Env {
             candidates.push(RelayCandidate::Direct);
         }
 
-        // 2. Пытаемся получить DHT relay ticket
-        if let Some(dht) = self.dht.lock().unwrap().as_ref() {
-            if let Some(ticket) = dht.find_relay_ticket(target_pubkey) {
-                candidates.push(RelayCandidate::DhtRelay(ticket));
+        // 2. Пытаемся получить DHT relay ticket через select_relay
+        if let Some(dht_arc) = self.dht.lock().unwrap().as_ref() {
+            let dht = dht_arc.lock().unwrap();
+            if let Some(contact) = dht.select_relay(&target_pubkey, 1) {
+                if let Some(ticket) = contact.relay_ticket {
+                    candidates.push(RelayCandidate::DhtRelay(ticket));
+                }
             }
         }
 
@@ -1816,7 +1890,6 @@ fn initialize_dht(env: &Arc<Env>, st: &mut State) {
     use crate::store::default_dht_state_path;
 
     let cfg = env.cfg.lock().unwrap();
-    let our_id = env.identity.ed_pub();
     let state_path = if cfg.dht_state_path.is_empty() {
         default_dht_state_path()
     } else {
@@ -1825,14 +1898,27 @@ fn initialize_dht(env: &Arc<Env>, st: &mut State) {
     let bootstrap_peers = cfg.dht_peers.clone();
     drop(cfg);
 
-    // Создаём DHT узел
-    let dht_node = Arc::new(DhtNode::new(our_id, env.sock.clone(), state_path));
+    // Создаём DHT узел (protocol implementation)
+    let dht_node = Arc::new(Mutex::new(ProtoDhtNode::new(&env.identity, env.sock.local_addr().unwrap(), &state_path)));
+
+    // Загружаем сохранённое состояние
+    {
+        let mut dht = dht_node.lock().unwrap();
+        let _ = dht.load();
+    }
 
     // Запускаем DHT в фоне с сохранёнными пирами
-    let _handle = dht_node.start(bootstrap_peers);
+    {
+        let mut dht = dht_node.lock().unwrap();
+        dht.bootstrap(bootstrap_peers);
+    }
+
+    // Создаём wrapper для PathSelector
+    let dht_wrapper = Arc::new(ProtocolDhtWrapper::new(dht_node.clone()));
 
     // Сохраняем в env
-    *env.dht.lock().unwrap() = Some(dht_node.clone());
+    *env.dht.lock().unwrap() = Some(dht_node);
+    *env.dht_wrapper.lock().unwrap() = Some(dht_wrapper);
 
     // Запрашиваем bootstrap peers у сервера (DHT_BOOTSTRAP_REQ)
     // Ответ придёт как DHT_BOOTSTRAP и будет обработан в on_ctrl
@@ -1901,6 +1987,8 @@ pub fn start_with_tun(
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
         dht: Mutex::new(None),
+        dht_wrapper: Mutex::new(None),
+        path_selector: Mutex::new(PathSelector::new()),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -2028,8 +2116,9 @@ fn dispatch(
     } else if typ == proto::dht::DHT_FRAME_TYPE {
         // DHT фрейм — обрабатываем в DHT узле
         if let Ok(msg) = proto::dht::decode_dht_frame(datagram) {
-            if let Some(dht) = env.dht.lock().unwrap().as_ref() {
-                dht.handle_message(msg, src);
+            if let Some(dht_arc) = env.dht.lock().unwrap().as_ref() {
+                let mut dht = dht_arc.lock().unwrap();
+                let _ = dht.handle_message(msg, src);
             }
         }
         true
@@ -2123,6 +2212,8 @@ struct State {
     last_rtt: Instant,
     last_punch: Instant,
     last_leave: Instant,
+    /// Ожидающий ответ CTRL_PONG для измерения RTT: (addr, start_time).
+    pending_ping: Option<(SocketAddr, Instant)>,
 }
 
 impl State {
@@ -2158,6 +2249,7 @@ impl State {
             last_rtt: now,
             last_punch: now,
             last_leave: now,
+            pending_ping: None,
         }
     }
 
@@ -2720,6 +2812,23 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             st.new_attempt();
             return;
         }
+        Cmd::PingServer { addr } => {
+            // Send CTRL_PING and measure RTT
+            if let Some(sess) = st.sess.as_mut() {
+                let start = Instant::now();
+                // Store the ping start time to measure RTT on response
+                st.pending_ping = Some((addr, start));
+                let frame = sess.seal(proto::ctrl::CTRL_PING, &[]);
+                env.send(&frame, addr);
+            } else {
+                env.emit(Event::ServerPingResult {
+                    addr,
+                    rtt_ms: None,
+                    success: false,
+                });
+            }
+            return;
+        }
         Cmd::AddFriend { .. }
         | Cmd::DelFriend(_)
         | Cmd::SetAlias { .. }
@@ -2790,7 +2899,8 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::AddServer { .. }
         | Cmd::DelServer { .. }
         | Cmd::SetPrimaryServer { .. }
-        | Cmd::Leave(_) => {}
+        | Cmd::Leave(_)
+        | Cmd::PingServer { .. } => {}
     }
 }
 
@@ -2829,6 +2939,7 @@ pub fn check_cfg_cmd(cfg: &Config, current: SocketAddr, cmd: &Cmd) -> Option<Str
                 (bad_addr || bad_key).then(|| format!("сервер №{idx}: неверный адрес или ключ"))
             }
         },
+        Cmd::PingServer { .. } => None,
         _ => None,
     }
 }
@@ -3183,15 +3294,27 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         ctrl::DHT_BOOTSTRAP => {
             if let Ok(peers) = payloads::dec_dht_bootstrap(payload) {
                 // Обновляем DHT с новыми bootstrap peers
-                if let Some(dht) = env.dht.lock().unwrap().as_ref() {
-                    for peer in peers {
-                        dht.add_contact(peer);
-                    }
-                    // Сохраняем пиры в конфиг для следующего запуска
+                if let Some(dht_arc) = env.dht.lock().unwrap().as_ref() {
+                    let mut dht = dht_arc.lock().unwrap();
+                    // Add peers to routing table via bootstrap
+                    dht.bootstrap(peers.clone());
+                    // Сохраняем пиры в конфиг для следующего запуска (берём до 50 известных узлов)
+                    let known_nodes = dht.known_nodes(50);
                     env.update_cfg(|c| {
-                        c.dht_peers = dht.get_closest_contacts(&dht.our_id, 50);
+                        c.dht_peers = known_nodes;
                     });
                 }
+            }
+        }
+        ctrl::CTRL_PONG => {
+            // Handle ping response for RTT measurement
+            if let Some((addr, start)) = st.pending_ping.take() {
+                let rtt = start.elapsed().as_millis() as u32;
+                env.emit(Event::ServerPingResult {
+                    addr,
+                    rtt_ms: Some(rtt),
+                    success: true,
+                });
             }
         }
         _ => {}
@@ -3522,8 +3645,8 @@ fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
         .map(|(gid, _)| gid)
 }
 
-/// IP-пакет из адаптера → пиру. Напрямую — только если прямой канал жив;
-/// иначе через релей сервера.
+/// IP-пакет из адаптера → пиру. Выбираем оптимальный путь:
+/// Direct (прямой) -> DHT Relay -> Server Relay (fallback).
 fn route_packet(env: &Env, bytes: &[u8]) {
     if bytes.len() > proto::MAX_GROUP_PAYLOAD {
         return;
@@ -3537,20 +3660,39 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    let (key, h, ctr, target) = {
+    
+    // Find the group and member, get pubkey and direct_addr
+    let (_gid, target_pubkey, direct_addr, key, h, ctr) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
         };
         let gs = g.get_mut(&gid).expect("pick_group вернул свою группу");
-        let target = gs
-            .members
-            .get(&dst)
-            .and_then(|p| p.direct_addr)
-            .unwrap_or_else(|| env.server());
+        let member = match gs.members.get(&dst) {
+            Some(m) => m,
+            None => return,
+        };
+        let target_pubkey = member.pubkey;
+        let direct_addr = member.direct_addr;
         let (k, h, c) = gs.next_frame(gid, dst);
-        (k, h, c, target)
+        (gid, target_pubkey, direct_addr, k, h, c)
     };
+    
+    // Use PathSelector to choose the best path
+    let path = {
+        let selector = env.path_selector.lock().unwrap();
+        let dht_wrapper = env.dht_wrapper.lock().unwrap();
+        let dht_opt = dht_wrapper.as_ref().map(|w| w.as_ref() as &dyn PathDhtNode);
+        selector.select_path(
+            target_pubkey,
+            dht_opt,
+            env.server(),
+            direct_addr,
+            NatType::Unknown, // Could be improved with actual NAT type detection
+        )
+    };
+    
+    let target = path.target_addr();
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     env.send(&frame, target);
 }
@@ -3863,6 +4005,7 @@ pub fn run(
             ),
             Event::InvitesSynced { .. } => {}
             Event::FriendGroups { .. } => {}
+            Event::ServerPingResult { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
             Event::Notice(n) => eprintln!("[engine] {n}"),
         }

@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
+use std::net::SocketAddr;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -36,6 +37,8 @@ pub struct ServerEntry {
     pub label: String,
     pub addr: String,
     pub pubkey: [u8; 32],
+    /// Последний измеренный пинг (мс).
+    pub ping_ms: Option<u32>,
 }
 
 /// Форма добавления сервера. `focus`: 0 — адрес, 1 — код, 2 — подпись.
@@ -79,6 +82,8 @@ pub enum ServersAction {
     },
     /// Удалить сервер (никогда не текущий).
     Delete(usize),
+    /// Проверить пинг сервера.
+    Ping(usize),
     /// Новое имя адаптера и путь к dll (пусто — по умолчанию).
     SetAdapter { name: String, dll: String },
     /// Закрыть экран.
@@ -144,6 +149,17 @@ impl ServersView {
         let last = self.servers.len().saturating_sub(1);
         self.current = current.min(last);
         self.sel = self.sel.min(last);
+    }
+
+    /// Обновляет пинг для сервера по адресу.
+    pub fn update_ping(&mut self, addr: SocketAddr, ping_ms: Option<u32>) {
+        let addr_str = addr.to_string();
+        for s in &mut self.servers {
+            if s.addr == addr_str {
+                s.ping_ms = ping_ms;
+                break;
+            }
+        }
     }
 
     // ------------------------------------------------------------ клавиши
@@ -233,6 +249,12 @@ impl ServersView {
                     focus: 0,
                     error: None,
                 });
+            }
+            KeyCode::Char('p') => {
+                if self.sel < n {
+                    self.notice = None;
+                    return Some(ServersAction::Ping(self.sel));
+                }
             }
             _ => {}
         }
@@ -823,6 +845,7 @@ mod tests {
                 },
                 addr: format!("10.0.0.{}:5555", i + 1),
                 pubkey: [i as u8; 32],
+                ping_ms: None,
             })
             .collect();
         ServersView::new(servers, 0, "TunnelVPN", "")
@@ -1028,6 +1051,7 @@ mod tests {
             label: String::new(),
             addr: "vpn.example.org:5555".into(),
             pubkey: id.ed_pub(),
+            ping_ms: None,
         });
         v.mode = Mode::Add(AddForm {
             addr: "other.example.org:1".into(),
