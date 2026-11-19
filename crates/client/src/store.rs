@@ -74,6 +74,9 @@ pub struct Config {
     /// важнее). Применяется после перезапуска.
     #[serde(default)]
     pub dll: String,
+    /// Настройка выбора пути к пирам.
+    #[serde(default)]
+    pub path: PathConfig,
 }
 
 /// Выбор транспорта до сервера.
@@ -87,6 +90,75 @@ pub enum TransportMode {
     Udp,
     /// Только TCP (сервер — по TCP, p2p с пирами — всё равно UDP).
     Tcp,
+}
+
+/// Стратегия выбора пути до пира.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathStrategy {
+    /// Автоматический выбор: прямой → DHT-релей → серверный релей.
+    #[default]
+    Auto,
+    /// Только прямые соединения.
+    DirectOnly,
+    /// Предпочесть релей (если доступен).
+    PreferRelay,
+}
+
+impl PathStrategy {
+    /// Преобразовать в путь модуля path.
+    pub fn to_path_strategy(&self) -> crate::path::PathStrategy {
+        match self {
+            PathStrategy::Auto => crate::path::PathStrategy::Auto,
+            PathStrategy::DirectOnly => crate::path::PathStrategy::DirectOnly,
+            PathStrategy::PreferRelay => crate::path::PathStrategy::PreferRelay,
+        }
+    }
+}
+
+/// Конфигурация выбора пути.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PathConfig {
+    /// Стратегия выбора пути.
+    #[serde(default)]
+    pub strategy: PathStrategy,
+    /// Таймаут прямого соединения (мс).
+    #[serde(default = "default_direct_timeout")]
+    pub direct_timeout_ms: u32,
+    /// Таймаут релейного соединения (мс).
+    #[serde(default = "default_relay_timeout")]
+    pub relay_timeout_ms: u32,
+    /// Максимум неудач до открытия circuit breaker.
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// Время сброса circuit breaker (сек).
+    #[serde(default = "default_circuit_breaker_secs")]
+    pub circuit_breaker_secs: u32,
+}
+
+fn default_direct_timeout() -> u32 {
+    2000
+}
+fn default_relay_timeout() -> u32 {
+    5000
+}
+fn default_max_failures() -> u32 {
+    5
+}
+fn default_circuit_breaker_secs() -> u32 {
+    30
+}
+
+impl Default for PathConfig {
+    fn default() -> Self {
+        Self {
+            strategy: PathStrategy::Auto,
+            direct_timeout_ms: 2000,
+            relay_timeout_ms: 5000,
+            max_failures: 5,
+            circuit_breaker_secs: 30,
+        }
+    }
 }
 
 impl Default for Config {
@@ -108,6 +180,7 @@ impl Default for Config {
             transport: TransportMode::Auto,
             adapter: String::new(),
             dll: String::new(),
+            path: PathConfig::default(),
         }
     }
 }

@@ -37,6 +37,7 @@ use tunnel_protocol as proto;
 
 use crate::store::{Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
+use crate::path::{Path, PathSelector, NatType};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
@@ -643,6 +644,13 @@ pub enum Event {
         from: u32,
         complete: bool,
     },
+    /// Выбран путь к пиру (для TUI/телеметрии).
+    PathSelected {
+        gid: u32,
+        peer_ip: u32,
+        path: Path,
+        score: f32,
+    },
     /// Ответ FRIEND_GROUPS_RESP: группы пира `pubkey` (из самого ответа).
     FriendGroups {
         pubkey: [u8; 32],
@@ -1017,6 +1025,8 @@ struct Env {
     tun: Arc<dyn TunDev>,
     quit: AtomicBool,
     key_log: KeyLog,
+    /// Path selector for optimal peer routing.
+    path_selector: Arc<PathSelector>,
 }
 
 impl Env {
@@ -1824,6 +1834,7 @@ pub fn start_with_tun(
         tun,
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
+        path_selector: Arc::new(PathSelector::new()),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -3434,20 +3445,72 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    let (key, h, ctr, target) = {
+
+    // First, get group info and peer info while holding the lock briefly
+    let (gid, direct_addr, peer_pubkey, peer_endpoint, peer_candidates, server_addr) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
         };
         let gs = g.get_mut(&gid).expect("pick_group вернул свою группу");
-        let target = gs
-            .members
-            .get(&dst)
-            .and_then(|p| p.direct_addr)
-            .unwrap_or_else(|| env.server());
+        let peer = gs.members.get(&dst);
+        let direct_addr = peer.and_then(|p| p.direct_addr);
+        let peer_pubkey = peer.map(|p| p.pubkey);
+        let peer_endpoint = peer.and_then(|p| p.endpoint);
+        let peer_candidates = peer.map(|p| p.candidates.clone()).unwrap_or_default();
+        let server_addr = env.server();
+        (gid, direct_addr, peer_pubkey, peer_endpoint, peer_candidates, server_addr)
+    };
+
+    // Determine NAT type from peer's endpoint/candidates (simplified)
+    let nat_type = if peer_endpoint.is_some() {
+        if peer_candidates.is_empty() {
+            NatType::FullCone
+        } else {
+            NatType::RestrictedCone
+        }
+    } else if peer_pubkey.is_some() {
+        NatType::Symmetric
+    } else {
+        NatType::Unknown
+    };
+
+    // Use path selector to choose best path
+    let path = if let Some(pk) = peer_pubkey {
+        env.path_selector.select_path(
+            pk,
+            None, // DHT node - not implemented yet
+            server_addr,
+            direct_addr,
+            nat_type,
+        )
+    } else {
+        Path::ServerRelay {
+            server_addr,
+            est_rtt_ms: 100,
+        }
+    };
+
+    // Get next_frame with the group lock
+    let (key, h, ctr, target) = {
+        let mut g = env.groups.lock().unwrap();
+        let gs = g.get_mut(&gid).expect("group disappeared");
         let (k, h, c) = gs.next_frame(gid, dst);
+        let target = path.target_addr();
         (k, h, c, target)
     };
+
+    // Emit path selection event for telemetry/TUI
+    if let Some(peer_pubkey) = peer_pubkey {
+        let score = env.path_selector.score_path(&path, peer_pubkey, nat_type, 0);
+        env.emit(Event::PathSelected {
+            gid,
+            peer_ip: dst,
+            path: path.clone(),
+            score,
+        });
+    }
+
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     env.send(&frame, target);
 }
@@ -3760,6 +3823,7 @@ pub fn run(
             ),
             Event::InvitesSynced { .. } => {}
             Event::FriendGroups { .. } => {}
+            Event::PathSelected { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
             Event::Notice(n) => eprintln!("[engine] {n}"),
         }

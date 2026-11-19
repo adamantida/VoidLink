@@ -927,6 +927,9 @@ impl App {
                 E::Notice(n) => {
                     self.log(MsgKind::Info, n);
                 }
+                E::PathSelected { .. } => {
+                    // Path selection telemetry - could update UI badge here
+                }
             }
         }
     }
