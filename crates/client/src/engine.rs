@@ -31,13 +31,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use proto::ctrl;
+use proto::dht::{NodeId, RelayTicket};
 use proto::handshake;
 use proto::payloads;
 use tunnel_protocol as proto;
 
+use crate::dht::DhtNode;
 use crate::store::{Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
-use crate::path::{Path, PathSelector, NatType};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
@@ -644,13 +645,6 @@ pub enum Event {
         from: u32,
         complete: bool,
     },
-    /// Выбран путь к пиру (для TUI/телеметрии).
-    PathSelected {
-        gid: u32,
-        peer_ip: u32,
-        path: Path,
-        score: f32,
-    },
     /// Ответ FRIEND_GROUPS_RESP: группы пира `pubkey` (из самого ответа).
     FriendGroups {
         pubkey: [u8; 32],
@@ -1008,6 +1002,17 @@ impl TunDev for crate::tun_macos::Utun {
 
 // ---------- общий контекст потоков ----------
 
+/// Кандидат для релей-маршрута к пиру.
+#[derive(Debug, Clone)]
+pub enum RelayCandidate {
+    /// Прямое соединение (есть direct_addr).
+    Direct,
+    /// Через DHT-релей (имеем RelayTicket).
+    DhtRelay(RelayTicket),
+    /// Через серверный релей (fallback).
+    ServerRelay,
+}
+
 struct Env {
     groups: Groups,
     meta: Arc<Mutex<Meta>>,
@@ -1025,8 +1030,8 @@ struct Env {
     tun: Arc<dyn TunDev>,
     quit: AtomicBool,
     key_log: KeyLog,
-    /// Path selector for optimal peer routing.
-    path_selector: Arc<PathSelector>,
+    /// DHT узел для peer discovery и relay routing.
+    dht: Mutex<Option<Arc<DhtNode>>>,
 }
 
 impl Env {
@@ -1081,6 +1086,37 @@ impl Env {
         let mut cfg = self.cfg.lock().unwrap();
         f(&mut cfg);
         (self.save)(&cfg);
+    }
+
+    /// Получить кандидатов релей для целевого пира по его NodeId (pubkey).
+    /// Используется при отправке DATA пиру без прямого соединения.
+    fn get_relay_candidates(&self, target_pubkey: NodeId) -> Vec<RelayCandidate> {
+        let mut candidates = Vec::new();
+
+        // 1. Проверяем прямой канал - ищем пира по pubkey во всех группах
+        let has_direct = {
+            let groups = self.groups.lock().unwrap();
+            groups.values().any(|g| {
+                g.members.values().any(|p| p.pubkey == target_pubkey && p.direct_addr.is_some())
+            })
+        };
+        if has_direct {
+            candidates.push(RelayCandidate::Direct);
+        }
+
+        // 2. Пытаемся получить DHT relay ticket
+        if let Some(dht) = self.dht.lock().unwrap().as_ref() {
+            if let Some(ticket) = dht.find_relay_ticket(target_pubkey) {
+                candidates.push(RelayCandidate::DhtRelay(ticket));
+            }
+        }
+
+        // 3. Fallback: серверный релей (всегда доступен, если подключены к серверу)
+        if !self.quitting() {
+            candidates.push(RelayCandidate::ServerRelay);
+        }
+
+        candidates
     }
 }
 
@@ -1774,6 +1810,36 @@ pub fn start(
     }
 }
 
+/// Инициализировать DHT: создать узел, загрузить сохранённые пиры,
+/// запросить bootstrap у сервера.
+fn initialize_dht(env: &Arc<Env>, st: &mut State) {
+    use crate::store::default_dht_state_path;
+
+    let cfg = env.cfg.lock().unwrap();
+    let our_id = env.identity.ed_pub();
+    let state_path = if cfg.dht_state_path.is_empty() {
+        default_dht_state_path()
+    } else {
+        std::path::PathBuf::from(&cfg.dht_state_path)
+    };
+    let bootstrap_peers = cfg.dht_peers.clone();
+    drop(cfg);
+
+    // Создаём DHT узел
+    let dht_node = Arc::new(DhtNode::new(our_id, env.sock.clone(), state_path));
+
+    // Запускаем DHT в фоне с сохранёнными пирами
+    let _handle = dht_node.start(bootstrap_peers);
+
+    // Сохраняем в env
+    *env.dht.lock().unwrap() = Some(dht_node.clone());
+
+    // Запрашиваем bootstrap peers у сервера (DHT_BOOTSTRAP_REQ)
+    // Ответ придёт как DHT_BOOTSTRAP и будет обработан в on_ctrl
+    let req = proto::payloads::enc_dht_bootstrap_req();
+    st.send_ctrl(env, proto::ctrl::DHT_BOOTSTRAP_REQ, &req);
+}
+
 /// Метка сервера из конфига.
 fn server_label(cfg: &Config, server: SocketAddr) -> String {
     cfg.servers
@@ -1829,12 +1895,12 @@ pub fn start_with_tun(
         save: save.clone(),
         identity,
         server: Mutex::new(server),
-        sock,
+        sock: sock.clone(),
         tcp: Mutex::new(None),
         tun,
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
-        path_selector: Arc::new(PathSelector::new()),
+        dht: Mutex::new(None),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -1869,6 +1935,10 @@ pub fn start_with_tun(
         env.quit.store(true, Ordering::Relaxed);
         return Err(e);
     }
+
+    // Инициализируем DHT после успешного подключения к серверу.
+    // Запрашиваем bootstrap peers у сервера.
+    initialize_dht(&env, &mut st);
 
     spawn_sampler(env.clone());
     {
@@ -1955,6 +2025,14 @@ fn dispatch(
             Some(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
             None => true,
         }
+    } else if typ == proto::dht::DHT_FRAME_TYPE {
+        // DHT фрейм — обрабатываем в DHT узле
+        if let Ok(msg) = proto::dht::decode_dht_frame(datagram) {
+            if let Some(dht) = env.dht.lock().unwrap().as_ref() {
+                dht.handle_message(msg, src);
+            }
+        }
+        true
     } else if src == env.server() {
         in_tx
             .send(Input::Server {
@@ -3102,6 +3180,20 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 });
             }
         }
+        ctrl::DHT_BOOTSTRAP => {
+            if let Ok(peers) = payloads::dec_dht_bootstrap(payload) {
+                // Обновляем DHT с новыми bootstrap peers
+                if let Some(dht) = env.dht.lock().unwrap().as_ref() {
+                    for peer in peers {
+                        dht.add_contact(peer);
+                    }
+                    // Сохраняем пиры в конфиг для следующего запуска
+                    env.update_cfg(|c| {
+                        c.dht_peers = dht.get_closest_contacts(&dht.our_id, 50);
+                    });
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -3445,72 +3537,20 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-
-    // First, get group info and peer info while holding the lock briefly
-    let (gid, direct_addr, peer_pubkey, peer_endpoint, peer_candidates, server_addr) = {
+    let (key, h, ctr, target) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
         };
         let gs = g.get_mut(&gid).expect("pick_group вернул свою группу");
-        let peer = gs.members.get(&dst);
-        let direct_addr = peer.and_then(|p| p.direct_addr);
-        let peer_pubkey = peer.map(|p| p.pubkey);
-        let peer_endpoint = peer.and_then(|p| p.endpoint);
-        let peer_candidates = peer.map(|p| p.candidates.clone()).unwrap_or_default();
-        let server_addr = env.server();
-        (gid, direct_addr, peer_pubkey, peer_endpoint, peer_candidates, server_addr)
-    };
-
-    // Determine NAT type from peer's endpoint/candidates (simplified)
-    let nat_type = if peer_endpoint.is_some() {
-        if peer_candidates.is_empty() {
-            NatType::FullCone
-        } else {
-            NatType::RestrictedCone
-        }
-    } else if peer_pubkey.is_some() {
-        NatType::Symmetric
-    } else {
-        NatType::Unknown
-    };
-
-    // Use path selector to choose best path
-    let path = if let Some(pk) = peer_pubkey {
-        env.path_selector.select_path(
-            pk,
-            None, // DHT node - not implemented yet
-            server_addr,
-            direct_addr,
-            nat_type,
-        )
-    } else {
-        Path::ServerRelay {
-            server_addr,
-            est_rtt_ms: 100,
-        }
-    };
-
-    // Get next_frame with the group lock
-    let (key, h, ctr, target) = {
-        let mut g = env.groups.lock().unwrap();
-        let gs = g.get_mut(&gid).expect("group disappeared");
+        let target = gs
+            .members
+            .get(&dst)
+            .and_then(|p| p.direct_addr)
+            .unwrap_or_else(|| env.server());
         let (k, h, c) = gs.next_frame(gid, dst);
-        let target = path.target_addr();
         (k, h, c, target)
     };
-
-    // Emit path selection event for telemetry/TUI
-    if let Some(peer_pubkey) = peer_pubkey {
-        let score = env.path_selector.score_path(&path, peer_pubkey, nat_type, 0);
-        env.emit(Event::PathSelected {
-            gid,
-            peer_ip: dst,
-            path: path.clone(),
-            score,
-        });
-    }
-
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     env.send(&frame, target);
 }
@@ -3823,7 +3863,6 @@ pub fn run(
             ),
             Event::InvitesSynced { .. } => {}
             Event::FriendGroups { .. } => {}
-            Event::PathSelected { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
             Event::Notice(n) => eprintln!("[engine] {n}"),
         }

@@ -3,6 +3,7 @@
 //! используют их через `tunnel_client::…`.
 
 pub mod api;
+pub mod dht;
 pub mod dns;
 pub mod engine;
 #[cfg(test)]
