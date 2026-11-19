@@ -31,6 +31,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod dht;
 pub mod frag;
 pub mod handshake;
 pub mod payloads;
@@ -39,6 +40,10 @@ pub mod replay;
 #[cfg(test)]
 mod fuzz_tests;
 
+pub use dht::{
+    NodeId, NodeContact, RelayTicket, DhtMessage, Token, RoutingTable, DhtNode, DhtState,
+    distance, bucket_index, encode_dht_msg, decode_dht_msg, K, NUM_BUCKETS,
+};
 pub use frag::{FRAG_MAX_COUNT, FRAG_MAX_PAYLOAD, FRAG_THRESHOLD, Reassembler};
 pub use handshake::{
     CookieSecret, DirKeys, EphemeralKey, Hello3, PinResolution, Role, RotationLink, SessionKeys,
