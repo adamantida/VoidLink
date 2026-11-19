@@ -449,6 +449,35 @@ impl Inner {
             Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
             Cmd::DelServer { idx } => format!("сервер №{idx} удалён"),
             Cmd::SetPrimaryServer { idx } => format!("сервер по умолчанию: №{idx}"),
+            Cmd::SwitchServer { addr, pubkey, label } => {
+                // Validate IPv4/IPv6 family match (same as client engine)
+                let family_ok = this
+                    .cfg
+                    .lock()
+                    .unwrap()
+                    .servers
+                    .iter()
+                    .find(|s| s.addr.parse::<SocketAddr>().ok() == Some(*addr))
+                    .map(|s| s.addr.parse::<SocketAddr>().unwrap().is_ipv6() == addr.is_ipv6())
+                    .unwrap_or(false);
+                if !family_ok {
+                    return Err(format!(
+                        "сервер {addr}: другое семейство адресов (IPv4/IPv6) — перезапустите клиент с этим сервером"
+                    ));
+                }
+                // Update config: activate server (handles autojoin_by_server)
+                let mut cfg = lock(&this.cfg);
+                if cfg.activate_server(*addr) {
+                    // Save will be done below
+                }
+                // Verify server exists in config
+                let server_exists = cfg.servers.iter().any(|s| s.addr.parse::<SocketAddr>().ok() == Some(*addr));
+                if !server_exists {
+                    return Err(format!("сервер {addr} не найден в конфиге"));
+                }
+                drop(cfg);
+                format!("переключение на сервер {addr} ({label})")
+            }
             Cmd::Reconnect => {
                 Inner::retry_now(this);
                 return Ok(());
@@ -548,6 +577,10 @@ fn apply_offline(c: &mut Config, cmd: Cmd) {
                 c.activate_server(a);
             }
             c.servers.insert(0, s);
+        }
+        Cmd::SwitchServer { addr, .. } => {
+            // activate_server handles autojoin_by_server (like client engine's switch_server)
+            c.activate_server(addr);
         }
         _ => {}
     }
