@@ -136,7 +136,9 @@ Server code и pubkey. Старый ключ подписывает новый, 
   `voidlink_relayed_frames_total`, `voidlink_bytes_relayed_total`,
   `voidlink_dropped_frames_total`, `voidlink_hello_total`,
   `voidlink_challenge_total`, `voidlink_ctrl_frames_total`,
-  `voidlink_probes_total`;
+  `voidlink_probes_total`, `voidlink_fed_peers`, `voidlink_fed_groups`,
+  `voidlink_fed_addr_claims`, `voidlink_fed_relayed_total`,
+  `voidlink_fed_hint_rejected_total`;
 - `GET /healthz` — `200 ok`, если живы все воркеры и housekeeping
   отмечался за последние 10 с, иначе `503 unavailable`.
 
@@ -175,12 +177,17 @@ X25519-ключ и `caps`; сервер хранит их в сессии и:
 * в mesh-секцию включает только онлайн-участников, публиковавших
   `MESH_INFO`; старые клиенты хвост игнорируют.
 
-**Федерация (T4, черновик).** Новых флагов пока нет. Сервер безопасно
-принимает `SERVER_HINT` (как недоверенную подсказку), `JOIN_FED` (отвечает
-`ERROR`) и молча отбрасывает кадры `0x40..=0x4F`. Флаги федерации,
-TOFU-пиннинг ключей пиров, репликация групп и `FED_RELAY` появятся вместе с
-T4; тогда же в метрики добавятся счётчики федеративных сессий. До этого
-включать нечего: федерация выключена по построению.
+**Федерация (T4).** Включается флагом `--federate`; `--peer <addr>` задаёт
+явный пин пира (можно повторять), `--fed-pool <addr>` — общий пул адресов.
+Сервер принимает `SERVER_HINT` только как недоверенную подсказку, проверяет
+кандидата подписанным `SRV_HELLO`/`ACK`, закрепляет ключ (TOFU) в
+`server.json → federation.peers`, реплицирует группы (`FED_GROUP_PUSH`/
+`DELTA`), адреса (`FED_ADDR_PUSH`/`REVOKE`) и релеит кадры между серверами
+(`FED_RELAY` + `ACK`/`NACK`). Конфликт адресов решает меньший ed25519.
+Метрики: `voidlink_fed_peers`, `voidlink_fed_groups`,
+`voidlink_fed_addr_claims`, `voidlink_fed_relayed_total`,
+`voidlink_fed_hint_rejected_total`. Встречные `SRV_HELLO` разрешаются
+тай-брейком (меньший ed — инициатор).
 
 ## TCP-фолбэк
 
