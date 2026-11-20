@@ -12,10 +12,13 @@
 //!   процесс пользователя мог бы поднять свой экземпляр серверной стороны;
 //! - следующий экземпляр создаётся до ожидания клиента, так что пока жив
 //!   [`Listener`], хотя бы один наш экземпляр существует и имя не освобождается;
-//! - клиент проверяет, что сервер пайпа работает от SYSTEM
-//!   (`GetNamedPipeServerProcessId` → токен процесса → `S-1-5-18`); если токен
-//!   службы непривилегированному пользователю не открыть — по владельцу
-//!   объекта пайпа (тоже должен быть SYSTEM, см. `O:SY`).
+//! - клиент проверяет, что сервер пайпа — служба (SYSTEM) **или** демон,
+//!   запущенный от администратора тем же пользователем: `GetNamedPipeServerProcessId`
+//!   → токен процесса → SID пользователя и `TokenElevation`; если токен службы
+//!   непривилегированному пользователю не открыть — по владельцу объекта пайпа
+//!   (`O:SY` у службы, `O:BA` у [`Listener::bind_console`]: владельца BA может
+//!   поставить только процесс с включённой группой Administrators).
+//!   Неповышенный процесс того же пользователя и чужой пользователь отвергаются.
 //!
 //! Хэндлы открыты с `FILE_FLAG_OVERLAPPED`: синхронный ввод-вывод на одном
 //! файловом объекте Windows сериализует, и блокирующее чтение в одном потоке
@@ -39,12 +42,12 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_KERNEL_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
@@ -58,7 +61,8 @@ use windows_sys::Win32::System::Pipes::{
     WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Размер буферов пайпа в каждую сторону.
@@ -170,11 +174,41 @@ fn valid_sid(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
+/// SID LocalSystem в строковой форме.
+const SYSTEM_SID: &str = "S-1-5-18";
+/// SID встроенной группы Administrators.
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// Кому принадлежит объект пайпа (`O:` в SDDL).
+///
+/// Служба ставит `O:SY` — поставить такого владельца может только SYSTEM.
+/// `tunnel-daemon console` работает от администратора (не SYSTEM) и ставит
+/// `O:BA`: владельца BA может поставить только процесс с **включённой** группой
+/// Administrators, то есть повышенный (в UAC-фильтрованном токене BA — deny-only,
+/// и `CreateNamedPipeW` падает с `ERROR_INVALID_OWNER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeOwner {
+    /// Служба Windows: `O:SY`.
+    System,
+    /// `tunnel-daemon console` от администратора: `O:BA`.
+    Administrators,
+}
+
+impl PipeOwner {
+    /// Псевдоним владельца для SDDL (`O:SY` / `O:BA`).
+    fn sddl(self) -> &'static str {
+        match self {
+            PipeOwner::System => "SY",
+            PipeOwner::Administrators => "BA",
+        }
+    }
+}
+
 /// SDDL пайпа: SYSTEM и Administrators — полный доступ, владелец-пользователь —
 /// чтение/запись без права создавать экземпляры пайпа. Остальным — ничего.
-pub fn pipe_sddl(owner_sid: Option<&str>) -> io::Result<String> {
-    let mut s = String::from("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)");
-    if let Some(sid) = owner_sid {
+pub fn pipe_sddl(owner: PipeOwner, client_sid: Option<&str>) -> io::Result<String> {
+    let mut s = format!("O:{}D:P(A;;GA;;;SY)(A;;GA;;;BA)", owner.sddl());
+    if let Some(sid) = client_sid {
         if !valid_sid(sid) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -186,7 +220,7 @@ pub fn pipe_sddl(owner_sid: Option<&str>) -> io::Result<String> {
     Ok(s)
 }
 
-/// Сервер пайпа (только служба, от SYSTEM).
+/// Сервер пайпа: служба (SYSTEM) или `console` от администратора.
 pub struct Listener {
     name: Vec<u16>,
     sd: SecDesc,
@@ -197,16 +231,26 @@ pub struct Listener {
 impl Listener {
     /// Поднимает пайп без доступа для пользователя (только SY и BA).
     pub fn bind(name: impl AsRef<OsStr>) -> io::Result<Listener> {
-        Self::bind_with_owner(name, None)
+        Self::bind_with_owner(name, PipeOwner::System, None)
     }
 
-    /// Поднимает пайп; `owner_sid` — SID пользователя, записанный при установке.
+    /// Пайп `tunnel-daemon console`: владелец объекта — Administrators,
+    /// `client_sid` — SID запустившего пользователя (он получает чтение/запись).
+    /// Требует повышенного процесса: иначе `CreateNamedPipeW` откажет по владельцу.
+    pub fn bind_console(name: impl AsRef<OsStr>, client_sid: &str) -> io::Result<Listener> {
+        Self::bind_with_owner(name, PipeOwner::Administrators, Some(client_sid))
+    }
+
+    /// Поднимает пайп; `owner` — владелец объекта, `client_sid` — SID
+    /// пользователя, которому выдан доступ (при установке службы — из
+    /// `owner.sid`, у `console` — текущего).
     /// Падает, если пайп с таким именем уже существует (`FIRST_PIPE_INSTANCE`).
     pub fn bind_with_owner(
         name: impl AsRef<OsStr>,
-        owner_sid: Option<&str>,
+        owner: PipeOwner,
+        client_sid: Option<&str>,
     ) -> io::Result<Listener> {
-        let sd = SecDesc::from_sddl(&pipe_sddl(owner_sid)?)?;
+        let sd = SecDesc::from_sddl(&pipe_sddl(owner, client_sid)?)?;
         let l = Listener {
             name: wide(name.as_ref()),
             sd,
@@ -284,8 +328,9 @@ impl Listener {
     }
 }
 
-/// Подключается к пайпу демона и проверяет, что его сервер — процесс от SYSTEM.
-/// Исключений для разработки нет (PLAN.md 7.2).
+/// Подключается к пайпу демона и проверяет, что его сервер доверенный:
+/// служба (SYSTEM) или демон от администратора этого же пользователя
+/// (правило — [`decide_trust`]).
 pub fn connect(name: impl AsRef<OsStr>) -> io::Result<Conn> {
     let w = wide(name.as_ref());
     let mut tries = 0;
@@ -313,10 +358,11 @@ pub fn connect(name: impl AsRef<OsStr>) -> io::Result<Conn> {
         }
         return Err(io::Error::from_raw_os_error(err as i32));
     };
-    if !server_is_system(h.as_raw_handle())? {
+    if decide_trust(&server_facts(h.as_raw_handle())?).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "сервер пайпа работает не от SYSTEM — возможна подмена демона",
+            "сервер пайпа — не служба и не повышенный демон этого пользователя: \
+возможна подмена демона",
         ));
     }
     Ok(Conn {
@@ -326,57 +372,172 @@ pub fn connect(name: impl AsRef<OsStr>) -> io::Result<Conn> {
     })
 }
 
-/// Работает ли процесс-сервер пайпа от LocalSystem.
-fn server_is_system(pipe: HANDLE) -> io::Result<bool> {
+/// Что известно о процессе-сервере пайпа. Собирается из Win32, решение
+/// принимает чистая [`decide_trust`] (таблица — в тестах).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerFacts {
+    /// Токен сервера удалось открыть (у службы обычному пользователю — нет).
+    pub token_readable: bool,
+    /// Пользователь токена — LocalSystem.
+    pub token_user_system: bool,
+    /// Пользователь токена — текущий пользователь.
+    pub token_user_is_me: bool,
+    /// Процесс повышен (UAC elevation).
+    pub token_elevated: bool,
+    /// Владелец объекта пайпа — SYSTEM (`O:SY`).
+    pub pipe_owner_system: bool,
+    /// Владелец объекта пайпа — Administrators (`O:BA`).
+    pub pipe_owner_admin: bool,
+}
+
+/// Почему сервер пайпа признан доверенным.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// Служба: токен от LocalSystem.
+    System,
+    /// Демон от администратора того же пользователя (`tunnel-daemon console`).
+    ElevatedSameUser,
+    /// Токен не открыть, но объект пайпа принадлежит SYSTEM или Administrators:
+    /// владельца BA ставит только повышенный процесс.
+    OwnerProof,
+}
+
+/// Правило доверия к серверу пайпа: `None` — подключаться нельзя.
+///
+/// Порядок важен: если токен открыт, решает он (неповышенный процесс того же
+/// пользователя отвергается, даже если владелец объекта выглядит солидно —
+/// владельца мог поставить сам захватчик). Доказательство по владельцу —
+/// только когда токен недоступен (служба от SYSTEM, повышенный демон).
+pub fn decide_trust(f: &ServerFacts) -> Option<Trust> {
+    if f.token_readable {
+        if f.token_user_system {
+            return Some(Trust::System);
+        }
+        return (f.token_user_is_me && f.token_elevated).then_some(Trust::ElevatedSameUser);
+    }
+    (f.pipe_owner_system || f.pipe_owner_admin).then_some(Trust::OwnerProof)
+}
+
+/// Факты о сервере пайпа: процесс, его токен и владелец объекта.
+fn server_facts(pipe: HANDLE) -> io::Result<ServerFacts> {
     let mut pid = 0u32;
     if unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) } == 0 {
         return Err(last_err());
     }
-    match process_is_system(pid) {
-        Ok(v) => Ok(v),
-        // Токен службы непривилегированному пользователю обычно не открыть.
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-            pipe_owner_is_system(pipe)
+    let me = current_user_sid().ok();
+    let mut f = ServerFacts::default();
+    match process_token(pid) {
+        Ok(tok) => {
+            f.token_readable = true;
+            if let Ok(sid) = token_user_sid(tok.as_raw_handle()) {
+                f.token_user_system = sid == SYSTEM_SID;
+                f.token_user_is_me = me.as_deref() == Some(sid.as_str());
+            }
+            f.token_elevated = token_elevated(tok.as_raw_handle()).unwrap_or(false);
         }
-        Err(e) => Err(e),
+        // Токен службы непривилегированному пользователю обычно не открыть —
+        // решаем по владельцу объекта пайпа.
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {}
+        Err(e) => return Err(e),
     }
+    let (owner_system, owner_admin) = pipe_owner(pipe)?;
+    f.pipe_owner_system = owner_system;
+    f.pipe_owner_admin = owner_admin;
+    Ok(f)
 }
 
-fn process_is_system(pid: u32) -> io::Result<bool> {
+/// Токен процесса по PID.
+fn process_token(pid: u32) -> io::Result<OwnedHandle> {
     let proc = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
     let mut tok: HANDLE = ptr::null_mut();
     if unsafe { OpenProcessToken(proc.as_raw_handle(), TOKEN_QUERY, &mut tok) } == 0 {
         return Err(last_err());
     }
-    let tok = owned(tok)?;
+    owned(tok)
+}
+
+/// SID пользователя текущего процесса в форме `S-1-…`.
+pub fn current_user_sid() -> io::Result<String> {
+    token_user_sid(current_token()?.as_raw_handle())
+}
+
+/// Запущен ли текущий процесс повышенным (администратор после UAC).
+pub fn is_elevated() -> io::Result<bool> {
+    token_elevated(current_token()?.as_raw_handle())
+}
+
+fn current_token() -> io::Result<OwnedHandle> {
+    let mut tok: HANDLE = ptr::null_mut();
+    // SAFETY: псевдо-хэндл текущего процесса валиден, `tok` — выходной параметр.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) } == 0 {
+        return Err(last_err());
+    }
+    owned(tok)
+}
+
+/// SID пользователя из токена (строка `S-1-…`).
+fn token_user_sid(tok: HANDLE) -> io::Result<String> {
     let mut len = 0u32;
-    unsafe { GetTokenInformation(tok.as_raw_handle(), TokenUser, ptr::null_mut(), 0, &mut len) };
+    // SAFETY: нулевой буфер — запрос нужного размера.
+    unsafe { GetTokenInformation(tok, TokenUser, ptr::null_mut(), 0, &mut len) };
     let err = unsafe { GetLastError() };
     if len == 0 || err != ERROR_INSUFFICIENT_BUFFER {
         return Err(io::Error::from_raw_os_error(err as i32));
     }
     // u64 — выравнивание под TOKEN_USER.
     let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-    if unsafe {
-        GetTokenInformation(
-            tok.as_raw_handle(),
-            TokenUser,
-            buf.as_mut_ptr().cast(),
-            len,
-            &mut len,
-        )
-    } == 0
-    {
+    // SAFETY: буфер не меньше запрошенного размера и выровнен.
+    if unsafe { GetTokenInformation(tok, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) } == 0 {
         return Err(last_err());
     }
     // SAFETY: буфер заполнен структурой TOKEN_USER и выровнен.
     let tu = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
-    Ok(unsafe { IsWellKnownSid(tu.User.Sid, WinLocalSystemSid) } != 0)
+    sid_to_string(tu.User.Sid)
 }
 
-fn pipe_owner_is_system(pipe: HANDLE) -> io::Result<bool> {
+/// Повышен ли токен (UAC elevation).
+fn token_elevated(tok: HANDLE) -> io::Result<bool> {
+    let mut elev: TOKEN_ELEVATION = unsafe { zeroed() };
+    let mut len = 0u32;
+    // SAFETY: буфер — TOKEN_ELEVATION, размер передан верно.
+    let ok = unsafe {
+        GetTokenInformation(
+            tok,
+            TokenElevation,
+            (&mut elev as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(last_err());
+    }
+    Ok(elev.TokenIsElevated != 0)
+}
+
+/// SID в строку `S-1-…`; буфер строки освобождается `LocalFree`.
+fn sid_to_string(sid: PSID) -> io::Result<String> {
+    let mut out: *mut u16 = ptr::null_mut();
+    // SAFETY: `sid` валиден, `out` — выходной параметр (строка от LocalAlloc).
+    if unsafe { ConvertSidToStringSidW(sid, &mut out) } == 0 {
+        return Err(last_err());
+    }
+    let guard = SecDesc(out as PSECURITY_DESCRIPTOR);
+    let mut n = 0usize;
+    // SAFETY: строка NUL-терминирована и жива до `drop(guard)`.
+    while unsafe { *out.add(n) } != 0 {
+        n += 1;
+    }
+    let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(out, n) });
+    drop(guard);
+    Ok(s)
+}
+
+/// Владелец объекта пайпа: (SYSTEM, Administrators).
+fn pipe_owner(pipe: HANDLE) -> io::Result<(bool, bool)> {
     let mut owner: PSID = ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `pipe` — валидный хэндл, остальные — выходные параметры.
     let rc = unsafe {
         GetSecurityInfo(
             pipe,
@@ -393,7 +554,11 @@ fn pipe_owner_is_system(pipe: HANDLE) -> io::Result<bool> {
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
     let _guard = SecDesc(sd);
-    Ok(!owner.is_null() && unsafe { IsWellKnownSid(owner, WinLocalSystemSid) } != 0)
+    if owner.is_null() {
+        return Ok((false, false));
+    }
+    let sid = sid_to_string(owner)?;
+    Ok((sid == SYSTEM_SID, sid == ADMINISTRATORS_SID))
 }
 
 /// Соединение по пайпу. `try_clone()` даёт вторую половину для другого потока
@@ -505,13 +670,116 @@ mod tests {
     #[test]
     fn sddl_shape() {
         assert_eq!(
-            pipe_sddl(Some("S-1-5-21-1-2-3-1001")).unwrap(),
+            pipe_sddl(PipeOwner::System, Some("S-1-5-21-1-2-3-1001")).unwrap(),
             "O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;S-1-5-21-1-2-3-1001)"
         );
-        assert!(pipe_sddl(Some("S-1-5)(A;;GA;;;WD")).is_err());
-        assert!(pipe_sddl(Some("WD")).is_err());
+        // `console` от администратора: владелец объекта — BA, доступ тому же
+        // пользователю по его SID.
+        assert_eq!(
+            pipe_sddl(PipeOwner::Administrators, Some("S-1-5-21-1-2-3-1001")).unwrap(),
+            "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;S-1-5-21-1-2-3-1001)"
+        );
+        assert_eq!(
+            pipe_sddl(PipeOwner::Administrators, None).unwrap(),
+            "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)"
+        );
+        assert!(pipe_sddl(PipeOwner::System, Some("S-1-5)(A;;GA;;;WD")).is_err());
+        assert!(pipe_sddl(PipeOwner::System, Some("WD")).is_err());
         // Без FILE_CREATE_PIPE_INSTANCE (0x4) и с полными чтением/записью.
         assert_eq!(PIPE_CLIENT_ACCESS & 0x4, 0);
         assert_eq!(PIPE_CLIENT_ACCESS | 0x4, 0x0012_0089 | 0x0012_0116);
+    }
+
+    /// Токен читается, все поля кроме названных — false.
+    fn facts() -> ServerFacts {
+        ServerFacts {
+            token_readable: true,
+            ..ServerFacts::default()
+        }
+    }
+
+    #[test]
+    fn доверие_службе_по_токену() {
+        let f = ServerFacts {
+            token_user_system: true,
+            ..facts()
+        };
+        assert_eq!(decide_trust(&f), Some(Trust::System));
+        // Даже если владелец объекта не тот — решает токен.
+        let f = ServerFacts {
+            pipe_owner_admin: true,
+            ..f
+        };
+        assert_eq!(decide_trust(&f), Some(Trust::System));
+    }
+
+    #[test]
+    fn доверие_повышенному_демону_своего_пользователя() {
+        let f = ServerFacts {
+            token_user_is_me: true,
+            token_elevated: true,
+            ..facts()
+        };
+        assert_eq!(decide_trust(&f), Some(Trust::ElevatedSameUser));
+    }
+
+    #[test]
+    fn неповышенный_свой_процесс_отвергается() {
+        // Захват пайпа обычным процессом того же пользователя: токен открыт,
+        // повышения нет — отказ, даже если владельцем объекта значится BA
+        // (поставить его такой процесс не смог бы, но правило не должно
+        // зависеть от этого).
+        let f = ServerFacts {
+            token_user_is_me: true,
+            token_elevated: false,
+            pipe_owner_admin: true,
+            pipe_owner_system: true,
+            ..facts()
+        };
+        assert_eq!(decide_trust(&f), None);
+    }
+
+    #[test]
+    fn чужой_пользователь_отвергается() {
+        let f = ServerFacts {
+            token_user_is_me: false,
+            token_elevated: true,
+            ..facts()
+        };
+        assert_eq!(decide_trust(&f), None);
+    }
+
+    #[test]
+    fn доказательство_по_владельцу_когда_токен_недоступен() {
+        // Служба: токен SYSTEM обычному пользователю не открыть, владелец O:SY.
+        let f = ServerFacts {
+            token_readable: false,
+            pipe_owner_system: true,
+            ..ServerFacts::default()
+        };
+        assert_eq!(decide_trust(&f), Some(Trust::OwnerProof));
+        // Демон от администратора: владелец O:BA (ставит только повышенный).
+        let f = ServerFacts {
+            token_readable: false,
+            pipe_owner_admin: true,
+            ..ServerFacts::default()
+        };
+        assert_eq!(decide_trust(&f), Some(Trust::OwnerProof));
+        // Ни токена, ни владельца — отказ.
+        let f = ServerFacts {
+            token_readable: false,
+            ..ServerFacts::default()
+        };
+        assert_eq!(decide_trust(&f), None);
+    }
+
+    #[test]
+    fn свой_sid_читается() {
+        // На Windows всегда доступен: `S-1-…` текущего пользователя.
+        let sid = current_user_sid().expect("SID текущего пользователя");
+        assert!(valid_sid(&sid), "неожиданный SID: {sid}");
+        assert!(sid.starts_with("S-1-5-"));
+        // `is_elevated` не падает ни в каком режиме.
+        assert!(is_elevated().is_ok());
     }
 }

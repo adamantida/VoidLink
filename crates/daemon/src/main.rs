@@ -24,31 +24,44 @@ fn main() -> ExitCode {
         Mode::Console {
             debug,
             fake,
+            seed_config,
             data_dir,
         } => {
             // Остановка — Ctrl+C / SIGTERM: флаг, хаб выходит штатно.
             let stop = Arc::new(AtomicBool::new(false));
             service::install_ctrl_handler(stop.clone());
+            let dir = dir(data_dir);
+            // Windows: движок с правами администратора доверяет каталогу
+            // данных — он должен быть закрыт, как у службы (и до переноса
+            // пользовательского конфига в него).
+            if !fake && let Err(e) = service::secure_console_data_dir(&dir) {
+                eprintln!("ошибка: {e}");
+                return ExitCode::FAILURE;
+            }
+            if seed_config {
+                match service::seed_user_config(&dir) {
+                    Ok(Some(src)) => eprintln!(
+                        "конфиг перенесён: {} → {}",
+                        src.display(),
+                        dir.join("client.json").display()
+                    ),
+                    Ok(None) => eprintln!(
+                        "переносить нечего: у демона уже есть client.json или нет пользовательского"
+                    ),
+                    Err(e) => {
+                        eprintln!("ошибка: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             if fake {
-                service::run_console(
-                    &dir(data_dir),
-                    debug,
-                    |_log| tunnel_daemon::FakeBackend::new(),
-                    stop,
-                )
+                service::run_console(&dir, debug, |_log| tunnel_daemon::FakeBackend::new(), stop)
             } else {
                 // Настоящий движок по client.json каталога данных (нужны права
                 // администратора на TUN). Нет серверов — «нет сервера» до
                 // AddServer; ошибка запуска при заданном сервере — останов и
                 // выход с ней (как раньше).
                 tunnel_client::engine::set_debug(debug);
-                let dir = dir(data_dir);
-                // Windows: движок с правами администратора доверяет каталогу
-                // данных — он должен быть закрыт, как у службы.
-                if let Err(e) = service::secure_console_data_dir(&dir) {
-                    eprintln!("ошибка: {e}");
-                    return ExitCode::FAILURE;
-                }
                 let failed = Arc::new(std::sync::Mutex::new(None::<String>));
                 let (f, s, d) = (failed.clone(), stop.clone(), dir.clone());
                 let r = service::run_console(
@@ -67,10 +80,7 @@ fn main() -> ExitCode {
                         match DaemonEngine::open(&d, log.clone(), real_start(tun), None) {
                             Ok(e) => {
                                 if !e.has_server() {
-                                    log(
-                                        Level::Warn,
-                                        "в конфиге нет серверов — ждём AddServer (tunnel-client tui / add-server)",
-                                    );
+                                    log(Level::Warn, tunnel_daemon::NO_SERVERS_HINT);
                                 } else if let Err(err) = e.start_now() {
                                     fail(err);
                                 }

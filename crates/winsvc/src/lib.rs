@@ -25,7 +25,7 @@ mod service;
 #[cfg(windows)]
 pub use acl::{check_path, secure_data_dir, verify_install_dir};
 #[cfg(windows)]
-pub use install::{install, uninstall};
+pub use install::{import_user_config, install, uninstall};
 #[cfg(windows)]
 pub use service::run_as_service;
 

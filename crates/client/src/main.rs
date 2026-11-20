@@ -939,9 +939,12 @@ fn main() -> Result<()> {
 
 /// `tui`: открывается всегда (этап 9, §3.8). Выбор режима:
 /// 1. `--embedded` — свой движок (TUN, InstanceLock, первичная настройка);
-/// 2. живой демон с движком — тонкий клиент по IPC;
-/// 3. демон без движка / демона нет — офлайн-TUI: конфиг правится локально,
-///    очередь `ui-pending.json` уходит демону, когда тот появится.
+/// 2. `--remote` — только демон, без молчаливого фолбэка;
+/// 3. `--offline` — не искать демона, сразу офлайн-TUI;
+/// 4. живой демон (в том числе `Waiting` — «нет сервера»: конфиг правится по
+///    IPC, движок поднимется по `AddServer`) — тонкий клиент;
+/// 5. демона нет — свой движок, как до этапа 9 (нужны права на TUN);
+/// 6. свой движок не поднять (нет прав, замок занят) — офлайн-TUI с причиной.
 ///
 /// Без серверов TUI тоже открывается (пилюля «○ нет сервера», F3/F4) —
 /// настройка не блокирует интерфейс.
@@ -960,38 +963,106 @@ fn run_tui(
             return run_embedded_tui(dir, cfg, identity, server_sel, adapter, dll);
         }
         Some(UiMode::Offline) => return run_offline_tui(dir, cfg, identity, None),
-        _ => {}
+        Some(UiMode::Remote) => {
+            // Явно просили тонкий клиент — без молчаливого фолбэка.
+            let ep = Endpoint::for_data_dir(dir);
+            let eng = IpcEngine::connect(&ep, Some(dir.to_path_buf()))?;
+            return run_thin_tui(eng, dir, cfg, identity);
+        }
+        None => {}
     }
     let ep = Endpoint::for_data_dir(dir);
     match IpcEngine::connect(&ep, Some(dir.to_path_buf())) {
-        Ok(eng) => {
-            let snap = eng.snapshot();
-            if snap.meta.offline {
-                // Демон есть, движка в нём нет (TUN/сервер): офлайн с причиной.
-                let reason = snap
+        Ok(eng) => match start_mode(Some(eng.editable()), Ok(())) {
+            StartMode::Thin => {
+                // Демон есть — тонкий клиент, даже если движка в нём ещё нет:
+                // `Waiting` принимает правки конфига, и движок поднимется по
+                // `AddServer` (T0). Офлайн нужен только для заглушки
+                // `{"engine": null, "error"}` (битый client.json демона) —
+                // её правки не примет.
+                run_thin_tui(eng, dir, cfg, identity)
+            }
+            _ => {
+                let reason = eng
+                    .snapshot()
                     .meta
                     .offline_reason
                     .clone()
                     .unwrap_or_else(|| "демон без движка".to_string());
                 drop(eng);
-                return run_offline_tui(dir, cfg, identity, Some(reason));
+                run_offline_tui(dir, cfg, identity, Some(reason))
             }
-            run_thin_tui(eng, dir, cfg)
-        }
+        },
         Err(e) => {
-            if ui_mode == Some(UiMode::Remote) {
-                // Явно просили тонкий клиент — без молчаливого фолбэка.
-                return Err(e);
+            // Демона нет (или он не пускает): свой движок, как до этапа 9.
+            // Нет прав/замка — офлайн с причиной, а не молчаливый отказ.
+            let pre = embedded_preflight(dir);
+            match start_mode(None, pre.clone()) {
+                StartMode::Embedded => {
+                    run_embedded_tui(dir, cfg, identity, server_sel, adapter, dll)
+                }
+                _ => {
+                    let why = match pre {
+                        Err(why) => format!("{why} · {e}"),
+                        Ok(()) => e.to_string(),
+                    };
+                    run_offline_tui(dir, cfg, identity, Some(why))
+                }
             }
-            // Демона нет — штатный офлайн; демон есть, но не отвечает —
-            // офлайн с причиной.
-            let reason = match ep.open() {
-                Ok(None) => None,
-                _ => Some(e.to_string()),
-            };
-            run_offline_tui(dir, cfg, identity, reason)
         }
     }
+}
+
+/// Что поднимать `tui` без флагов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartMode {
+    /// Тонкий клиент демона (движок в нём или `Waiting`).
+    Thin,
+    /// Свой движок в этом процессе.
+    Embedded,
+    /// Офлайн-TUI на локальной копии конфига.
+    Offline,
+}
+
+/// Решение «что поднимать»: `daemon` — есть ли демон и принимает ли он правки
+/// конфига, `own_engine` — прошёл ли preflight своего движка.
+fn start_mode(daemon: Option<bool>, own_engine: Result<(), String>) -> StartMode {
+    match daemon {
+        Some(true) => StartMode::Thin,
+        Some(false) => StartMode::Offline,
+        None if own_engine.is_ok() => StartMode::Embedded,
+        None => StartMode::Offline,
+    }
+}
+
+/// Можно ли поднять свой движок в этом процессе: замок single-instance и
+/// права на TUN. `Err` — причина отказа (она уходит в офлайн-шапку).
+fn embedded_preflight(dir: &std::path::Path) -> Result<(), String> {
+    // Замок: другой TUI, `run` или демон без IPC — второй движок с той же
+    // identity выбил бы первого с сервера. Проверяем и сразу отпускаем:
+    // `run_embedded_tui` возьмёт замок заново.
+    match InstanceLock::acquire(dir) {
+        Ok(_) => {}
+        Err(LockError::Busy) => {
+            return Err("движок уже запущен (другой TUI, run или демон без IPC)".into());
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+    #[cfg(windows)]
+    {
+        match tunnel_ipc::transport::is_elevated() {
+            Ok(true) => {}
+            Ok(false) => return Err("нужны права администратора для TUN".into()),
+            Err(e) => return Err(format!("проверка прав: {e}")),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !std::path::Path::new("/dev/net/tun").exists() {
+            return Err("нет /dev/net/tun (модуль tun не загружен?)".into());
+        }
+    }
+    Ok(())
 }
 
 /// Свой движок в этом процессе (`--embedded`): замок single-instance и
@@ -1044,7 +1115,12 @@ fn run_embedded_tui(
 
 /// Тонкий клиент демона с живым движком. Без имени — первичная настройка
 /// командами демону (без серверов TUI открывается: пилюля «нет сервера»).
-fn run_thin_tui(eng: IpcEngine, dir: &std::path::Path, cfg: &mut Config) -> Result<()> {
+fn run_thin_tui(
+    eng: IpcEngine,
+    dir: &std::path::Path,
+    cfg: &mut Config,
+    identity: &proto::Identity,
+) -> Result<()> {
     use tunnel_client::api::EngineApi;
     let snap = eng.snapshot();
     if snap.cfg.name.trim().is_empty() {
@@ -1081,9 +1157,21 @@ fn run_thin_tui(eng: IpcEngine, dir: &std::path::Path, cfg: &mut Config) -> Resu
         cfg.name = c.name.clone();
         cfg.servers = c.servers.clone();
     }
+    // Что сказать до первого кадра: своя identity у демона (служба и
+    // `console` живут в `%ProgramData%`) и перенос серверов из локального
+    // конфига (у демона свой каталог данных).
+    let mut notices = Vec::new();
+    if eng.me().my_pub != identity.ed_pub() {
+        notices.push(format!(
+            "демон работает со своей identity {} (локальная {} не используется)",
+            eng.me().my_code,
+            identity.friend_code()
+        ));
+    }
+    notices.extend(tunnel_client::offline::migrate_servers(&eng, &cfg.servers));
     // Тема — локальная (ui.json); остальное App берёт из снимка демона.
     let ui = ui_cfg(dir, cfg);
-    tui::run_remote(eng, &ui)
+    tui::run_remote(eng, &ui, &notices)
 }
 
 /// Офлайн-TUI: движка нет. Конфиг правится локально (общий `Arc`), правки
@@ -1112,7 +1200,7 @@ fn run_offline_tui(
     let shared = Arc::new(std::sync::Mutex::new(cfg.clone()));
     let eng =
         tunnel_client::remote::connect_offline_with_reason(dir, shared, identity.clone(), reason)?;
-    tui::run_remote(eng, &ui)
+    tui::run_remote(eng, &ui, &[])
 }
 
 /// Локальные настройки TUI: тема из `ui.json` (иначе — из client.json).
@@ -1337,6 +1425,25 @@ fn with_server<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn выбор_режима_tui_без_флагов() {
+        // Демон принимает правки (живой или `Waiting`) — тонкий клиент.
+        assert_eq!(start_mode(Some(true), Ok(())), StartMode::Thin);
+        assert_eq!(
+            start_mode(Some(true), Err("нет прав".into())),
+            StartMode::Thin
+        );
+        // Демон есть, но правки не принимает (битый client.json) — офлайн.
+        assert_eq!(start_mode(Some(false), Ok(())), StartMode::Offline);
+        // Демона нет: свой движок, если preflight прошёл…
+        assert_eq!(start_mode(None, Ok(())), StartMode::Embedded);
+        // …иначе офлайн с причиной (нет прав, замок занят).
+        assert_eq!(
+            start_mode(None, Err("нужны права администратора для TUN".into())),
+            StartMode::Offline
+        );
+    }
 
     fn srv(addr: &str, label: &str) -> StoredServer {
         StoredServer {

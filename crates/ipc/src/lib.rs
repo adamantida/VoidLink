@@ -6,7 +6,8 @@
 //!   не паника.
 //! - [`transport`] — `Listener::bind(name)` → `accept()` → [`Conn`]; `connect(name)`.
 //!   Unix — сокет `0600`, Windows — named pipe с явным SDDL и проверкой, что
-//!   сервер пайпа работает от SYSTEM.
+//!   сервер пайпа — служба (SYSTEM) или демон от администратора того же
+//!   пользователя ([`transport::decide_trust`]).
 //! - [`lock`] — single-instance замок движка (демон, embedded TUI, `run`).
 //! - [`client`] — блокирующий [`IpcClient`] (Hello, Subscribe, Req с таймаутом)
 //!   для TUI, трея и CLI.

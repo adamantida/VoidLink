@@ -259,7 +259,7 @@ fn friend_name(cfg: &Config, pk: &[u8; 32], fallback: &str) -> String {
 /// через демона команда — ошибка с объяснением.
 pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -> Result<()> {
     let me = Me::from_json(c.me());
-    let (snap, _history) = subscribe(c, HANDSHAKE_TIMEOUT).map_err(|e| anyhow!(e))?;
+    let (snap, _history, _editable) = subscribe(c, HANDSHAKE_TIMEOUT).map_err(|e| anyhow!(e))?;
     let mut s = Session { c, snap };
     match cmd {
         "id" => {

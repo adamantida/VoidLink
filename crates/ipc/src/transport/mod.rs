@@ -13,7 +13,10 @@ pub use unix::{Conn, Listener, cleanup_stale, connect};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Conn, Listener, connect, pipe_sddl};
+pub use windows::{
+    Conn, Listener, PipeOwner, ServerFacts, Trust, connect, current_user_sid, decide_trust,
+    is_elevated, pipe_sddl,
+};
 
 /// Имя пайпа демона по умолчанию (Windows).
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\tunnel-daemon";

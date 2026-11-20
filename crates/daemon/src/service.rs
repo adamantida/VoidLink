@@ -41,21 +41,24 @@ impl Backend for NullBackend {
 /// Где демон слушает фронтендов.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcMode {
-    /// Без IPC (Windows `console`: пайп поднимает только служба, PLAN.md 7.2).
+    /// Без IPC (Windows `console` без прав администратора).
     None,
     /// Unix-сокет `<данные>/daemon.sock`.
     #[cfg(unix)]
     Unix,
-    /// Named pipe службы: имя и SID владельца (из `owner.sid`).
+    /// Named pipe: имя, SID пользователя с доступом и владелец объекта
+    /// (`O:SY` у службы, `O:BA` у `console` от администратора).
     #[cfg(windows)]
     Pipe {
         name: String,
         owner_sid: Option<String>,
+        owner: tunnel_ipc::transport::PipeOwner,
     },
 }
 
 impl IpcMode {
-    /// IPC режима `console`: на Unix — сокет, на Windows — нет.
+    /// IPC режима `console`: на Unix — сокет; на Windows — пайп, если процесс
+    /// запущен от администратора (иначе `O:BA` не поставить, SECURITY.md §13).
     pub fn console_default() -> Self {
         #[cfg(unix)]
         {
@@ -63,8 +66,78 @@ impl IpcMode {
         }
         #[cfg(not(unix))]
         {
-            IpcMode::None
+            console_pipe()
         }
+    }
+}
+
+/// Решение по пайпу `console` (чистая функция — таблица в тестах).
+#[cfg(windows)]
+fn console_pipe_decision(elevated: bool, sid: std::io::Result<String>) -> IpcMode {
+    match (elevated, sid) {
+        (true, Ok(sid)) => IpcMode::Pipe {
+            name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.into(),
+            owner_sid: Some(sid),
+            owner: tunnel_ipc::transport::PipeOwner::Administrators,
+        },
+        _ => IpcMode::None,
+    }
+}
+
+/// Пайп `console` на Windows: только из повышенного процесса.
+#[cfg(all(not(unix), windows))]
+fn console_pipe() -> IpcMode {
+    let elevated = tunnel_ipc::transport::is_elevated().unwrap_or(false);
+    console_pipe_decision(elevated, tunnel_ipc::transport::current_user_sid())
+}
+
+/// Не-Windows и не-Unix (не бывает на практике): пайпа нет.
+#[cfg(all(not(unix), not(windows)))]
+fn console_pipe() -> IpcMode {
+    IpcMode::None
+}
+
+/// Почему IPC выключен (для лога; `console` без прав администратора).
+#[cfg(windows)]
+fn ipc_none_reason() -> &'static str {
+    "на Windows пайп поднимает служба (tunnel-daemon install) или console от администратора"
+}
+
+/// Почему IPC выключен (не-Windows; в норме недостижимо).
+#[cfg(not(windows))]
+fn ipc_none_reason() -> &'static str {
+    "режим без IPC"
+}
+
+/// Понятная ошибка подъёма пайпа: занятое имя — это чаще всего работающая служба.
+#[cfg(windows)]
+fn pipe_error(name: &str, e: &std::io::Error) -> String {
+    // ERROR_ACCESS_DENIED (5) — имя занято первым экземпляром (наш или чужой),
+    // ERROR_PIPE_BUSY (231) — свободных экземпляров нет.
+    match e.raw_os_error() {
+        Some(5) | Some(231) => format!(
+            "IPC: пайп {name}: {e} (пайп уже поднят — вероятно, работает служба TunnelDaemon; \
+остановите её или запускайте «tunnel-client tui --embedded»)"
+        ),
+        _ => format!("IPC: пайп {name}: {e}"),
+    }
+}
+
+/// `console --seed-config`: перенести `%APPDATA%\tunnel\client.json` в каталог
+/// данных демона (как `install`), если у демона конфига ещё нет. Возвращает
+/// путь источника, если перенос сделан.
+///
+/// SECURITY.md §12: пользовательский конфиг — в `%APPDATA%`, его может писать
+/// любой процесс пользователя, поэтому перенос только явным флагом.
+pub fn seed_user_config(dir: &Path) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    {
+        tunnel_winsvc::import_user_config(dir, None).map_err(|e| format!("{e:#}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        Ok(None)
     }
 }
 
@@ -148,7 +221,13 @@ pub fn run_daemon<B: Backend + 'static>(
     let hub = Arc::new(Hub::with_log(make_backend(log.callback()), log.callback()));
     let server = match &opts.ipc {
         IpcMode::None => {
-            log.log(Level::Info, "IPC выключен (фронтенды не подключатся)");
+            log.log(
+                Level::Info,
+                &format!(
+                    "IPC выключен (фронтенды не подключатся): {}",
+                    ipc_none_reason()
+                ),
+            );
             None
         }
         #[cfg(unix)]
@@ -159,16 +238,21 @@ pub fn run_daemon<B: Backend + 'static>(
             })?,
         ),
         #[cfg(windows)]
-        IpcMode::Pipe { name, owner_sid } => Some(
+        IpcMode::Pipe {
+            name,
+            owner_sid,
+            owner,
+        } => Some(
             IpcServer::start_pipe(
                 hub.clone(),
                 name,
+                *owner,
                 owner_sid.as_deref(),
                 Some(log.callback()),
             )
             .map_err(|e| {
                 log.log(Level::Error, &format!("IPC: пайп {name}: {e}"));
-                format!("IPC: пайп {name}: {e}")
+                pipe_error(name, &e)
             })?,
         ),
     };
@@ -353,6 +437,7 @@ where
         let ipc = IpcMode::Pipe {
             name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.into(),
             owner_sid,
+            owner: tunnel_ipc::transport::PipeOwner::System,
         };
         let opts = RunOpts::service(&dir, ipc);
         tunnel_winsvc::run_as_service(tunnel_winsvc::SERVICE_NAME, move |rx| {
@@ -503,8 +588,18 @@ mod service_tests {
         std::env::temp_dir().join(format!("tunnel-svc-{tag}-{}", std::process::id()))
     }
 
+    /// На Windows замок движка — `Global\TunnelEngine`, один на машину,
+    /// поэтому тесты, поднимающие `run_daemon`, идут по очереди: иначе
+    /// второй получает `LockError::Busy` и бэкенд не создаётся.
+    static ENGINE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn engine_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn body_resume_then_stop() {
+        let _engine = engine_guard();
         let dir = tmp("body");
         let _ = std::fs::remove_dir_all(&dir);
         let (tx, rx) = mpsc::channel();
@@ -634,6 +729,7 @@ mod service_tests {
 
     #[test]
     fn body_returns_core_error() {
+        let _engine = engine_guard();
         // Каталог данных — файл: замок/лог не создать, ядро выходит с ошибкой.
         let f = tmp("file");
         std::fs::write(&f, b"x").unwrap();

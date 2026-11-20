@@ -148,10 +148,11 @@ impl IpcServer {
     pub fn start_pipe<B: Backend + 'static>(
         hub: Arc<Hub<B>>,
         name: &str,
-        owner_sid: Option<&str>,
+        owner: tunnel_ipc::transport::PipeOwner,
+        client_sid: Option<&str>,
         log: Option<LogFn>,
     ) -> io::Result<IpcServer> {
-        let listener = Listener::bind_with_owner(name, owner_sid)?;
+        let listener = Listener::bind_with_owner(name, owner, client_sid)?;
         if let Some(l) = &log {
             l(Level::Info, &format!("IPC: пайп {name}"));
         }
