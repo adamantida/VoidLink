@@ -35,7 +35,7 @@ use crate::api::{EngineApi, LocalEngine};
 use crate::engine::{self, Cmd};
 use crate::store::{Config, Store};
 
-use app::App;
+use app::{App, MsgKind};
 
 /// Запускает TUI: поднимает движок и рисует интерфейс до выхода.
 pub fn run(
@@ -83,14 +83,19 @@ pub fn run(
 
 /// Тонкий клиент: движок в демоне (или офлайн-движок), TUI только рисует и
 /// шлёт команды (права администратора не нужны). `ui` — локальные настройки
-/// (тема). Закрытие TUI туннель не трогает.
-pub fn run_remote(eng: impl EngineApi, ui: &Config) -> Result<()> {
+/// (тема), `notices` — что сказать до первого кадра (перенос серверов,
+/// identity демона). Закрытие TUI туннель не трогает.
+pub fn run_remote(eng: impl EngineApi, ui: &Config, notices: &[String]) -> Result<()> {
     clock::init();
     let mut term = setup_terminal(true)?;
     let mut app = App::new(eng.me().my_pub, &eng.me().my_code, ui);
     // Адаптер и dll — у демона, TUI их не знает.
     app.adapter_name = String::new();
     app.dll_path = String::new();
+    for n in notices {
+        app.toast(MsgKind::Info, n.clone());
+        app.log(MsgKind::Info, n.clone());
+    }
     let res = event_loop(&mut term, &mut app, &eng);
     restore_terminal(&mut term, true)?;
     res

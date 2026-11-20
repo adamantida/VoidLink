@@ -7,11 +7,11 @@
 Соберите друзей, команду или парк машин в защищённую виртуальную сеть
 за пару минут — как будто все подключены к одному свитчу.
 
-[![CI](https://github.com/adamantida/VoidLink2/actions/workflows/ci.yml/badge.svg)](https://github.com/adamantida/VoidLink2/actions/workflows/ci.yml)
+[![CI](https://github.com/adamantida/VoidLink/actions/workflows/ci.yml/badge.svg)](https://github.com/adamantida/VoidLink/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
 ![Protocol](https://img.shields.io/badge/протокол-v4%2B-6f42c1)
 ![Platforms](https://img.shields.io/badge/Windows%20·%20Linux%20·%20macOS-0a7bbb)
-![Tests](https://img.shields.io/badge/тесты-565-2ea44f)
+![Tests](https://img.shields.io/badge/тесты-580-2ea44f)
 ![Self-hosted](https://img.shields.io/badge/self--hosted-100%25-111)
 
 [**Быстрый старт**](#-быстрый-старт) ·
@@ -257,7 +257,7 @@ tunnel-daemon console | service | install | uninstall [--purge]
 
 ## 📈 Качество
 
-- **565 автотестов**: юнит-тесты, фаззинг декодеров, e2e с настоящим сервером и
+- **580 автотестов**: юнит-тесты, фаззинг декодеров, e2e с настоящим сервером и
   движками (3+ клиента, кик, подмена отправителя, повторы, ротация ключей при
   потере пакетов, TCP-фолбэк, DNS/IPv6, IPC демона, mesh-кодеки и таблица
   путей этапа 9).

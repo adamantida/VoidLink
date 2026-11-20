@@ -24,6 +24,11 @@ pub use log::{Level, LogFn, Logger};
 pub use server::IpcServer;
 pub use service::{IpcMode, ResumeSignal, RunOpts, ServiceEnv, run_daemon};
 
+/// Подсказка в лог, когда в конфиге нет серверов: фронтенды добавляют их по
+/// IPC (`tunnel-client tui`), и движок поднимается по `AddServer`.
+pub const NO_SERVERS_HINT: &str =
+    "в конфиге нет серверов — ждём AddServer по IPC (tunnel-client tui)";
+
 use std::path::{Path, PathBuf};
 
 /// Каталог данных демона: `%ProgramData%\tunnel` (Windows — identity

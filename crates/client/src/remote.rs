@@ -169,6 +169,9 @@ struct Shared {
     history: Mutex<Vec<Event>>,
     down: AtomicBool,
     stop: AtomicBool,
+    /// Демон принимает команды конфига: снимок полный (у `Waiting` конфиг есть
+    /// и правки применяются), а не заглушка `{"engine": null, "error": …}`.
+    editable: AtomicBool,
 }
 
 impl Shared {
@@ -197,6 +200,13 @@ pub struct IpcEngine {
     worker: Option<JoinHandle<()>>,
     /// Каталог `ui.json` (тема); `None` — тема не сохраняется.
     ui_dir: Option<PathBuf>,
+}
+
+/// Принимает ли демон правки конфига: полный снимок (`Snapshot`) — да,
+/// заглушка `{"engine": null, "error": …}` — нет (правки некуда применить:
+/// конфиг демона не читается).
+fn snapshot_editable(v: &serde_json::Value) -> bool {
+    v.get("engine").is_none()
 }
 
 /// Снимок из JSON демона. Демон без движка (служба не поднялась, TUN не
@@ -243,10 +253,12 @@ pub fn connect_offline_with_reason(
 }
 
 /// `Subscribe` и чтение до первого снимка: события до него — история кольца.
+/// Третий элемент — принимает ли демон команды конфига (см.
+/// [`IpcEngine::editable`]).
 pub(crate) fn subscribe(
     c: &mut IpcClient,
     timeout: Duration,
-) -> Result<(Snapshot, Vec<Event>), String> {
+) -> Result<(Snapshot, Vec<Event>, bool), String> {
     c.subscribe(SNAPSHOTS_MS).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     let mut history = Vec::new();
@@ -261,7 +273,10 @@ pub(crate) fn subscribe(
                     history.push(e);
                 }
             }
-            DaemonMsg::Snapshot { snap, .. } => return Ok((parse_snapshot(snap)?, history)),
+            DaemonMsg::Snapshot { snap, .. } => {
+                let editable = snapshot_editable(&snap);
+                return Ok((parse_snapshot(snap)?, history, editable));
+            }
             DaemonMsg::Shutdown { reason } => return Err(format!("демон завершается: {reason}")),
             _ => {}
         }
@@ -280,13 +295,15 @@ impl IpcEngine {
         };
         let me = Me::from_json(c.me())
             .ok_or_else(|| anyhow!("демон не сообщил identity (me: {})", c.me()))?;
-        let (snap, history) = subscribe(&mut c, HANDSHAKE_TIMEOUT).map_err(|e| anyhow!(e))?;
+        let (snap, history, editable) =
+            subscribe(&mut c, HANDSHAKE_TIMEOUT).map_err(|e| anyhow!(e))?;
         let shared = Arc::new(Shared {
             snap: Mutex::new(Arc::new(snap)),
             events: Mutex::new(VecDeque::new()),
             history: Mutex::new(history),
             down: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            editable: AtomicBool::new(editable),
         });
         let (tx, rx) = mpsc::channel();
         let (sh, ep2, me2) = (shared.clone(), ep.clone(), me.clone());
@@ -300,6 +317,13 @@ impl IpcEngine {
             worker: Some(worker),
             ui_dir,
         })
+    }
+
+    /// Принимает ли демон команды конфига. `false` — демон прислал заглушку
+    /// `{"engine": null, "error": …}` (битый `client.json`): править конфиг
+    /// через него нельзя, TUI работает офлайн на своей копии.
+    pub fn editable(&self) -> bool {
+        self.shared.editable.load(Ordering::SeqCst)
     }
 }
 
@@ -337,8 +361,9 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
                         "демон работает с другой identity — перезапустите TUI".into(),
                     ));
                 }
-                if let Ok((snap, _seen)) = subscribe(&mut c, HANDSHAKE_TIMEOUT) {
+                if let Ok((snap, _seen, editable)) = subscribe(&mut c, HANDSHAKE_TIMEOUT) {
                     *lock(&sh.snap) = Arc::new(snap);
+                    sh.editable.store(editable, Ordering::SeqCst);
                     sh.down.store(false, Ordering::SeqCst);
                     sh.push(Event::Notice("связь с демоном восстановлена".into()));
                     conn = Some(c);
@@ -377,8 +402,10 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
                     }
                 }
                 Ok(DaemonMsg::Snapshot { snap, .. }) => {
+                    let editable = snapshot_editable(&snap);
                     if let Ok(s) = parse_snapshot(snap) {
                         *lock(&sh.snap) = Arc::new(s);
+                        sh.editable.store(editable, Ordering::SeqCst);
                     }
                 }
                 Ok(DaemonMsg::Ack {
@@ -497,6 +524,23 @@ mod tests {
         assert_eq!(s.meta.offline_reason.as_deref(), Some("нет TUN"));
         let s = serde_json::to_value(Snapshot::default()).unwrap();
         assert_eq!(parse_snapshot(s).unwrap(), Snapshot::default());
+    }
+
+    #[test]
+    fn заглушка_демона_без_движка_не_редактируется() {
+        // `Waiting` шлёт полный снимок (конфиг есть, правки применяются),
+        // `Failed` — заглушку `{"engine": null, "error"}`: править нечего.
+        assert!(!snapshot_editable(&serde_json::json!({"engine": null})));
+        assert!(!snapshot_editable(
+            &serde_json::json!({"engine": null, "error": "нет TUN"})
+        ));
+        assert!(snapshot_editable(
+            &serde_json::to_value(Snapshot::default()).unwrap()
+        ));
+        // Живой снимок демона (с конфигом) — тоже редактируемый.
+        let mut live = Snapshot::default();
+        live.meta.connected = true;
+        assert!(snapshot_editable(&serde_json::to_value(live).unwrap()));
     }
 
     // ---------- поддельный демон на Unix-сокете ----------

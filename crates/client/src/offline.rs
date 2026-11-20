@@ -36,8 +36,8 @@ use crate::api::{EngineApi, EngineMode, Me};
 use crate::engine::{self, Cmd, Event};
 use crate::probe::ProbeState;
 use crate::remote::{DAEMON_DOWN, Endpoint, IpcEngine, UiPrefs};
-use crate::snapshot::{CfgView, MetaSnap, Snapshot};
-use crate::store::{self, Config};
+use crate::snapshot::{CfgServer, CfgView, MetaSnap, Snapshot};
+use crate::store::{self, Config, StoredServer};
 
 /// Файл очереди офлайн-правок (в каталоге данных клиента).
 pub const PENDING_FILE: &str = "ui-pending.json";
@@ -314,6 +314,13 @@ impl Shared {
             )));
         }
         self.flush(eng.as_ref());
+        // Серверы, добавленные локально (`%APPDATA%`), досылаем демону: у
+        // службы и `console` свой каталог данных, иначе они «терялись».
+        if live {
+            for notice in migrate_servers(eng.as_ref(), &self.cfg().servers) {
+                self.push(Event::Notice(notice));
+            }
+        }
     }
 
     /// Правка конфига без движка: применить, сохранить, поставить в очередь.
@@ -506,6 +513,58 @@ pub fn apply_cfg_cmd(c: &mut Config, cmd: Cmd) {
         }
         _ => {}
     }
+}
+
+/// Серверы локального конфига, которых нет в конфиге демона (по адресу).
+/// Совпадение адреса считается «уже есть»: чужой ключ не перезаписываем.
+pub fn missing_servers(local: &[StoredServer], daemon: &[CfgServer]) -> Vec<StoredServer> {
+    local
+        .iter()
+        .filter(|s| !daemon.iter().any(|d| d.addr == s.addr))
+        .cloned()
+        .collect()
+}
+
+/// `Cmd::AddServer` из записи конфига (hex-ключ → байты).
+pub fn add_server_cmd(s: &StoredServer) -> Result<Cmd, String> {
+    let key = proto::hex_to_bytes(&s.pubkey)
+        .map_err(|e| format!("сервер {}: неверный ключ «{}» ({e})", s.addr, s.pubkey))?;
+    let pubkey: [u8; 32] = key
+        .try_into()
+        .map_err(|_| format!("сервер {}: ключ не 32 байта", s.addr))?;
+    Ok(Cmd::AddServer {
+        addr: s.addr.clone(),
+        pubkey,
+        label: s.label.clone(),
+    })
+}
+
+/// Досылает демону серверы из локального конфига, которых у него нет.
+///
+/// У службы и `console` свой каталог данных (`%ProgramData%\tunnel`), а
+/// `add-server` без демона пишет в пользовательский (`%APPDATA%\tunnel`) —
+/// без этого переноса серверы до демона не доходили. Возвращает уведомления
+/// для лога/тостов.
+pub fn migrate_servers(eng: &dyn EngineApi, local: &[StoredServer]) -> Vec<String> {
+    let daemon = eng.snapshot().cfg.servers.clone();
+    let missing = missing_servers(local, &daemon);
+    let mut out = Vec::new();
+    let mut sent = 0usize;
+    for s in &missing {
+        match add_server_cmd(s) {
+            Ok(cmd) => match eng.send(cmd) {
+                Ok(()) => sent += 1,
+                Err(e) => out.push(format!("сервер {} не перенесён: {e}", s.addr)),
+            },
+            Err(e) => out.push(e),
+        }
+    }
+    if sent > 0 {
+        out.push(format!(
+            "серверы из локального конфига перенесены демону ({sent})"
+        ));
+    }
+    out
 }
 
 /// Закреплённый ключ сервера `addr` (проба просит его: `want_key`).
@@ -815,6 +874,62 @@ mod tests {
         let id = proto::Identity::generate();
         let cfg = Arc::new(Mutex::new(cfg));
         (ResilientEngine::new(dir, cfg.clone(), id, None), cfg)
+    }
+
+    #[test]
+    fn перенос_серверов_только_недостающих() {
+        let local = vec![
+            StoredServer {
+                addr: "10.0.0.1:9000".into(),
+                pubkey: "aa".repeat(32),
+                label: "свой".into(),
+            },
+            StoredServer {
+                addr: "10.0.0.2:9000".into(),
+                pubkey: "bb".repeat(32),
+                label: "чужой ключ".into(),
+            },
+        ];
+        let daemon = vec![CfgServer {
+            addr: "10.0.0.2:9000".into(),
+            pubkey: "cc".repeat(32),
+            label: "у демона".into(),
+        }];
+        // Адрес есть у демона (пусть и с другим ключом) — не трогаем.
+        let missing = missing_servers(&local, &daemon);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].addr, "10.0.0.1:9000");
+        // Всё уже есть — переносить нечего.
+        assert!(missing_servers(&local, &[]).len() == 2);
+        assert!(missing_servers(&[], &daemon).is_empty());
+    }
+
+    #[test]
+    fn команда_переноса_сервера() {
+        let s = StoredServer {
+            addr: "10.0.0.1:9000".into(),
+            pubkey: "aa".repeat(32),
+            label: "сервер".into(),
+        };
+        match add_server_cmd(&s).unwrap() {
+            Cmd::AddServer {
+                addr,
+                pubkey,
+                label,
+            } => {
+                assert_eq!(addr, "10.0.0.1:9000");
+                assert_eq!(pubkey, [0xaa; 32]);
+                assert_eq!(label, "сервер");
+            }
+            other => panic!("ожидали AddServer, получили {other:?}"),
+        }
+        // Битая запись — ошибка с адресом, без паники.
+        let bad = StoredServer {
+            addr: "10.0.0.9:9000".into(),
+            pubkey: "zz".into(),
+            label: String::new(),
+        };
+        assert!(add_server_cmd(&bad).unwrap_err().contains("10.0.0.9:9000"));
     }
 
     #[test]

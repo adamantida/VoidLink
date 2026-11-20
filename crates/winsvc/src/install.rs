@@ -67,7 +67,7 @@ pub fn install(opts: &InstallOptions) -> Result<InstallReport> {
 
     // только после смены владельца/ACL: подложенный заранее файл к этому
     // моменту удалён вместе с чужим каталогом
-    let config_imported = import_user_config(&dir, opts.user_appdata.as_deref())?;
+    let config_imported = import_user_config(&dir, opts.user_appdata.as_deref())?.is_some();
     let owner_sid = match &opts.owner_sid {
         Some(sid) => {
             validate_sid(sid)?;
@@ -319,27 +319,31 @@ where
 
 /// Импорт `%APPDATA%\tunnel\client.json` пользователя (из
 /// [`InstallOptions::user_appdata`] или окружения), если у службы конфига
-/// ещё нет. Возвращает, был ли импорт.
-fn import_user_config(dir: &Path, appdata: Option<&Path>) -> Result<bool> {
+/// ещё нет. Возвращает путь источника, если импорт был.
+///
+/// Используется и `install`, и `tunnel-daemon console --seed-config`: перенос
+/// identity/серверов в каталог данных демона — единственный способ сохранить
+/// свой friend code при переходе на демон.
+pub fn import_user_config(dir: &Path, appdata: Option<&Path>) -> Result<Option<PathBuf>> {
     let dst = service_config_path(dir);
     if dst.exists() {
-        return Ok(false);
+        return Ok(None);
     }
     let appdata = match appdata {
         Some(a) => a.to_path_buf(),
         None => match std::env::var_os("APPDATA") {
             Some(a) => PathBuf::from(a),
-            None => return Ok(false),
+            None => return Ok(None),
         },
     };
     let src = user_config_path(&appdata);
     let data = match std::fs::read(&src) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("чтение {}", src.display())),
     };
     write_secure(&dst, &data)?;
-    Ok(true)
+    Ok(Some(src))
 }
 
 /// Запись файла в каталог данных: создаётся заново (не копируется), чтобы

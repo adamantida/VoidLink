@@ -605,10 +605,7 @@ impl DaemonBackend {
                 if e.has_server() {
                     e.start_async();
                 } else {
-                    (env.log)(
-                        Level::Warn,
-                        "в конфиге нет серверов — ждём AddServer (tunnel-client tui / add-server)",
-                    );
+                    (env.log)(Level::Warn, crate::NO_SERVERS_HINT);
                 }
                 DaemonBackend::Ready(Box::new(e))
             }
