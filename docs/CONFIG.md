@@ -228,7 +228,11 @@ flowchart TD
 - При установке (`tunnel-daemon install`) `client.json` установившего
   пользователя импортируется из `%APPDATA%\tunnel\` в `%ProgramData%\tunnel\`. Identity и друзья переходят вместе с ним.
 - `owner.sid` задаёт SID пользователя, которому разрешён доступ к пайпу
-  `\\.\pipe\tunnel-daemon`.
+  `\\.\pipe\tunnel-daemon`. У `tunnel-daemon console` отдельного файла нет:
+  доступ выдаётся текущему SID, а владелец объекта пайпа — Administrators
+  (`O:BA`), поэтому такой пайп поднимается только от администратора.
+  Свой `client.json` в каталог демона консольный режим переносит только с
+  `--seed-config`.
 - Удаление `tunnel-daemon uninstall --purge` удаляет и `%ProgramData%\tunnel`
   (identity, друзья, `owner.sid`). Без `--purge` данные остаются.
 - Сиды ключей никогда не отправляются по IPC: интерфейсы (`tunnel-tray`,
