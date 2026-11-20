@@ -154,8 +154,10 @@ impl FakeDaemon {
 impl Drop for FakeDaemon {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.kill_conns();
+        // Сначала сокет: после `remove_file` переподключиться уже некуда, и
+        // фронтенд не может «поймать» живой слушатель между шагами.
         let _ = std::fs::remove_file(&self.path);
+        self.kill_conns();
     }
 }
 
@@ -280,13 +282,15 @@ fn очередь_уходит_демону_и_очищается() {
     });
 
     // Демон пропал: снова офлайн, новые правки копятся в очереди.
-    d.kill_conns();
+    // `drop` убирает сокет: если только порвать соединения, офлайн-движок
+    // успевает переподключиться к живому слушателю, и `unavailable()` не
+    // наступает — гонка, которая ловилась на ubuntu.
+    drop(d);
     wait_until("демон недоступен", || eng.unavailable());
     eng.send(Cmd::SetStatus("офлайн".into())).unwrap();
     assert_eq!(eng.pending_edits(), 1);
     assert!(dir.join(PENDING_FILE).exists());
     drop(eng);
-    drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
