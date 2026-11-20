@@ -6140,4 +6140,61 @@ mod tests {
         }
         assert_eq!(notices, 4);
     }
+
+    /// T4b2: кандидаты `SERVER_HINT` — из `client.json.servers` и DHT-контактов
+    /// (ed + addr), без текущего сервера, повторов по адресу и битых строк;
+    /// батч не больше `MAX_SERVER_HINT`.
+    #[test]
+    fn подсказки_серверов_батч_без_повторов_и_своего_сервера() {
+        let server: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let (env, _ev) = test_env(server);
+        let hex = |b: u8| proto::hex_of(&[b; 32]);
+        let stored = |addr: &str, pk: String| crate::store::StoredServer {
+            addr: addr.into(),
+            pubkey: pk,
+            label: String::new(),
+        };
+        {
+            let mut c = env.cfg.lock().unwrap();
+            // Текущий сервер себе же не подсказываем.
+            c.servers.push(stored(&server.to_string(), hex(1)));
+            c.servers.push(stored("127.0.0.1:5101", hex(2)));
+            c.servers.push(stored("127.0.0.1:5102", hex(3)));
+            // Повтор адреса с другим ключом — один кандидат (первый).
+            c.servers.push(stored("127.0.0.1:5101", hex(4)));
+            // Битые строки — пропуск, кадр от них не растёт.
+            c.servers.push(stored("не адрес", hex(5)));
+            c.servers.push(stored("127.0.0.1:5103", "не hex".into()));
+            // DHT-контакты: новый адрес — кандидат, повтор — нет.
+            for (ed, addr) in [(6u8, "127.0.0.1:5102"), (7u8, "127.0.0.1:5104")] {
+                c.mesh.contacts.push(crate::store::StoredContact {
+                    ed: hex(ed),
+                    x: String::new(),
+                    addr: addr.into(),
+                    rtt_ms: 0,
+                    seen_s: 0,
+                    caps: 0,
+                });
+            }
+        }
+        let hints = hint_candidates(&env);
+        let addrs: Vec<&str> = hints.iter().map(|h| h.addr.as_str()).collect();
+        assert_eq!(
+            addrs,
+            ["127.0.0.1:5101", "127.0.0.1:5102", "127.0.0.1:5104"],
+            "порядок, дедупликация по адресу, пропуск битых"
+        );
+        assert_eq!(hints[0].ed_pub, [2; 32], "ключ первого кандидата адреса");
+
+        // Батч ограничен MAX_SERVER_HINT (лишние не едут).
+        {
+            let mut c = env.cfg.lock().unwrap();
+            c.servers.clear();
+            for i in 0..12u32 {
+                c.servers
+                    .push(stored(&format!("127.0.0.1:{}", 5200 + i), hex(8)));
+            }
+        }
+        assert_eq!(hint_candidates(&env).len(), payloads::MAX_SERVER_HINT);
+    }
 }

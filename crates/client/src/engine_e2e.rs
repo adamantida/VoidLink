@@ -216,6 +216,34 @@ impl Node {
     fn tx_pkts(&self) -> u64 {
         self.eng.stats.tx_pkts.load(Ordering::Relaxed)
     }
+
+    /// Метка федерации группы (uuid из `FED_GROUPS`, T4).
+    fn fed_uuid(&self, gid: u32) -> Option<[u8; 16]> {
+        self.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .and_then(|g| g.fed_uuid)
+    }
+
+    /// Список доступных федерированных групп движка (`FED_GROUPS`).
+    fn fed_list(&self) -> Vec<crate::engine::FedGroupInfo> {
+        self.eng.meta.lock().unwrap().fed_groups.clone()
+    }
+
+    /// IP участника `pk` в группе `gid` (по состояниям движка).
+    fn member_ip(&self, gid: u32, pk: &[u8; 32]) -> Option<u32> {
+        self.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)?
+            .members
+            .values()
+            .find(|p| p.pubkey == *pk)
+            .map(|p| p.ip)
+    }
 }
 
 /// Сервер слушает 0.0.0.0 — клиентам нужен 127.0.0.1 с тем же портом.
@@ -261,6 +289,100 @@ fn start_server_with(
     .expect("сервер стартует")
 }
 
+/// Сервер с федерацией (`Config.federate = true`, T4): известные пиры
+/// заводятся подсказкой клиента (`SERVER_HINT`), метрики — по `metrics`.
+fn start_fed_server(
+    dir: &std::path::Path,
+    port: u16,
+    metrics: Option<SocketAddr>,
+) -> tunnel_server::Server {
+    tunnel_server::Server::start(tunnel_server::Config {
+        listen: SocketAddr::from(([127, 0, 0, 1], port)),
+        data_dir: dir.to_path_buf(),
+        workers: 4,
+        quiet: true,
+        federate: true,
+        metrics,
+        limits: tunnel_server::Limits {
+            max_owned_groups: 64,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("сервер с федерацией стартует")
+}
+
+/// `client.json.servers`: адрес (как его видит клиент) и ed25519-ключ —
+/// источник кандидатов `SERVER_HINT`.
+fn stored_servers(items: &[(SocketAddr, [u8; 32], &str)]) -> Vec<crate::store::StoredServer> {
+    items
+        .iter()
+        .map(|(a, pk, label)| crate::store::StoredServer {
+            addr: a.to_string(),
+            pubkey: proto::hex_of(pk),
+            label: (*label).to_string(),
+        })
+        .collect()
+}
+
+/// Разобранный `server.json` (проверка персистентности федерации).
+fn json_file(path: &std::path::Path) -> serde_json::Value {
+    let raw = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_slice(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Запись группы федерации в `server.json`: (локальный gid, сервер-источник
+/// правды `origin`).
+fn fed_group_record(j: &serde_json::Value, uuid_hex: &str) -> Option<(u32, String)> {
+    j["federation"]["groups"]
+        .as_array()?
+        .iter()
+        .find(|g| g["uuid"] == uuid_hex)
+        .map(|g| {
+            (
+                g["gid"].as_u64().unwrap_or(0) as u32,
+                g["origin"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+}
+
+/// ed25519-ключи закреплённых пиров из `server.json`.
+fn fed_peer_eds(j: &serde_json::Value) -> Vec<String> {
+    j["federation"]["peers"]
+        .as_array()
+        .map(|v| {
+            v.iter()
+                .filter_map(|p| p["ed"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Тело `/metrics` сервера (HTTP-эндпоинт метрик, `--metrics`).
+fn metrics_text(addr: SocketAddr) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).expect("метрики: connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: metrics\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("метрики: read");
+    out
+}
+
+/// Значение счётчика `name` из тела `/metrics` (0 — строки нет).
+fn metric_value(text: &str, name: &str) -> u64 {
+    text.lines()
+        .find_map(|l| {
+            let mut it = l.split_whitespace();
+            if it.next() != Some(name) {
+                return None;
+            }
+            it.next()?.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
 /// Ждёт, пока `f` не станет истинным.
 fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
     let end = Instant::now() + within;
@@ -273,7 +395,20 @@ fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
 /// IP-пакет `from → to` повторяется (как повторяет его приложение), пока
 /// не дойдёт до TUN получателя; возвращает, сколько это заняло.
 fn deliver(from: &Node, to: &Node, gid: u32, tag: &str, within: Duration) -> Duration {
-    let pkt = ipv4(from.my_ip(gid), to.my_ip(gid), tag.as_bytes());
+    deliver_across(from, gid, to, gid, tag, within)
+}
+
+/// То же между группами с разными локальными gid (один сервер у каждого
+/// клиента — федерация: gid на серверах разные, IP — один на identity).
+fn deliver_across(
+    from: &Node,
+    from_gid: u32,
+    to: &Node,
+    to_gid: u32,
+    tag: &str,
+    within: Duration,
+) -> Duration {
+    let pkt = ipv4(from.my_ip(from_gid), to.my_ip(to_gid), tag.as_bytes());
     let t0 = Instant::now();
     loop {
         from.eng.send_ip_packet(&pkt);
@@ -2604,4 +2739,264 @@ fn e2e_адрес_один_на_все_группы_выход_из_одной_�
     drop(b);
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- T4b2: федерация клиента (E2E 4) ----------
+
+/// E2E 4: два настоящих сервера в процессе, федерация включена. S1 создаёт
+/// группу на A — T4b1 назначает ей uuid и реплицирует B; S2 видит её в
+/// `FED_GROUPS` и входит по `JOIN_FED` (B заявляет адрес S2 владельцу, тот
+/// добавляет его и присылает новое состояние). Пакет S1→S2 идёт A →
+/// `FED_RELAY` → B → TunDev получателя. `server.json` обоих серверов
+/// (uuid/gid/peer) переживает рестарт B.
+#[test]
+fn e2e_федерация_репликация_join_fed_и_релей_до_tun() {
+    let dir_a = temp_dir("fed-a");
+    let dir_b = temp_dir("fed-b");
+    let a = start_fed_server(&dir_a, 0, None);
+    let b = start_fed_server(&dir_b, 0, None);
+    let (a_pub, b_pub) = (a.pubkey, b.pubkey);
+    let (a_addr, b_addr) = (local(a.addr), local(b.addr));
+    // client.json.servers — источник SERVER_HINT: клиенты знают оба сервера,
+    // и A/B знакомятся без --peer (сервер подсказке не доверяет: SRV_HELLO).
+    let servers = stored_servers(&[(a_addr, a_pub, "A"), (b_addr, b_pub, "B")]);
+    let save: Arc<dyn Fn(&Config) + Send + Sync> = Arc::new(|_| {});
+    let mut s1 = Node::start_cfg(
+        Config {
+            name: "s1".into(),
+            servers,
+            ..Config::default()
+        },
+        a_addr,
+        a_pub,
+        proto::Identity::generate(),
+        save.clone(),
+    )
+    .expect("S1 подключается");
+    let mut s2 = Node::start_cfg(
+        Config {
+            name: "s2".into(),
+            // S2 сам не подсказывает B о A: знакомство серверов — по одной
+            // подсказке S1. Взаимные подсказки в один момент дают
+            // встречные SRV_HELLO (гонка рукопожатий на сервере, не T4b2).
+            ..Config::default()
+        },
+        b_addr,
+        b_pub,
+        proto::Identity::generate(),
+        save,
+    )
+    .expect("S2 подключается");
+    s1.wait("S1 подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    s2.wait("S2 подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+
+    // Своя группа на A: сервер (--federate) даёт ей uuid и реплицирует B.
+    let gid1 = s1.create("fed", false);
+    let ev = s2.wait(
+        "FED_GROUPS на B",
+        T,
+        |e| matches!(e, Event::FedGroups { groups } if groups.iter().any(|g| g.name == "fed")),
+    );
+    let fed = match ev {
+        Event::FedGroups { groups } => groups.into_iter().find(|g| g.name == "fed").unwrap(),
+        _ => unreachable!(),
+    };
+    assert_ne!(fed.uuid, [0u8; 16], "T4b1: uuid федерации не назначен");
+    assert_eq!(fed.owner, s1.eng.my_pub, "владелец группы — S1");
+    assert_eq!(fed.members, 1, "в реплике только владелец: {fed:?}");
+    let gid2 = fed.gid;
+    let uuid_hex = proto::hex_of(&fed.uuid);
+
+    // server.json A: uuid своей группы, локальный gid и origin = сам A.
+    wait_until("A записал uuid группы", T, || {
+        fed_group_record(&json_file(&dir_a.join("server.json")), &uuid_hex).is_some()
+    });
+    let ja = json_file(&dir_a.join("server.json"));
+    assert_eq!(
+        fed_group_record(&ja, &uuid_hex),
+        Some((gid1, proto::hex_of(&a_pub))),
+        "gid/origin своей группы в server.json A"
+    );
+    assert!(
+        fed_peer_eds(&ja).contains(&proto::hex_of(&b_pub)),
+        "A не закрепил B по подсказке: {ja}"
+    );
+
+    // S2 входит по uuid: ответ — обычный GROUP_STATE с локальным gid B.
+    s2.eng.cmds.send(Cmd::JoinFed { uuid: fed.uuid }).unwrap();
+    s2.wait(
+        "S2 вошёл в федеративную группу",
+        T,
+        |e| matches!(e, Event::GroupJoined { gid, name, .. } if *gid == gid2 && name == "fed"),
+    );
+    assert_eq!(
+        s2.fed_uuid(gid2),
+        Some(fed.uuid),
+        "у группы нет метки федерации"
+    );
+    assert!(
+        s2.fed_list()
+            .iter()
+            .any(|f| f.uuid == fed.uuid && f.gid == gid2),
+        "нет доступной федеративной группы в снимке: {:?}",
+        s2.fed_list()
+    );
+    assert_eq!(s2.members(gid2), 1, "в группе на B только S2");
+    let s2_ip = s2.my_ip(gid2);
+    assert_ne!(s2_ip, 0, "B не выдал адрес вошедшему");
+
+    // Заявка ушла владельцу (A) и принята: S1 видит S2 с тем же адресом.
+    wait_until("S1 видит S2 в группе", T, || {
+        s1.members(gid1) == 1 && s1.member_ip(gid1, &s2.eng.my_pub) == Some(s2_ip)
+    });
+    assert_eq!(s1.fed_uuid(gid1), None, "своя группа S1 — не реплика");
+
+    // Пакет S1→S2: получателя нет на A, кадр уходит FED_RELAY серверу B,
+    // оттуда — в TunDev S2. И обратно.
+    deliver_across(&s1, gid1, &s2, gid2, "S1→S2 через федерацию", T);
+    deliver_across(&s2, gid2, &s1, gid1, "S2→S1 через федерацию", T);
+
+    // server.json B: реплика с uuid, локальным gid B и origin = A.
+    wait_until("B записал реплику", T, || {
+        fed_group_record(&json_file(&dir_b.join("server.json")), &uuid_hex)
+            == Some((gid2, proto::hex_of(&a_pub)))
+    });
+    let jb = json_file(&dir_b.join("server.json"));
+    assert!(
+        fed_peer_eds(&jb).contains(&proto::hex_of(&a_pub)),
+        "B не закрепил A (TOFU): {jb}"
+    );
+
+    // Рестарт B: identity, реплика (uuid/gid) и пин A — в server.json и
+    // возвращаются серверу. Новый клиент видит ту же запись сразу.
+    let port_b = b.addr.port();
+    b.stop();
+    let b2 = start_fed_server(&dir_b, port_b, None);
+    assert_eq!(b2.pubkey, b_pub, "identity сервера пережила рестарт");
+    // Новый клиент B — без старых сессий: список доступных групп приходит из
+    // server.json (uuid/gid реплики не пересозданы).
+    let mut s3 = Node::start_cfg(
+        Config {
+            name: "s3".into(),
+            ..Config::default()
+        },
+        local(b2.addr),
+        b2.pubkey,
+        proto::Identity::generate(),
+        Arc::new(|_| {}),
+    )
+    .expect("S3 подключается");
+    let ev = s3.wait(
+        "FED_GROUPS после рестарта B",
+        T,
+        |e| matches!(e, Event::FedGroups { groups } if groups.iter().any(|g| g.uuid == fed.uuid)),
+    );
+    match ev {
+        Event::FedGroups { groups } => {
+            let g = groups.iter().find(|g| g.uuid == fed.uuid).unwrap();
+            assert_eq!(g.gid, gid2, "локальный gid изменился после рестарта");
+            assert_eq!(g.name, "fed");
+        }
+        _ => unreachable!(),
+    }
+    let jb2 = json_file(&dir_b.join("server.json"));
+    assert_eq!(
+        fed_group_record(&jb2, &uuid_hex),
+        Some((gid2, proto::hex_of(&a_pub))),
+        "uuid/gid/origin реплики не пережили рестарт"
+    );
+    assert!(
+        fed_peer_eds(&jb2).contains(&proto::hex_of(&a_pub)),
+        "пин A не пережил рестарт: {jb2}"
+    );
+
+    drop(s1);
+    drop(s2);
+    drop(s3);
+    drop(b2);
+    a.stop();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// E2E 4, негатив: ложные кандидаты в `SERVER_HINT` (нерабочий адрес и
+/// чужой ed-ключ) сервер отклоняет — метрика
+/// `voidlink_fed_hint_rejected_total`, пин не появляется. Подсказка при этом
+/// не спамится: одна отправка, дальше пауза 5 минут (в тесте — окно
+/// наблюдения).
+#[test]
+fn e2e_ложные_подсказки_федерации_отклоняются_и_не_спамят() {
+    let dir_a = temp_dir("fed-neg-a");
+    let dir_b = temp_dir("fed-neg-b");
+    let a = start_fed_server(&dir_a, 0, Some("127.0.0.1:0".parse().unwrap()));
+    let metrics_addr = a.metrics_addr.expect("метрики включены");
+    let b = start_fed_server(&dir_b, 0, None);
+    let b_addr = local(b.addr);
+    let a_pub = a.pubkey;
+    // Посредник считает управляющие фреймы клиента (тип открыт).
+    let proxy = LossyProxy::start(local(a.addr), Box::new(|_, _, _| false));
+    let bogus = proto::Identity::generate().ed_pub();
+    let servers = stored_servers(&[
+        // Адрес, который сервер не имеет права принимать (нулевой).
+        ("0.0.0.0:5555".parse().unwrap(), [9u8; 32], "ложный адрес"),
+        // Живой сервер B, но с чужим ed-ключом: SRV_HELLO_ACK не сойдётся.
+        (b_addr, bogus, "ложный ключ"),
+    ]);
+    let mut s = Node::start_cfg(
+        Config {
+            name: "neg".into(),
+            servers,
+            ..Config::default()
+        },
+        proxy.addr,
+        a_pub,
+        proto::Identity::generate(),
+        Arc::new(|_| {}),
+    )
+    .expect("клиент подключается");
+    s.wait("клиент подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+
+    // Подсказка уходит один раз (сразу после WELCOME) и больше не повторяется.
+    wait_until("SERVER_HINT отправлен", T, || {
+        proxy.sent(ctrl::SERVER_HINT) == 1
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        proxy.sent(ctrl::SERVER_HINT),
+        1,
+        "SERVER_HINT спамится чаще, чем раз в 5 минут"
+    );
+
+    // Оба кандидата отвергнуты: нулевой адрес — сразу, живой с чужим
+    // ключом — по ответу SRV_HELLO_ACK. Счётчик отказа растёт, пин не
+    // появляется (voidlink_fed_peers = 0).
+    wait_until(
+        "метрика отклонённых подсказок",
+        T,
+        || {
+            metric_value(
+                &metrics_text(metrics_addr),
+                "voidlink_fed_hint_rejected_total",
+            ) > 0
+        },
+    );
+    let text = metrics_text(metrics_addr);
+    assert_eq!(
+        metric_value(&text, "voidlink_fed_peers"),
+        0,
+        "ложный ключ закреплён:\n{text}"
+    );
+
+    drop(s);
+    drop(proxy);
+    b.stop();
+    a.stop();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
