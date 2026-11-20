@@ -76,7 +76,8 @@ enum UiMode {
     Embedded,
     /// Только тонкий клиент демона (демона нет — ошибка).
     Remote,
-    /// Офлайн-TUI: демона не ищем, правки копятся в `ui-pending.json`.
+    /// Офлайн-TUI: демона при старте не ищем (правки копятся в
+    /// `ui-pending.json`; если демон появится позже — подключимся).
     Offline,
 }
 
@@ -1030,7 +1031,15 @@ fn run_embedded_tui(
     save_cfg(dir, cfg)?;
     let cfg = Arc::new(cfg.clone());
     let store = Arc::new(store::Store::new(dir));
-    tui::run(cfg, server, pub_key, identity.clone(), adapter, dll.clone(), store)
+    tui::run(
+        cfg,
+        server,
+        pub_key,
+        identity.clone(),
+        adapter,
+        dll.clone(),
+        store,
+    )
 }
 
 /// Тонкий клиент демона с живым движком. Без имени — первичная настройка
@@ -1204,7 +1213,7 @@ global: --dir <path> --profile <имя> --debug --server <N|addr|label> (по у
                               без прав админа, нет — офлайн-TUI (правки
                               копятся и уйдут демону); --embedded — свой
                               движок, --remote — только демон, --offline —
-                              сразу офлайн
+                              не искать демона при старте
 peer = friend code (TUN-…) | hex | alias
 
 TUI открывается всегда: без серверов — пилюля «нет сервера» (F3/F4), без

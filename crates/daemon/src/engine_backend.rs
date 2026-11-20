@@ -663,12 +663,139 @@ impl Backend for DaemonBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn server(addr: &str) -> store::StoredServer {
         store::StoredServer {
             addr: addr.into(),
             pubkey: "00".repeat(32),
             label: String::new(),
+        }
+    }
+
+    /// Каталог данных с конфигом и identity (как после первого запуска).
+    fn data_dir(tag: &str, cfg: &Config) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vl-eb-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        store::Store::new(&dir).save(cfg).unwrap();
+        dir
+    }
+
+    /// `SwitchServer` в состоянии Waiting: правка конфига применяется сразу
+    /// (автовход переезжает, `client.json` сохраняется), движок будится
+    /// немедленно (`retry_now`), причина `Failed` видна фронтенду.
+    #[test]
+    fn switch_server_в_waiting_переключает_и_будит_движок() {
+        let mut cfg = Config {
+            name: "alpha".into(),
+            servers: vec![server("10.0.0.1:7000"), server("10.0.0.2:7000")],
+            active_server: "10.0.0.1:7000".into(),
+            autojoin: vec![3],
+            ..Config::default()
+        };
+        store::ensure_identity(&mut cfg);
+        let dir = data_dir("switch", &cfg);
+        let starts = Arc::new(AtomicU32::new(0));
+        let s = starts.clone();
+        let start: StartFn = Arc::new(move |_a: EngineStart| {
+            s.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("TUN недоступен")
+        });
+        let log: crate::log::LogFn = Arc::new(|_, _| {});
+        let e = DaemonEngine::open(&dir, log, start, None).unwrap();
+        assert!(e.has_server());
+        // Синхронный запуск падает: Waiting с видимой причиной.
+        assert!(e.start_now().is_err());
+        assert!(!e.is_live());
+        let snap = e.snapshot();
+        assert_eq!(snap["meta"]["offline"], Value::Bool(true));
+        assert!(
+            snap["meta"]["offline_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("TUN недоступен")),
+            "причина в снимке: {snap}"
+        );
+        let before = starts.load(Ordering::SeqCst);
+        assert_eq!(before, 1);
+
+        // SwitchServer без движка: сразу применить и разбудить движок.
+        let cmd = serde_json::to_value(Cmd::SwitchServer {
+            addr: "10.0.0.2:7000".parse().unwrap(),
+            pubkey: [0; 32],
+            label: "новый".into(),
+        })
+        .unwrap();
+        e.send(cmd).unwrap();
+        let evs = e.poll_events();
+        assert!(
+            evs.iter().any(|ev| {
+                ev["Notice"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("переключение на сервер"))
+            }),
+            "Notice о переключении: {evs:?}"
+        );
+        // Конфиг сохранён: активный сервер новый, автовход прежнего — в
+        // `autojoin_by_server`.
+        let saved: Config =
+            serde_json::from_slice(&std::fs::read(dir.join("client.json")).unwrap()).unwrap();
+        assert_eq!(saved.active_server, "10.0.0.2:7000");
+        assert_eq!(
+            saved.autojoin_by_server.get("10.0.0.1:7000"),
+            Some(&vec![3])
+        );
+        // `retry_now` поднял поток запуска: попытка была не одна.
+        let t0 = std::time::Instant::now();
+        while starts.load(Ordering::SeqCst) == before {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "движок не будили"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Причина следующего отказа снова видна (Error в событиях).
+        let t0 = std::time::Instant::now();
+        let mut why = String::new();
+        while why.is_empty() && t0.elapsed() < std::time::Duration::from_secs(5) {
+            for ev in e.poll_events() {
+                if let Some(err) = ev["Error"].as_str() {
+                    why = err.to_string();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(why.contains("TUN недоступен"), "{why}");
+
+        // Reconnect в Waiting — тоже немедленная попытка, а не отказ.
+        let before = starts.load(Ordering::SeqCst);
+        e.send(serde_json::to_value(Cmd::Reconnect).unwrap())
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        while starts.load(Ordering::SeqCst) == before {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "Reconnect не разбудил движок"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Битый каталог данных демона: снимок `{"engine": null, "error": …}` —
+    /// фронтенд покажет причину (TUI уйдёт в офлайн), команды — отказ.
+    #[test]
+    fn failed_демон_отдаёт_причину() {
+        let b = DaemonBackend::Failed("нет прав на каталог".into());
+        let v = b.snapshot();
+        assert_eq!(v["engine"], Value::Null);
+        assert_eq!(v["error"], "нет прав на каталог");
+        assert!(b.engine().is_none());
+        match b.send(serde_json::to_value(Cmd::RefreshList).unwrap()) {
+            Err(e) => assert_eq!(e, "нет прав на каталог"),
+            Ok(()) => panic!("команда без движка должна отклоняться"),
         }
     }
 

@@ -2926,9 +2926,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             // Проба не требует сессии (PROBE_REQ — открытым текстом, §3.7) и
             // идёт своим сокетом/потоком (`probe::ProbeState`), не мешая
             // сессии. Результат — `Event::ProbeResult` из `tick`.
-            if let Err(e) = env
-                .probes
-                .start_probe(addr, pinned_server_key(&env.cfg, addr), epoch_ms())
+            if let Err(e) =
+                env.probes
+                    .start_probe(addr, pinned_server_key(&env.cfg, addr), epoch_ms())
             {
                 if debug() {
                     eprintln!("[engine] проба {addr}: {e:#}");

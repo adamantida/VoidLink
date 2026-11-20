@@ -46,8 +46,7 @@ pub const RECONNECT_EVERY: Duration = Duration::from_millis(500);
 /// Текст отказа сетевой команде без движка.
 pub const NO_ENGINE: &str = "движка нет — команда не отправлена (офлайн-режим)";
 /// Адрес-заглушка «текущего сервера» для `engine::check_cfg_cmd` без движка.
-const NO_CURRENT: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+const NO_CURRENT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -126,6 +125,9 @@ struct Shared {
     pending: Mutex<VecDeque<Cmd>>,
     /// События офлайн-режима (Notice/Error/Disconnected) + пробы.
     events: Mutex<VecDeque<Event>>,
+    /// История кольца демона на момент подключения — один раз, в лог без
+    /// тостов (`EngineApi::take_history`).
+    history: Mutex<Vec<Event>>,
     /// Почему офлайн (нет демона / демон без движка).
     reason: Mutex<Option<String>>,
     /// Пробы серверов: свой сокет и поток, движок не нужен.
@@ -228,10 +230,10 @@ impl Shared {
         if !changed {
             return;
         }
-        if let Some(w) = why {
-            if toast {
-                self.push(Event::Notice(format!("офлайн: {w}")));
-            }
+        if let Some(w) = why
+            && toast
+        {
+            self.push(Event::Notice(format!("офлайн: {w}")));
         }
     }
 
@@ -251,7 +253,7 @@ impl Shared {
     }
 
     /// Отправить очередь демону по порядку; успешные убрать.
-    fn flush(&self, eng: &IpcEngine) {
+    fn flush(&self, eng: &dyn EngineApi) {
         loop {
             let cmd = match lock(&self.pending).front() {
                 Some(c) => c.clone(),
@@ -276,8 +278,6 @@ impl Shared {
         let live = !snap.meta.offline;
         let reason = snap.meta.offline_reason.clone();
         let history = eng.take_history();
-        // Демон мог прочитать наш client.json уже с правками (TUI правила
-        // файл офлайн): тогда очередь применять не надо — она бы задвоилась.
         let same = {
             let local = self.cfg();
             CfgView::from_cfg(&local) == snap.cfg
@@ -286,9 +286,9 @@ impl Shared {
         *lock(&self.remote) = Some(eng.clone());
         self.live.store(live, Ordering::SeqCst);
         self.set_reason(if live { None } else { reason.clone() });
-        for ev in history {
-            self.push(ev);
-        }
+        // История кольца демона — отдельно (`take_history`): TUI разберёт её
+        // без тостов и окон, как у тонкого клиента.
+        lock(&self.history).extend(history);
         if !live {
             self.push(Event::Notice(match &reason {
                 Some(r) => format!("демон доступен, движок не запущен: {r}"),
@@ -313,7 +313,7 @@ impl Shared {
                 "демон доступен — применяем отложенные правки ({n})"
             )));
         }
-        self.flush(&eng);
+        self.flush(eng.as_ref());
     }
 
     /// Правка конфига без движка: применить, сохранить, поставить в очередь.
@@ -556,6 +556,7 @@ impl ResilientEngine {
             live: AtomicBool::new(false),
             pending: Mutex::new(pending),
             events: Mutex::new(VecDeque::new()),
+            history: Mutex::new(Vec::new()),
             reason: Mutex::new(reason),
             probes: ProbeState::new(),
             retry_now: AtomicBool::new(false),
@@ -661,6 +662,10 @@ impl EngineApi for ResilientEngine {
         // Демон без движка доступен: он принимает правки конфига — это не
         // «демон недоступен», а «сервер недоступен» (пилюля в TUI).
         !self.is_remote()
+    }
+
+    fn take_history(&self) -> Vec<Event> {
+        std::mem::take(&mut *lock(&self.sh.history))
     }
 
     fn save_theme(&self, theme: &str) -> Result<()> {
@@ -883,7 +888,10 @@ mod tests {
         assert_eq!(cfg.lock().unwrap().adapter, "vl1");
         assert_eq!(cfg.lock().unwrap().dll, "C:/wintun.dll");
         let disk = store::Store::new(&d).load().unwrap();
-        assert_eq!((disk.adapter.as_str(), disk.dll.as_str()), ("vl1", "C:/wintun.dll"));
+        assert_eq!(
+            (disk.adapter.as_str(), disk.dll.as_str()),
+            ("vl1", "C:/wintun.dll")
+        );
         drop(eng);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -917,11 +925,8 @@ mod tests {
                 ts_ms: req.ts_ms,
                 ed_pub: Some(key),
             });
-            sock.send_to(
-                &proto::plain_frame(proto::ctrl::PROBE_RESP, &resp),
-                src,
-            )
-            .unwrap();
+            sock.send_to(&proto::plain_frame(proto::ctrl::PROBE_RESP, &resp), src)
+                .unwrap();
         });
         let d = temp_dir("probe");
         let cfg = Config {
@@ -1008,6 +1013,127 @@ mod tests {
         assert!(s.cfg.servers.is_empty());
         assert!(s.meta.offline && s.meta.offline_reason.is_none());
         drop(eng);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Движок-приёмник: команды в `sent`; `fail_at` — номер, на котором
+    /// «демон пропал» (0 — первая же).
+    struct SinkEngine {
+        sent: Mutex<Vec<Cmd>>,
+        me: Me,
+        fail_at: Option<usize>,
+    }
+
+    impl SinkEngine {
+        fn new(me: Me) -> Self {
+            SinkEngine {
+                sent: Mutex::new(Vec::new()),
+                me,
+                fail_at: None,
+            }
+        }
+    }
+
+    impl EngineApi for SinkEngine {
+        fn snapshot(&self) -> Arc<Snapshot> {
+            Arc::new(Snapshot::default())
+        }
+        fn poll_events(&self) -> Vec<Event> {
+            Vec::new()
+        }
+        fn send(&self, cmd: Cmd) -> Result<()> {
+            let mut sent = self.sent.lock().unwrap();
+            if self.fail_at == Some(sent.len()) {
+                return Err(anyhow!("демон недоступен"));
+            }
+            sent.push(cmd);
+            Ok(())
+        }
+        fn me(&self) -> &Me {
+            &self.me
+        }
+        fn mode(&self) -> EngineMode {
+            EngineMode::Remote
+        }
+        fn save_theme(&self, _theme: &str) -> Result<()> {
+            Ok(())
+        }
+        fn save_adapter(&self, _name: &str, _dll: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `Shared` без фонового потока — для проверки `flush` напрямую.
+    fn shared(dir: &Path, cfg: Config, pending: VecDeque<Cmd>) -> Shared {
+        let mut probe_cfg = cfg.clone();
+        let id = store::ensure_identity(&mut probe_cfg);
+        Shared {
+            dir: dir.to_path_buf(),
+            cfg: Arc::new(Mutex::new(cfg)),
+            save: Arc::new(|_: &Config| {}),
+            me: Me {
+                my_pub: id.ed_pub(),
+                my_code: id.friend_code(),
+            },
+            stop: AtomicBool::new(false),
+            remote: Mutex::new(None),
+            live: AtomicBool::new(false),
+            pending: Mutex::new(pending),
+            events: Mutex::new(VecDeque::new()),
+            history: Mutex::new(Vec::new()),
+            reason: Mutex::new(None),
+            probes: ProbeState::new(),
+            retry_now: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn очередь_отправляется_по_порядку_и_очищается() {
+        let d = temp_dir("flush");
+        let cmds: VecDeque<Cmd> = VecDeque::from(vec![
+            Cmd::AddServer {
+                addr: "127.0.0.1:5599".into(),
+                pubkey: [1; 32],
+                label: "дом".into(),
+            },
+            Cmd::SetName("tui".into()),
+        ]);
+        save_pending(&d, &cmds);
+        let sh = shared(&d, Config::default(), cmds);
+        let eng = SinkEngine::new(sh.me.clone());
+        sh.flush(&eng);
+        let sent = eng.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "все команды ушли");
+        assert!(matches!(sent[0], Cmd::AddServer { .. }), "{sent:?}");
+        assert!(
+            matches!(&sent[1], Cmd::SetName(n) if n == "tui"),
+            "порядок сохранён: {sent:?}"
+        );
+        assert_eq!(sh.pending_len(), 0);
+        assert!(!d.join(PENDING_FILE).exists(), "очередь очищена и на диске");
+        drop(sh);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn демон_пропал_посреди_очереди_остаток_ждёт() {
+        let d = temp_dir("flushfail");
+        let cmds: VecDeque<Cmd> = VecDeque::from(vec![
+            Cmd::SetName("tui".into()),
+            Cmd::SetStatus("тут".into()),
+        ]);
+        save_pending(&d, &cmds);
+        let sh = shared(&d, Config::default(), cmds);
+        let mut eng = SinkEngine::new(sh.me.clone());
+        eng.fail_at = Some(1);
+        sh.flush(&eng);
+        // Первая ушла, вторая не подтверждена — остаётся в очереди и на диске.
+        assert_eq!(sh.pending_len(), 1);
+        let left = load_pending(&d);
+        assert_eq!(left.len(), 1);
+        assert!(matches!(&left[0], Cmd::SetStatus(s) if s == "тут"));
+        assert!(d.join(PENDING_FILE).exists());
+        drop(sh);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

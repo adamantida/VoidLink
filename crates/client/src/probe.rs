@@ -245,14 +245,22 @@ impl ProbeState {
         debug_assert_eq!(body.len(), payloads::PROBE_REQ_LEN);
         let frame = proto::plain_frame(ctrl::PROBE_REQ, &body);
         // Регистрируем ожидание до отправки: ответ может прийти сразу.
-        lock(&self.inner.pending).insert(
-            nonce,
-            Pending {
-                addr,
-                started: Instant::now(),
-                pinned,
-            },
-        );
+        // Повторный запрос к тому же адресу не ставим: два ожидания дали бы
+        // «недоступен» после успешного ответа (запоздавший таймаут).
+        {
+            let mut pending = lock(&self.inner.pending);
+            if pending.values().any(|p| p.addr == addr) {
+                bail!("проба {addr} уже идёт");
+            }
+            pending.insert(
+                nonce,
+                Pending {
+                    addr,
+                    started: Instant::now(),
+                    pinned,
+                },
+            );
+        }
         let sent = match &*lock(&self.jobs) {
             Some(tx) => tx.send(Job { nonce, frame, addr }).is_ok(),
             None => false,
@@ -380,7 +388,7 @@ fn worker(inner: Arc<Inner>, jobs: Receiver<Job>, timeout: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnel_protocol::payloads::{ProbeResp, PROBE_REQ_LEN, PROBE_RESP_KEY_LEN, PROBE_RESP_LEN};
+    use tunnel_protocol::payloads::{PROBE_REQ_LEN, PROBE_RESP_KEY_LEN, PROBE_RESP_LEN, ProbeResp};
 
     fn addr() -> SocketAddr {
         "203.0.113.9:5555".parse().unwrap()
@@ -450,7 +458,11 @@ mod tests {
         let r = st
             .on_response(addr(), &resp([2u8; PROBE_NONCE_LEN], Some([6u8; 32])))
             .unwrap();
-        assert_eq!(r.key_match, KeyMatch::Mismatch, "сервер отвечает чужим ключом");
+        assert_eq!(
+            r.key_match,
+            KeyMatch::Mismatch,
+            "сервер отвечает чужим ключом"
+        );
         assert_eq!(r.key_match.as_bool(), Some(false));
         // Без закреплённого ключа сверять не с чем.
         let st = ProbeState::new();
@@ -535,7 +547,7 @@ mod tests {
         // Запрос — ровно 64 байта тела, want_key=1 (был закреплённый ключ).
         let req = srv.join().unwrap();
         assert_eq!(req.len(), PROBE_REQ_LEN);
-        assert_eq!(payloads::dec_probe_req(&req).unwrap().want_key, true);
+        assert!(payloads::dec_probe_req(&req).unwrap().want_key);
         assert_eq!(st.pending(), 0);
     }
 
@@ -551,16 +563,24 @@ mod tests {
         assert_eq!(r.key_match, KeyMatch::Unknown);
         let req = srv.join().unwrap();
         assert!(!payloads::dec_probe_req(&req).unwrap().want_key);
-        assert_eq!(payloads::enc_probe_resp(&ProbeResp {
-            nonce: [0; PROBE_NONCE_LEN],
-            ts_ms: 0,
-            ed_pub: None,
-        }).len(), PROBE_RESP_LEN);
-        assert_eq!(payloads::enc_probe_resp(&ProbeResp {
-            nonce: [0; PROBE_NONCE_LEN],
-            ts_ms: 0,
-            ed_pub: Some([0; 32]),
-        }).len(), PROBE_RESP_KEY_LEN);
+        assert_eq!(
+            payloads::enc_probe_resp(&ProbeResp {
+                nonce: [0; PROBE_NONCE_LEN],
+                ts_ms: 0,
+                ed_pub: None,
+            })
+            .len(),
+            PROBE_RESP_LEN
+        );
+        assert_eq!(
+            payloads::enc_probe_resp(&ProbeResp {
+                nonce: [0; PROBE_NONCE_LEN],
+                ts_ms: 0,
+                ed_pub: Some([0; 32]),
+            })
+            .len(),
+            PROBE_RESP_KEY_LEN
+        );
     }
 
     #[test]
@@ -574,10 +594,38 @@ mod tests {
             .unwrap();
         let r = wait_result(&st, Duration::from_secs(3)).expect("проба завершилась");
         assert!(!r.available, "{r:?}");
-        assert_eq!((r.rtt_ms, r.key, r.key_match), (None, None, KeyMatch::Unknown));
+        assert_eq!(
+            (r.rtt_ms, r.key, r.key_match),
+            (None, None, KeyMatch::Unknown)
+        );
         // Две попытки по 120 мс — не мгновенно и не дольше разумного.
-        assert!(started.elapsed() >= Duration::from_millis(120), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(st.pending(), 0);
+    }
+
+    #[test]
+    fn повторная_проба_того_же_адреса_не_дублируется() {
+        // Второе ожидание того же адреса дало бы «недоступен» уже после
+        // успешного ответа (запоздавший таймаут) — не ставим его.
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sink.local_addr().unwrap();
+        let st = ProbeState::with_timeout(Duration::from_millis(120));
+        st.start_probe(addr, None, 1_700_000_000_000).unwrap();
+        let e = st
+            .start_probe(addr, None, 1_700_000_000_000)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("уже идёт"), "{e}");
+        let r = wait_result(&st, Duration::from_secs(3)).expect("проба завершилась");
+        assert!(!r.available);
+        assert_eq!(st.pending(), 0);
+        // После завершения — снова можно.
+        st.start_probe(addr, None, 1_700_000_000_000).unwrap();
+        assert_eq!(st.pending(), 1);
     }
 
     #[test]
@@ -587,6 +635,10 @@ mod tests {
             let st = ProbeState::new();
             assert_eq!(st.pending(), 0);
         }
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

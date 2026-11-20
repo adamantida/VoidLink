@@ -424,7 +424,10 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert!(text.contains("⏳ ожидает применения") && !text.contains("(1)"), "{text}");
+        assert!(
+            text.contains("⏳ ожидает применения") && !text.contains("(1)"),
+            "{text}"
+        );
         let text: String = status_badges(&BadgeState::default(), &th)
             .iter()
             .map(|s| s.content.to_string())

@@ -18,7 +18,7 @@ use crate::snapshot::Snapshot;
 use crate::store::{self, Config, StoredFriend, StoredServer};
 use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
 use crate::tui::badges::{ConnState, Transport};
-use crate::tui::servers::{ProbeLine, ServerEntry, ServersAction, ServersView};
+use crate::tui::servers::{ProbeLine, ServerEntry, ServersAction, ServersView, resolve_addr};
 use crate::tui::theme::ThemeKind;
 use crate::tui::{clipboard, keymap};
 
@@ -2849,6 +2849,12 @@ impl App {
                         self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
                         return (None, false);
                     };
+                    // Уже идёт (автопроба или прошлый `p`) — второй запрос не
+                    // нужен: его таймаут затёр бы свежий результат.
+                    if matches!(self.stack.last(), Some(Popup::Servers(v)) if v.is_probing(addr)) {
+                        self.toast(MsgKind::Info, format!("{addr}: уже проверяется"));
+                        return (None, false);
+                    }
                     // Явная проба `p`: результат покажем тостом.
                     self.probe_manual.insert(addr);
                     if let Some(Popup::Servers(v)) = self.stack.last_mut() {
@@ -3251,15 +3257,6 @@ fn server_entries(cfg: &Config) -> Vec<ServerEntry> {
             probing: false,
         })
         .collect()
-}
-
-/// `ip:port` или `host:port` → адрес (первый из разрешённых).
-pub(crate) fn resolve_addr(addr: &str) -> Option<std::net::SocketAddr> {
-    if let Ok(a) = addr.parse() {
-        return Some(a);
-    }
-    use std::net::ToSocketAddrs;
-    addr.to_socket_addrs().ok()?.next()
 }
 
 /// Копирование в системный буфер обмена (через SSH — OSC 52 первым).
@@ -4537,10 +4534,7 @@ mod tests {
         );
 
         // `p` — повтор выбранного: команда ушла, снова «проверяется…».
-        a.handle_key(
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
-            &eng,
-        );
+        a.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &eng);
         assert!(matches!(
             eng.sent().last(),
             Some(Cmd::ProbeServer { addr: a }) if *a == addr
@@ -4604,6 +4598,9 @@ mod tests {
             panic!("экран серверов открыт")
         };
         assert_eq!(v.servers[0].probe.map(|p| p.rtt_ms), Some(Some(3)));
-        assert_eq!(v.servers[0].probe.map(|p| p.key_match), Some(KeyMatch::Match));
+        assert_eq!(
+            v.servers[0].probe.map(|p| p.key_match),
+            Some(KeyMatch::Match)
+        );
     }
 }

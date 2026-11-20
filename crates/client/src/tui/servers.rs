@@ -26,9 +26,18 @@ use ratatui::widgets::{
 };
 use tunnel_protocol as proto;
 
-use super::app::resolve_addr;
 use super::theme::Theme;
 use crate::probe::KeyMatch;
+
+/// `ip:port` или `host:port` → адрес (первый из разрешённых). Результаты
+/// пробы ищут строку по resolved-адресу, а не по строке из конфига.
+pub(crate) fn resolve_addr(addr: &str) -> Option<SocketAddr> {
+    if let Ok(a) = addr.parse() {
+        return Some(a);
+    }
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs().ok()?.next()
+}
 
 /// Максимальная длина однострочного поля ввода.
 const MAX_INPUT: usize = 120;
@@ -590,8 +599,16 @@ impl ServersView {
                 ],
             )
             .header(
-                Row::new(vec!["", "имя", "адрес", "доступен", "RTT", "ключ", "pubkey"])
-                    .style(th.dim),
+                Row::new(vec![
+                    "",
+                    "имя",
+                    "адрес",
+                    "доступен",
+                    "RTT",
+                    "ключ",
+                    "pubkey",
+                ])
+                .style(th.dim),
             )
             .row_highlight_style(th.selected)
             .highlight_symbol("▌");
