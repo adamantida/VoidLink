@@ -130,6 +130,9 @@ pub struct StoredContact {
     /// Когда контакт последний раз отвечал, unix секунды.
     #[serde(default)]
     pub seen_s: u64,
+    /// Возможности mesh (`mesh::caps::*`); бит `MESH` подразумевается.
+    #[serde(default)]
+    pub caps: u8,
 }
 
 /// Выбор транспорта до сервера.
@@ -347,6 +350,7 @@ mod tests {
             addr: "1.2.3.4:5".into(),
             rtt_ms: 42,
             seen_s: 7,
+            caps: 0,
         });
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();

@@ -496,6 +496,8 @@ mod tests {
             last_rx: base + Duration::from_millis(9_750),
             last_direct: Some(base),
             rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
         };
         let paths = PathTable::empty();
         let p = PeerSnap::from_sess(&peer, &paths, now);

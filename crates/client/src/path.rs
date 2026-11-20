@@ -434,6 +434,53 @@ impl PathTable {
         recalc_target_pinned(ip, t, pin, ctx, &mut out);
         out
     }
+
+    /// Выбрать путь доставки для `route_packet`: пересчитать получателя
+    /// (гистерезис и закрепление — те же, что в [`PathTable::recalc`]) и
+    /// вернуть текущий путь. Изменения — вторым элементом: движок рассылает
+    /// их событиями. У получателя без записи она заводится (участник группы).
+    pub fn choose(
+        &self,
+        ip: u32,
+        now_ms: u64,
+        server_up: bool,
+    ) -> (Option<PathKind>, Vec<PathChange>) {
+        self.ensure_target(ip);
+        let changes = self.recalc_one(ip, now_ms, server_up);
+        (self.current(ip), changes)
+    }
+
+    /// Доступные сейчас пути получателя по возрастанию стоимости (для
+    /// отката, когда выбранный путь отказал).
+    pub fn fallbacks(&self, ip: u32, now_ms: u64, server_up: bool) -> Vec<PathKind> {
+        let p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = Ctx {
+            server: p.server,
+            server_up,
+            relay: p.relay_enabled,
+            now_ms,
+        };
+        let Some(t) = p.targets.get(&ip) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(f64, PathKind)> = Vec::new();
+        for kind in [
+            Some(PathKind::Direct),
+            Some(PathKind::Server),
+            t.peer.map(|r| PathKind::PeerRelay { via: r.via }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some((cost, _)) = cost_of(t, kind, ctx)
+                && cost.is_finite()
+            {
+                v.push((cost, kind));
+            }
+        }
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v.into_iter().map(|(_, k)| k).collect()
+    }
 }
 
 /// Неизменяемые входы пересчёта: связь с сервером, режим релея, время.

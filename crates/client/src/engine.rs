@@ -62,6 +62,16 @@ const PING_EVERY: Duration = Duration::from_secs(5);
 const LIST_EVERY: Duration = Duration::from_secs(15);
 /// Пересчёт путей доставки (стоимость/гистерезис, §3.6).
 const PATHS_EVERY: Duration = Duration::from_secs(10);
+/// Шаг mesh-таймеров (сессии, DHT-пинги, повторы forward).
+const MESH_EVERY: Duration = Duration::from_secs(1);
+/// `MESH_INFO` серверу: сразу после WELCOME и далее раз в 5 минут (§4.1).
+const MESH_INFO_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Обслуживание DHT (устаревание, сохранение контактов) раз в минуту.
+const DHT_EVERY: Duration = Duration::from_secs(60);
+/// Поиск `find_node` для меш-пира не чаще раза в 5 минут.
+const LOOKUP_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Сколько кандидатов-реле пробуем на один кадр (L2).
+const RELAY_TRIES: usize = 3;
 const SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// Повтор HELLO3 одной попытки, пока нет WELCOME.
@@ -155,6 +165,23 @@ pub struct PeerSess {
     /// Последний фрейм пира, пришедший на `direct_addr`.
     pub last_direct: Option<Instant>,
     pub rtt_ms: Option<u64>,
+    /// Статический x25519-ключ пира из mesh-секции `GROUP_STATE` (§4.2):
+    /// `None` — клиент mesh не публиковал/сервер его не знает.
+    pub mesh_x: Option<[u8; 32]>,
+    /// Возможности mesh (`mesh::caps::*`) из mesh-секции.
+    pub mesh_caps: u8,
+}
+
+impl PeerSess {
+    /// Пир умеет mesh (можно инициировать рукопожатие, §3.2).
+    pub fn mesh_capable(&self) -> bool {
+        self.mesh_x.is_some() && proto::mesh::caps::has(self.mesh_caps, proto::mesh::caps::MESH)
+    }
+
+    /// Готов релеить чужой трафик.
+    pub fn can_relay(&self) -> bool {
+        self.mesh_capable() && proto::mesh::caps::has(self.mesh_caps, proto::mesh::caps::RELAY)
+    }
 }
 
 impl PeerSess {
@@ -463,6 +490,10 @@ impl GroupSess {
             last_rx: prev.map(|p| p.last_rx).unwrap_or(now),
             last_direct: None,
             rtt_ms: None,
+            // Mesh-метаданные придут хвостом GROUP_STATE сразу за участниками;
+            // до него сохраняем прежние (адрес/ключ пира не менялся).
+            mesh_x: prev.and_then(|p| p.mesh_x),
+            mesh_caps: prev.map(|p| p.mesh_caps).unwrap_or(0),
         };
         if m.online {
             peer.rtt_ms = prev.and_then(|p| p.rtt_ms);
@@ -507,6 +538,39 @@ impl GroupSess {
             .collect();
         for ip in ips {
             self.members.remove(&ip);
+        }
+    }
+
+    /// Применить mesh-хвост `GROUP_STATE` (§4.2): x-ключ и caps по адресу
+    /// оверлея. Отсутствующие в хвосте участники — «не публиковали»
+    /// (`None`/0), даже если раньше публиковали: сервер отдаёт хвост только
+    /// для тех, кто сейчас онлайн.
+    fn apply_mesh_section(&mut self, mesh: &[payloads::MeshEntry]) {
+        let mut by_ip: HashMap<u32, ([u8; 32], u8)> =
+            mesh.iter().map(|e| (e.ip, (e.x_pub, e.caps))).collect();
+        for (ip, p) in self.members.iter_mut() {
+            match by_ip.remove(ip) {
+                Some((x, caps)) => {
+                    p.mesh_x = Some(x);
+                    p.mesh_caps = caps;
+                }
+                None => {
+                    p.mesh_x = None;
+                    p.mesh_caps = 0;
+                }
+            }
+        }
+    }
+
+    /// Mesh-хвост `GROUP_UPDATE`: у записи хвоста `ip == 0` (адрес в дельте
+    /// `GroupDelta::Member`), поэтому цель ищется по ключу.
+    fn apply_mesh_tail_for(&mut self, pubkey: &[u8; 32], mesh: &[payloads::MeshEntry]) {
+        let Some(entry) = mesh.first() else {
+            return;
+        };
+        if let Some(p) = self.members.values_mut().find(|p| p.pubkey == *pubkey) {
+            p.mesh_x = Some(entry.x_pub);
+            p.mesh_caps = entry.caps;
         }
     }
 }
@@ -558,6 +622,8 @@ pub struct Meta {
     pub mesh_enabled: bool,
     /// Байт, отрелеенных этим клиентом через mesh (T3).
     pub relay_bytes: u64,
+    /// Живых mesh-сессий (для статус-бара и снимка).
+    pub mesh_sessions: u32,
 }
 
 impl Meta {
@@ -1086,6 +1152,8 @@ struct Env {
     mesh: Arc<Mutex<mesh::MeshState>>,
     /// DHT-таблица контактов (T3).
     dht: Arc<Mutex<dht::Dht>>,
+    /// Ответы MESH_NODES из потока приёма → поток движка (там поиски).
+    mesh_finds: Arc<Mutex<Vec<(u64, Vec<dht::Contact>)>>> ,
     /// Выбор пути доставки (этап 9): измерения, гистерезис, закрепления.
     paths: Arc<PathTable>,
     /// Пробы серверов (T2).
@@ -1949,6 +2017,7 @@ pub fn start_with_tun(
         server_rtt_ms: None,
         mesh_enabled,
         relay_bytes: 0,
+        mesh_sessions: 0,
     }));
 
     let sock = Arc::new(UdpSocket::bind(bind_addr(server)).context("bind udp")?);
@@ -1957,6 +2026,7 @@ pub fn start_with_tun(
 
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
     let paths = Arc::new(PathTable::new(&pinned));
+    let my_ed = identity.ed_pub();
     let env = Arc::new(Env {
         groups: groups.clone(),
         meta: meta.clone(),
@@ -1972,7 +2042,8 @@ pub fn start_with_tun(
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
         mesh: Arc::new(Mutex::new(mesh::MeshState::new(mesh_enabled))),
-        dht: Arc::new(Mutex::new(dht::Dht::new())),
+        dht: Arc::new(Mutex::new(dht::Dht::new(my_ed))),
+        mesh_finds: Arc::new(Mutex::new(Vec::new())),
         paths: paths.clone(),
         probes: Arc::new(probe::ProbeState::new()),
     });
@@ -2096,8 +2167,7 @@ fn dispatch(
     // сервера из списка (пробуемый сервер не обязан быть текущим), кадры
     // федерации — от чужих серверов (клиенту не адресованы).
     if proto::mesh::is_mesh(typ) {
-        let st = env.mesh.lock().unwrap();
-        let _ = mesh::on_frame(&st, src, typ, body);
+        handle_mesh_frame(env, src, typ, body);
         return true;
     }
     if typ == ctrl::PROBE_RESP {
@@ -2116,9 +2186,9 @@ fn dispatch(
         return true;
     }
     if proto::grp::is_group(typ) {
-        match handle_group_frame(env, src, datagram) {
-            Some(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
-            None => true,
+        match handle_group_frame(env, src, datagram, false) {
+            FrameVerdict::NeedGroup(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
+            FrameVerdict::Accepted | FrameVerdict::Drop => true,
         }
     } else if src == env.server() {
         in_tx
@@ -2223,6 +2293,22 @@ struct State {
     pending_ping: Option<PendingPong>,
     /// Последний пересчёт путей доставки (§3.6).
     last_paths: Instant,
+    /// Последний шаг mesh-таймеров (сессии, DHT, повторы forward).
+    last_mesh: Instant,
+    /// Последний `MESH_INFO` серверу.
+    last_info: Instant,
+    /// `MESH_INFO` нужен сразу (после нового WELCOME).
+    info_due: bool,
+    /// Последнее обслуживание DHT (устаревание, сохранение контактов).
+    last_dht: Instant,
+    /// Активные поиски `find_node`: id → поиск.
+    lookups: HashMap<u64, dht::Lookup>,
+    /// Когда последний раз искали контакт (ed → время).
+    last_lookup: HashMap<[u8; 32], Instant>,
+    /// Когда последний раз мерили маршрут через реле.
+    last_route_probe: Instant,
+    /// Номер следующего поиска DHT.
+    lookup_seq: u64,
 }
 
 impl State {
@@ -2260,6 +2346,14 @@ impl State {
             last_leave: now,
             pending_ping: None,
             last_paths: now,
+            last_mesh: now,
+            last_info: now,
+            info_due: false,
+            last_dht: now,
+            lookups: HashMap::new(),
+            last_lookup: HashMap::new(),
+            last_route_probe: now,
+            lookup_seq: 1,
         }
     }
 
@@ -2461,6 +2555,9 @@ fn on_connected(env: &Env, st: &mut State, was: bool) {
         env.meta.lock().unwrap().connected = true;
         env.emit(Event::Connected(env.server()));
     }
+    // MESH_INFO — сразу после WELCOME (§4.1): без него сервер не знает наш
+    // x-ключ и не отдаёт нас в MESH_SEED/хвосте GROUP_STATE.
+    st.info_due = true;
     restore(env, st);
 }
 
@@ -2778,6 +2875,11 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
         st.last_paths = now;
         paths_round(env, st.connected(), now);
     }
+    // Mesh/DHT: сессии, пинги, поиски, измерения маршрутов (§3.2–3.4).
+    if now.duration_since(st.last_mesh) >= MESH_EVERY {
+        st.last_mesh = now;
+        mesh_round(env, st, now, st.connected());
+    }
 }
 
 /// Пересчёт путей всех участников: события `PathChanged`/`PathLost` (§3.6).
@@ -2823,12 +2925,593 @@ fn paths_round(env: &Env, connected: bool, _now: Instant) {
     }
 }
 
+/// Шаг mesh/DHT (раз в секунду): `MESH_INFO`, сессии и рукопожатия, DHT
+/// (пинги/устаревание/сохранение), поиски `find_node`, измерения маршрутов
+/// через реле, разбор ответов `MESH_NODES`.
+fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
+    let now_ms = epoch_ms();
+    // 0. MESH_INFO: после WELCOME и далее раз в 5 минут (§4.1).
+    if connected && (st.info_due || now.duration_since(st.last_info) >= MESH_INFO_EVERY) {
+        st.info_due = false;
+        st.last_info = now;
+        let caps = my_mesh_caps(env);
+        st.send_ctrl(
+            env,
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&env.identity.x_pub(), caps),
+        );
+    }
+    // 1. DHT: устаревание (TTL 15 мин) + сохранение контактов в client.json.
+    if now.duration_since(st.last_dht) >= DHT_EVERY {
+        st.last_dht = now;
+        // Контакты из живых mesh-сессий — тоже источник (сменился адрес).
+        let sess = env.mesh.lock().unwrap().session_contacts();
+        let saved = {
+            let mut d = env.dht.lock().unwrap();
+            for c in sess {
+                d.insert(c);
+            }
+            d.expire(now_ms);
+            d.to_stored()
+        };
+        if env.cfg.lock().unwrap().mesh.contacts != saved {
+            env.update_cfg(|c| c.mesh.contacts = saved);
+        }
+    }
+    // 2. DHT-пинг ближайших: у кого есть mesh-сессия — MESH_PING, остальные
+    //    получат HELLO из mesh-таймера (не чаще `HANDSHAKE_GAP_MS`).
+    let due = env.dht.lock().unwrap().ping_due(now_ms);
+    if !due.is_empty() {
+        let w = mesh_world(env);
+        let check = GroupCheck {
+            groups: &w.groups,
+        };
+        let ctx = mesh::MeshCtx {
+            me: &env.identity,
+            my_caps: my_mesh_caps(env),
+            now_ms,
+            my_addr: w.my_addr,
+            contacts: &w.contacts,
+            members: &w.members,
+            relay_enabled: relay_enabled(env),
+            relay_budget: relay_budget(env),
+            check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+        };
+        let mut pinged: Vec<[u8; 32]> = Vec::new();
+        {
+            let mut mesh = env.mesh.lock().unwrap();
+            for c in &due {
+                if mesh.session(&c.ed).is_some()
+                    && let Some((to, frame)) = mesh.ping_peer(&ctx, &c.ed)
+                {
+                    env.send(&frame, to);
+                    pinged.push(c.ed);
+                }
+            }
+        }
+        if !pinged.is_empty() {
+            let mut d = env.dht.lock().unwrap();
+            for ed in pinged {
+                d.mark_pinged(&ed, now_ms);
+            }
+        }
+    }
+    // 3. Состав групп: адрес/ключ участника — контакт DHT. Смена адреса
+    //    запускает поиск заново (§3.3: «поиск при смене адреса»).
+    let peers = mesh_peers(env);
+    {
+        let mut d = env.dht.lock().unwrap();
+        let mut changed = false;
+        for p in &peers {
+            if d.set_addr(&p.ed, p.addr, now_ms) {
+                changed = true;
+            } else {
+                d.add_group_peer(p.ed, p.x, p.addr, p.caps | proto::mesh::caps::MESH, now_ms);
+            }
+        }
+        if changed {
+            st.last_lookup.clear();
+        }
+    }
+    // 4. find_node: до 2 раундов × α = 3 на пира; не чаще раза в 5 минут или
+    //    сразу после смены адреса.
+    for p in &peers {
+        let due = st
+            .last_lookup
+            .get(&p.ed)
+            .is_none_or(|t| now.duration_since(*t) >= LOOKUP_EVERY);
+        if !due || !proto::mesh::caps::has(p.caps, proto::mesh::caps::MESH) {
+            continue;
+        }
+        st.last_lookup.insert(p.ed, now);
+        st.lookup_seq = st.lookup_seq.wrapping_add(1).max(1);
+        let id = st.lookup_seq;
+        let lookup = env.dht.lock().unwrap().start_lookup(id, p.ed);
+        st.lookups.insert(id, lookup);
+        send_find_round(env, st, id);
+    }
+    // 5. Ответы MESH_NODES: контакты в DHT и следующий раунд поиска.
+    let finds = std::mem::take(&mut *env.mesh_finds.lock().unwrap());
+    for (id, nodes) in finds {
+        env.dht.lock().unwrap().on_nodes(&nodes);
+        if st.lookups.contains_key(&id) {
+            send_find_round(env, st, id);
+        }
+    }
+    // 6. Маршруты через реле: раз в `PATHS_EVERY` для каждого получателя —
+    //    MESH_ROUTE трём ближайшим реле-кандидатам (PathTable получит стоимость
+    //    L2 и сможет выбрать peer-путь).
+    if now.duration_since(st.last_route_probe) >= PATHS_EVERY {
+        st.last_route_probe = now;
+        let w = mesh_world(env);
+        let check = GroupCheck {
+            groups: &w.groups,
+        };
+        let ctx = mesh::MeshCtx {
+            me: &env.identity,
+            my_caps: my_mesh_caps(env),
+            now_ms,
+            my_addr: w.my_addr,
+            contacts: &w.contacts,
+            members: &w.members,
+            relay_enabled: relay_enabled(env),
+            relay_budget: relay_budget(env),
+            check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+        };
+        let targets: Vec<([u8; 32], u32, SocketAddr)> = peers
+            .iter()
+            .filter_map(|p| ip_of_ed(env, &p.ed).map(|ip| (p.ed, ip, p.addr)))
+            .collect();
+        for (dst_ed, _ip, _addr) in targets {
+            let cands = mesh::relay_candidates(&env.dht.lock().unwrap(), &dst_ed, RELAY_TRIES);
+            let mut mesh = env.mesh.lock().unwrap();
+            for c in cands {
+                if c.ed == dst_ed {
+                    continue;
+                }
+                if mesh.session(&c.ed).is_none() {
+                    continue;
+                }
+                if let Some((to, frame)) = mesh.route_probe(&ctx, &c.ed, dst_ed, c.addr) {
+                    env.send(&frame, to);
+                }
+            }
+        }
+    }
+    // 7. Сессии: рукопожатия, пинги, таймауты, повторы forward.
+    let w = mesh_world(env);
+    let check = GroupCheck {
+        groups: &w.groups,
+    };
+    let ctx = mesh::MeshCtx {
+        me: &env.identity,
+        my_caps: my_mesh_caps(env),
+        now_ms,
+        my_addr: w.my_addr,
+        contacts: &w.contacts,
+        members: &w.members,
+        relay_enabled: relay_enabled(env),
+        relay_budget: relay_budget(env),
+        check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+    };
+    let out = {
+        let mut mesh = env.mesh.lock().unwrap();
+        mesh.tick(&ctx)
+    };
+    apply_mesh_out(env, out);
+    sync_mesh_stats(env);
+}
+
+/// Продолжить поиск `find_node`: следующие α контактов к цели.
+fn send_find_round(env: &Env, st: &mut State, id: u64) {
+    let queries = {
+        let d = env.dht.lock().unwrap();
+        match st.lookups.get_mut(&id) {
+            Some(l) => l.next_queries(&d),
+            None => return,
+        }
+    };
+    if queries.is_empty() {
+        st.lookups.remove(&id);
+        return;
+    }
+    let target = st
+        .lookups
+        .get(&id)
+        .map(|l| l.target)
+        .expect("поиск есть");
+    let w = mesh_world(env);
+    let check = GroupCheck {
+        groups: &w.groups,
+    };
+    let ctx = mesh::MeshCtx {
+        me: &env.identity,
+        my_caps: my_mesh_caps(env),
+        now_ms: epoch_ms(),
+        my_addr: w.my_addr,
+        contacts: &w.contacts,
+        members: &w.members,
+        relay_enabled: relay_enabled(env),
+        relay_budget: relay_budget(env),
+        check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+    };
+    let mut mesh = env.mesh.lock().unwrap();
+    for c in queries {
+        if let Some((to, frame)) = mesh.find_node(&ctx, &c.ed, id, target) {
+            env.send(&frame, to);
+        }
+    }
+}
+
+/// Mesh-пиры из состава групп: ed, x-ключ, endpoint и caps.
+fn mesh_peers(env: &Env) -> Vec<dht::Contact> {
+    let g = env.groups.lock().unwrap();
+    let now = epoch_ms();
+    g.values()
+        .flat_map(|gs| gs.members.values())
+        .filter_map(|p| {
+            let x = p.mesh_x?;
+            let addr = p.endpoint?;
+            Some(dht::Contact {
+                ed: p.pubkey,
+                x,
+                addr,
+                rtt_ms: 0,
+                last_seen_ms: now,
+                caps: p.mesh_caps | proto::mesh::caps::MESH,
+            })
+        })
+        .collect()
+}
+
 /// Имя участника по адресу оверлея (первая группа, где он есть).
 fn peer_name(env: &Env, ip: u32) -> String {
     let g = env.groups.lock().unwrap();
     g.values()
         .find_map(|gs| gs.members.get(&ip).map(|p| p.name.clone()))
         .unwrap_or_default()
+}
+
+// ---------- mesh: DHT, сессии, релей (этап 9) ----------
+
+/// Возможности mesh для `MESH_INFO`/HELLO: `0` — mesh выключен.
+fn my_mesh_caps(env: &Env) -> u8 {
+    let cfg = env.cfg.lock().unwrap();
+    if !cfg.mesh.enabled {
+        return 0;
+    }
+    let mut c = proto::mesh::caps::MESH;
+    if cfg.mesh.relay_enabled {
+        c |= proto::mesh::caps::RELAY | proto::mesh::caps::ACCEPT_RELAY;
+    }
+    c
+}
+
+/// Релей чужого трафика разрешён (`mesh.relay_enabled`, по умолчанию да).
+fn relay_enabled(env: &Env) -> bool {
+    env.cfg.lock().unwrap().mesh.relay_enabled
+}
+
+/// Бюджет релея на пира за окно [`mesh::RELAY_WINDOW_MS`]: кбит/с → байт.
+fn relay_budget(env: &Env) -> u64 {
+    let kbps = u64::from(env.cfg.lock().unwrap().mesh.relay_budget_kbps);
+    kbps
+        .saturating_mul(125)
+        .saturating_mul(mesh::RELAY_WINDOW_MS / 1000)
+}
+
+/// Дополнить DHT контактами из состава группы: адрес (`MemberInfo.endpoint`)
+/// + x-ключ (mesh-секция). Участники без mesh-метаданных пропускаются.
+fn sync_group_contacts(env: &Env, gs: &GroupSess) {
+    let now = epoch_ms();
+    let mut d = env.dht.lock().unwrap();
+    for p in gs.members.values() {
+        if let (Some(x), Some(addr)) = (p.mesh_x, p.endpoint) {
+            let caps = p.mesh_caps | proto::mesh::caps::MESH;
+            d.add_group_peer(p.pubkey, x, addr, caps, now);
+        }
+    }
+}
+
+/// Мини-снимок группы для проверки открытого заголовка inner: реле не
+/// расшифровывает кадр, но обязано убедиться, что gid/src/dst/epoch — свои.
+struct GroupMini {
+    gid: u32,
+    epoch: u32,
+    ips: Vec<u32>,
+}
+
+impl GroupMini {
+    /// Кадр принадлежит этой группе: gid совпал, отправитель и получатель —
+    /// участники, эпоха текущая или прошлая (grace после ротации).
+    fn accepts(&self, gid: u32, src: u32, dst: u32, epoch: u32) -> bool {
+        self.gid == gid
+            && self.ips.contains(&src)
+            && self.ips.contains(&dst)
+            && (epoch == self.epoch || epoch + 1 == self.epoch)
+    }
+}
+
+/// Снимок мира для mesh-модуля. Блокировки берутся и отпускаются до вызова
+/// mesh (порядок «группы → DHT → mesh» соблюдается везде).
+struct MeshWorld {
+    contacts: Vec<dht::Contact>,
+    members: Vec<[u8; 32]>,
+    groups: Vec<GroupMini>,
+    my_addr: Option<SocketAddr>,
+}
+
+fn mesh_world(env: &Env) -> MeshWorld {
+    let mut members: Vec<[u8; 32]> = Vec::new();
+    let mut groups: Vec<GroupMini> = Vec::new();
+    let mut group_contacts: Vec<dht::Contact> = Vec::new();
+    {
+        let g = env.groups.lock().unwrap();
+        for (gid, gs) in g.iter() {
+            groups.push(GroupMini {
+                gid: *gid,
+                epoch: gs.epoch,
+                ips: gs.members.keys().copied().collect(),
+            });
+            for p in gs.members.values() {
+                members.push(p.pubkey);
+                if let (Some(x), Some(addr)) = (p.mesh_x, p.endpoint) {
+                    group_contacts.push(dht::Contact {
+                        ed: p.pubkey,
+                        x,
+                        addr,
+                        rtt_ms: 0,
+                        last_seen_ms: epoch_ms(),
+                        caps: p.mesh_caps | proto::mesh::caps::MESH,
+                    });
+                }
+                // Готовность релеить: участник без RELAY всё равно может быть
+                // целью L2 (его слушает наш релей), но кандидатом — нет.
+                let _ = p.can_relay();
+            }
+        }
+    }
+    let mut contacts = env.dht.lock().unwrap().contacts();
+    for c in group_contacts {
+        if !contacts.iter().any(|x| x.ed == c.ed) {
+            contacts.push(c);
+        }
+    }
+    MeshWorld {
+        contacts,
+        members,
+        groups,
+        my_addr: env.sock.local_addr().ok(),
+    }
+}
+
+/// Обработка входящего mesh-кадра: собрать снимок, прогнать через модуль,
+/// исполнить результат (отправки, DHT, ACK/NACK, события).
+fn handle_mesh_frame(env: &Env, src: SocketAddr, typ: u8, body: &[u8]) {
+    let w = mesh_world(env);
+    let check = GroupCheck {
+        groups: &w.groups,
+    };
+    let ctx = mesh::MeshCtx {
+        me: &env.identity,
+        my_caps: my_mesh_caps(env),
+        now_ms: epoch_ms(),
+        my_addr: w.my_addr,
+        contacts: &w.contacts,
+        members: &w.members,
+        relay_enabled: relay_enabled(env),
+        relay_budget: relay_budget(env),
+        check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+    };
+    let out = {
+        let mut st = env.mesh.lock().unwrap();
+        st.on_frame(&ctx, src, typ, body)
+    };
+    apply_mesh_out(env, out);
+}
+
+/// Проверка открытого заголовка inner (реле не расшифровывает кадр).
+struct GroupCheck<'a> {
+    groups: &'a [GroupMini],
+}
+
+impl GroupCheck<'_> {
+    fn accepts(&self, gid: u32, src: u32, dst: u32, epoch: u32) -> bool {
+        self.groups.iter().any(|g| g.accepts(gid, src, dst, epoch))
+    }
+}
+
+/// Исполнить [`mesh::MeshOut`]: отправки, контакты в DHT, доставка кадров
+/// (с ACK/NACK), события путей/UI.
+fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
+    for (to, frame) in &out.sends {
+        env.send(frame, *to);
+    }
+    if !out.learned.is_empty() {
+        let now = epoch_ms();
+        let mut d = env.dht.lock().unwrap();
+        for c in &out.learned {
+            if mesh::sane_contact(c) && c.ed != env.identity.ed_pub() {
+                let mut c = c.clone();
+                c.last_seen_ms = now;
+                d.insert(c);
+            }
+        }
+    }
+    if !out.finds.is_empty() {
+        // Разбор ответов и следующий раунд — в потоке движка (там состояние
+        // поисков): сюда только складываем.
+        env.mesh_finds
+            .lock()
+            .unwrap()
+            .extend(out.finds.iter().cloned());
+    }
+    let now_ms = epoch_ms();
+    for r in out.deliver {
+        let (ok, why) = match handle_group_frame(env, env.server(), &r.inner, true) {
+            FrameVerdict::Accepted => (true, proto::mesh::code::REJECTED),
+            FrameVerdict::NeedGroup(_) => (false, proto::mesh::code::DROP),
+            FrameVerdict::Drop => (false, proto::mesh::code::DROP),
+        };
+        let reply = {
+            let mut st = env.mesh.lock().unwrap();
+            st.delivery_result(now_ms, &r, ok, why)
+        };
+        if let Some((to, frame)) = reply {
+            env.send(&frame, to);
+        }
+    }
+    for e in out.events {
+        match e {
+            mesh::MeshEvent::Up { ed, addr, rtt_ms } => {
+                if debug() {
+                    eprintln!("[mesh] сессия с {} ({addr}): {rtt_ms:?} мс", proto::hex_of(&ed));
+                }
+            }
+            mesh::MeshEvent::Down { ed, reason } => {
+                if debug() {
+                    eprintln!("[mesh] сессия {} закрыта: {reason}", proto::hex_of(&ed));
+                }
+            }
+            mesh::MeshEvent::Rtt { .. } => {}
+            mesh::MeshEvent::RouteMeasured {
+                dst_ed,
+                via,
+                up_ms,
+                down_ms,
+                load,
+            } => {
+                if let Some(ip) = ip_of_ed(env, &dst_ed) {
+                    env.paths
+                        .record_peer_rtt(ip, via, up_ms, down_ms, load, uptime_ms(env));
+                }
+            }
+            mesh::MeshEvent::RouteFailed { .. } => {}
+            mesh::MeshEvent::ForwardFailed { dst_ed, code } => {
+                if let Some(ip) = ip_of_ed(env, &dst_ed) {
+                    env.paths.record_failure(ip);
+                    env.emit(Event::PathLost {
+                        ip,
+                        name: peer_name(env, ip),
+                    });
+                    let connected = env.meta.lock().unwrap().connected;
+                    for change in env.paths.recalc_one(ip, uptime_ms(env), connected) {
+                        emit_path_change(env, change);
+                    }
+                }
+                if debug() {
+                    eprintln!(
+                        "[mesh] релей не доставил кадр {}: код {code}",
+                        proto::hex_of(&dst_ed)
+                    );
+                }
+            }
+            mesh::MeshEvent::ForwardOk { .. } => {}
+        }
+    }
+    sync_mesh_stats(env);
+}
+
+/// Байты релея и число сессий — в снимок состояния (§3.4).
+fn sync_mesh_stats(env: &Env) {
+    let st = env.mesh.lock().unwrap().stats();
+    let mut m = env.meta.lock().unwrap();
+    m.relay_bytes = st.relay_bytes;
+    m.mesh_sessions = st.sessions;
+}
+
+/// Адрес оверлея участника по ed-ключу.
+fn ip_of_ed(env: &Env, ed: &[u8; 32]) -> Option<u32> {
+    let g = env.groups.lock().unwrap();
+    g.values()
+        .flat_map(|gs| gs.members.values())
+        .find(|p| p.pubkey == *ed)
+        .map(|p| p.ip)
+}
+
+/// Событие смены пути — из [`path::PathChange`].
+fn emit_path_change(env: &Env, change: path::PathChange) {
+    match change {
+        path::PathChange::Changed {
+            ip,
+            from,
+            to,
+            rtt_ms,
+        } => {
+            if debug() {
+                eprintln!("[engine] путь {ip}: {from:?} -> {to:?} ({rtt_ms:?} мс)");
+            }
+            env.emit(Event::PathChanged {
+                ip,
+                name: peer_name(env, ip),
+                path: to,
+                rtt_ms,
+            });
+        }
+        path::PathChange::Lost { ip, from } => {
+            if debug() {
+                eprintln!("[engine] путь {ip} потерян (был {from:?})");
+            }
+            env.emit(Event::PathLost {
+                ip,
+                name: peer_name(env, ip),
+            });
+        }
+    }
+}
+
+/// Отправить групповой кадр через реле (L2): до 3 кандидатов по стоимости
+/// (`PathTable::choose` дал лучшего, следующий — по DHT).
+/// `true` — кадр ушёл релею.
+fn try_relay(env: &Env, dst: u32, dst_ed: [u8; 32], inner: &[u8]) -> bool {
+    let w = mesh_world(env);
+    let mut cands: Vec<dht::Contact> = Vec::new();
+    if let Some(via) = env.paths.current(dst).and_then(|k| match k {
+        PathKind::PeerRelay { via } => Some(via),
+        _ => None,
+    }) {
+        if let Some(c) = w.contacts.iter().find(|c| c.ed == via) {
+            cands.push(c.clone());
+        }
+    }
+    for c in mesh::relay_candidates(&env.dht.lock().unwrap(), &dst_ed, RELAY_TRIES) {
+        if !cands.iter().any(|x| x.ed == c.ed) && c.ed != dst_ed {
+            cands.push(c);
+        }
+    }
+    let check = GroupCheck {
+        groups: &w.groups,
+    };
+    let ctx = mesh::MeshCtx {
+        me: &env.identity,
+        my_caps: my_mesh_caps(env),
+        now_ms: epoch_ms(),
+        my_addr: w.my_addr,
+        contacts: &w.contacts,
+        members: &w.members,
+        relay_enabled: relay_enabled(env),
+        relay_budget: relay_budget(env),
+        check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+    };
+    for c in cands.iter().take(RELAY_TRIES) {
+        let mut st = env.mesh.lock().unwrap();
+        match st.start_forward(&ctx, dst_ed, c, inner) {
+            Ok((to, frame)) => {
+                drop(st);
+                env.send(&frame, to);
+                return true;
+            }
+            Err(code) => {
+                if debug() {
+                    eprintln!(
+                        "[mesh] реле {} недоступно: код {code}",
+                        proto::hex_of(&c.ed)
+                    );
+                }
+            }
+        }
+    }
+    false
 }
 
 fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
@@ -3205,6 +3888,9 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             env.update_cfg(|c| c.mesh.enabled = on);
             env.mesh.lock().unwrap().set_enabled(on);
             env.meta.lock().unwrap().mesh_enabled = on;
+            // Включили — сразу публикуемся (сервер добавит нас в MESH_SEED
+            // и mesh-хвост GROUP_STATE); выключили — сервер забудет по TTL.
+            st.info_due = true;
             env.emit(Event::Notice(if on {
                 "mesh включён".into()
             } else {
@@ -3505,10 +4191,13 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
             }
         }
         ctrl::MESH_SEED => {
-            // Семя DHT от сервера (§3.3): ближайшие онлайн-сессии. T3 наполнит
-            // таблицу и начнёт mesh-рукопожатия; T1 только принимает контакты.
+            // Семя DHT от сервера (§3.3): ближайшие к нам онлайн-сессии.
+            // Свой/нулевой ключ отфильтровывает сам bootstrap; дальше
+            // рукопожатия начнёт mesh-таймер.
             if let Ok(seeds) = payloads::dec_mesh_seed(payload) {
-                env.dht.lock().unwrap().bootstrap(&seeds);
+                let me = env.identity.ed_pub();
+                let seeds = mesh::note_seeds(&seeds, &me);
+                env.dht.lock().unwrap().bootstrap(&seeds, epoch_ms());
             }
         }
         _ => {}
@@ -3622,6 +4311,10 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
                 entry.upsert_member(st.gid, m, now, &mut events);
             }
         }
+        // Хвост mesh-метаданных — после участников: сопоставление по ip.
+        entry.apply_mesh_section(&st.mesh);
+        // DHT: адреса и x-ключи участников — кандидаты в контакты (§3.3).
+        sync_group_contacts(env, entry);
         is_new
     };
     es.tombs.remove(&st.gid);
@@ -3694,6 +4387,9 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
             payloads::GroupDelta::Member(m) => {
                 if m.pubkey != my_pub {
                     gs.upsert_member(u.gid, m, now, &mut events);
+                    // Хвост дельты (§4.2): mesh-контакт изменившегося участника.
+                    gs.apply_mesh_tail_for(&m.pubkey, &u.mesh);
+                    sync_group_contacts(env, gs);
                 }
             }
             payloads::GroupDelta::Removed(pk) => {
@@ -3720,56 +4416,88 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
 
 // ---------- групповые фреймы ----------
 
-/// Приём фрейма группы (раздел 7, правила 1–6). `Some(gid)` — эпоха новее
-/// известной: нужен GET_GROUP (сигнал не чаще раза в секунду на группу).
-fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32> {
+/// Итог разбора группового кадра: доставлен, нужен GET_GROUP или отброшен.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameVerdict {
+    /// Расшифрован и обработан (инъекция в TUN, ответ на PING и т.п.).
+    Accepted,
+    /// Эпоха новее известной: нужен GET_GROUP (сигнал не чаще раза в секунду).
+    NeedGroup(u32),
+    /// Отброшен: не своя группа, не нам, не тот отправитель, повтор, мусор.
+    Drop,
+}
+
+/// Приём фрейма группы (раздел 7, правила 1–6). `relayed` — кадр пришёл
+/// через пира-релея (`MESH_FORWARD`): прямой адрес при этом не записывается,
+/// PING/PUNCH не отвечаются (L2 — только данные).
+fn handle_group_frame(
+    env: &Env,
+    src: SocketAddr,
+    datagram: &[u8],
+    relayed: bool,
+) -> FrameVerdict {
     env.stats.rx_pkts.fetch_add(1, Ordering::Relaxed);
     env.stats
         .rx_bytes
         .fetch_add(datagram.len() as u64, Ordering::Relaxed);
-    let (_, h) = proto::parse_group_header(datagram).ok()?;
+    let Ok((_, h)) = proto::parse_group_header(datagram) else {
+        return FrameVerdict::Drop;
+    };
     let now = Instant::now();
-    let is_relay = src == env.server();
+    let is_relay = relayed || src == env.server();
     // 1. Группа известна, эпоха — текущая или прошлая в пределах grace.
     let key = {
         let mut g = env.groups.lock().unwrap();
-        let gs = g.get_mut(&h.gid)?;
+        let Some(gs) = g.get_mut(&h.gid) else {
+            return FrameVerdict::Drop;
+        };
         match gs.rx_key(h.epoch, now) {
             Some(k) => k,
             None => {
                 // Сигнал «эпоха новее» — только от правдоподобно подлинных.
-                if gs.epoch_hint(&h, src, is_relay, now) {
-                    return Some(h.gid);
-                }
-                return None;
+                return if gs.epoch_hint(&h, src, is_relay, now) {
+                    FrameVerdict::NeedGroup(h.gid)
+                } else {
+                    FrameVerdict::Drop
+                };
             }
         }
     };
     // 2. Расшифровка (подлинность заголовка — он в AAD).
-    let (typ, h, ctr, payload) = proto::open_group(&key, datagram).ok()?;
+    let Ok((typ, h, ctr, payload)) = proto::open_group(&key, datagram) else {
+        return FrameVerdict::Drop;
+    };
     // 6. DATA: внутренний источник (IPv4 или IPv6 оверлея) — сам отправитель.
     if typ == proto::grp::DATA && crate::ipv6::source_member(&payload) != Some(h.src) {
-        return None;
+        return FrameVerdict::Drop;
     }
     let mut became_direct: Option<String> = None;
     let reply = {
         let mut g = env.groups.lock().unwrap();
-        let gs = g.get_mut(&h.gid)?;
+        let Some(gs) = g.get_mut(&h.gid) else {
+            return FrameVerdict::Drop;
+        };
         // 2. Адресован нам; 3. отправитель — текущий участник, не мы.
         if h.dst != gs.my_ip || h.src == gs.my_ip {
-            return None;
+            return FrameVerdict::Drop;
         }
-        let peer = gs.members.get(&h.src)?;
-        // 5. Через релей или с адреса пира, известного от сервера.
+        let Some(peer) = gs.members.get(&h.src) else {
+            return FrameVerdict::Drop;
+        };
+        // 5. Через релей или с адреса пира, известного от сервера. Через релея
+        // (L2) адрес отправителя произволен — подлинность уже дал ключ группы.
         if !is_relay && !peer.knows(src) {
-            return None;
+            return FrameVerdict::Drop;
         }
         // 4. Окно повторов (того ключа, которым открыт фрейм) — последним:
         //    отвергнутый фрейм счётчик не тратит.
-        if !gs.rx_window(&key, h.src)?.commit(ctr) {
-            return None;
+        let Some(win) = gs.rx_window(&key, h.src) else {
+            return FrameVerdict::Drop;
+        };
+        if !win.commit(ctr) {
+            return FrameVerdict::Drop;
         }
-        let peer = gs.members.get_mut(&h.src)?;
+        let peer = gs.members.get_mut(&h.src).expect("участник проверен");
         peer.last_rx = now;
         if !is_relay {
             match peer.direct_addr {
@@ -3788,15 +4516,21 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32
         {
             peer.rtt_ms = Some(epoch_ms().saturating_sub(sent_ms));
         }
-        match typ {
-            proto::grp::PING => Some((proto::grp::PONG, gs.next_frame(h.gid, h.src))),
-            // Ответ — KEEPALIVE, не PUNCH: на KEEPALIVE не отвечают, пинг-понга
-            // PUNCH↔PUNCH нет. Через релей не отвечаем: PUNCH нужен только для
-            // прямого канала.
-            proto::grp::PUNCH if !is_relay => {
-                Some((proto::grp::KEEPALIVE, gs.next_frame(h.gid, h.src)))
+        // Через релея heartbeat не отвечаем: ответ ушёл бы не туда (dst —
+        // исходный отправитель), а прямой канал его и так покрывает.
+        if relayed {
+            None
+        } else {
+            match typ {
+                proto::grp::PING => Some((proto::grp::PONG, gs.next_frame(h.gid, h.src))),
+                // Ответ — KEEPALIVE, не PUNCH: на KEEPALIVE не отвечают, пинг-понга
+                // PUNCH↔PUNCH нет. Через релей не отвечаем: PUNCH нужен только для
+                // прямого канала.
+                proto::grp::PUNCH if !is_relay => {
+                    Some((proto::grp::KEEPALIVE, gs.next_frame(h.gid, h.src)))
+                }
+                _ => None,
             }
-            _ => None,
         }
     };
     if let Some(name) = became_direct {
@@ -3822,7 +4556,7 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32
         }
         _ => {}
     }
-    None
+    FrameVerdict::Accepted
 }
 
 /// Через какую группу слать пакет участнику `dst` (протокол v4: адрес один
@@ -3839,8 +4573,10 @@ fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
         .map(|(gid, _)| gid)
 }
 
-/// IP-пакет из адаптера → пиру. Напрямую — только если прямой канал жив;
-/// иначе через релей сервера.
+/// IP-пакет из адаптера → пиру. Путь выбирает [`PathTable::choose`] по
+/// измеренной стоимости (§3.6): прямой → релей сервера → релей через пира.
+/// Отказ выбранного пути (`record_failure` + `PathLost`) — следующий кандидат:
+/// реле пробуются по очереди (до [`RELAY_TRIES`]), затем сервер.
 fn route_packet(env: &Env, bytes: &[u8]) {
     if bytes.len() > proto::MAX_GROUP_PAYLOAD {
         return;
@@ -3854,22 +4590,58 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    let (key, h, ctr, target) = {
+    let (key, h, ctr, direct, dst_ed) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
         };
         let gs = g.get_mut(&gid).expect("pick_group вернул свою группу");
-        let target = gs
-            .members
-            .get(&dst)
-            .and_then(|p| p.direct_addr)
-            .unwrap_or_else(|| env.server());
+        let Some(peer) = gs.members.get(&dst) else {
+            return;
+        };
+        let (direct, dst_ed) = (peer.direct_addr, peer.pubkey);
         let (k, h, c) = gs.next_frame(gid, dst);
-        (k, h, c, target)
+        (k, h, c, direct, dst_ed)
     };
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
-    env.send(&frame, target);
+    let connected = env.meta.lock().unwrap().connected;
+    let now_ms = uptime_ms(env);
+    let (chosen, changes) = env.paths.choose(dst, now_ms, connected);
+    for ch in changes {
+        emit_path_change(env, ch);
+    }
+    match chosen {
+        Some(PathKind::Direct) => match direct {
+            Some(a) => env.send(&frame, a),
+            // Адрес прямого канала пропал между пересчётом и отправкой:
+            // путь сломан, кадр не теряем — сервер доставит.
+            None => {
+                env.paths.record_failure(dst);
+                env.emit(Event::PathLost {
+                    ip: dst,
+                    name: peer_name(env, dst),
+                });
+                env.send(&frame, env.server());
+            }
+        },
+        Some(PathKind::PeerRelay { .. }) => {
+            if !try_relay(env, dst, dst_ed, &frame) {
+                // Реле не приняло (нет сессии/лимит/неизвестная цель):
+                // путь сломан, следующий кандидат — сервер (следующий тик
+                // пересчитает и, возможно, выберет другое реле).
+                env.paths.record_failure(dst);
+                env.emit(Event::PathLost {
+                    ip: dst,
+                    name: peer_name(env, dst),
+                });
+                env.send(&frame, env.server());
+            }
+        }
+        // Пути нет (нет связи и измерений) — пробуем сервер: если он мёртв,
+        // route_packet всё равно не теряет пакет (отправка в мёртвый адрес
+        // ничего не даёт, но и вреда нет).
+        Some(PathKind::Server) | None => env.send(&frame, env.server()),
+    }
 }
 
 /// Ответ встроенного DNS на запрос из адаптера: имена — нормализованные
@@ -4589,6 +5361,8 @@ mod tests {
             last_rx: t0,
             last_direct: None,
             rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
         };
         let mut groups: HashMap<u32, GroupSess> = HashMap::new();
         for gid in [3, 5, 9] {
@@ -4637,6 +5411,8 @@ mod tests {
                 last_rx: t0,
                 last_direct: None,
                 rtt_ms: None,
+                mesh_x: None,
+                mesh_caps: 0,
             },
         );
         let h = |src, epoch| proto::GroupHeader {
@@ -4867,6 +5643,7 @@ mod tests {
             server_rtt_ms: None,
             mesh_enabled: true,
             relay_bytes: 0,
+            mesh_sessions: 0,
         }));
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let paths = Arc::new(PathTable::new(&std::collections::BTreeMap::new()));
@@ -4885,7 +5662,8 @@ mod tests {
             quit: AtomicBool::new(false),
             key_log: KeyLog::default(),
             mesh: Arc::new(Mutex::new(mesh::MeshState::new(true))),
-            dht: Arc::new(Mutex::new(dht::Dht::new())),
+            dht: Arc::new(Mutex::new(dht::Dht::new([1u8; 32]))),
+            mesh_finds: Arc::new(Mutex::new(Vec::new())),
             paths: paths.clone(),
             probes: Arc::new(probe::ProbeState::new()),
         });
@@ -5004,6 +5782,8 @@ mod tests {
                 last_rx: Instant::now(),
                 last_direct: Some(Instant::now()),
                 rtt_ms: Some(20),
+                mesh_x: None,
+                mesh_caps: 0,
             },
         );
         env.groups.lock().unwrap().insert(1, g);

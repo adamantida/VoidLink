@@ -24,7 +24,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::handshake::EphemeralKey;
 use crate::{
-    Identity, MAX_GROUP_PAYLOAD, Reader, SymKey, derive_key, put_pub, put_u16, split_frame,
+    Identity, MAX_GROUP_PAYLOAD, Reader, SymKey, derive_key, put_pub, put_u16, put_u32, put_u64,
+    split_frame,
 };
 
 // ---------- типы кадров ----------
@@ -438,6 +439,290 @@ pub fn session_secret(my_secret: [u8; 32], peer_eph: &[u8; 32]) -> Result<[u8; 3
     Ok(shared.to_bytes())
 }
 
+// ---------- RPC внутри mesh-сессии ----------
+
+/// Коды отказов `MESH_FORWARD_NACK` / `MESH_ROUTE_FAIL` / `MESH_FORWARD`
+/// (общие для всех mesh-ответов «почему нет»).
+pub mod code {
+    /// Отказ без уточнения.
+    pub const REJECTED: u8 = 1;
+    /// Нет маршрута/сессии до цели.
+    pub const NO_ROUTE: u8 = 2;
+    /// Исчерпан лимит полосы релея (окно 10 с).
+    pub const BUDGET: u8 = 3;
+    /// Петля/превышен TTL хопов/цель в `visited`.
+    pub const LOOP: u8 = 4;
+    /// Кадр не разобрался (размер/формат/не TNL2).
+    pub const BAD: u8 = 5;
+    /// Внутренний групповой кадр отвергнут получателем (ключ/эпоха/окно).
+    pub const DROP: u8 = 6;
+}
+
+/// Максимум записей `Node` в одном `MESH_NODES`/`MESH_CONTACT`.
+pub const MAX_RPC_NODES: usize = 16;
+/// Минимальная длина записи `Node`: ed(32) | x(32) | caps(1) | rtt(2) | len(2).
+pub const NODE_MIN: usize = 32 + 32 + 1 + 2 + 2;
+/// Тело `MESH_BYE` (пустое).
+pub const MESH_BYE_LEN: usize = 0;
+
+/// Контакт mesh-сети в RPC (DHT-ответы, обмен контактами). `rtt_ms`
+/// — последний известный RTT до контакта (0 — неизвестен).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    /// ed25519 — идентификатор узла DHT.
+    pub ed: [u8; 32],
+    /// x25519 — статический ключ контакта.
+    pub x: [u8; 32],
+    pub addr: std::net::SocketAddr,
+    /// Возможности контакта (`caps::*`).
+    pub caps: u8,
+    pub rtt_ms: u16,
+}
+
+fn put_node(v: &mut Vec<u8>, n: &Node) {
+    put_pub(v, &n.ed);
+    put_pub(v, &n.x);
+    v.push(n.caps);
+    put_u16(v, n.rtt_ms);
+    crate::put_str(v, &n.addr.to_string());
+}
+
+fn read_node(r: &mut Reader) -> Result<Node> {
+    let ed = r.pub_key()?;
+    let x = r.pub_key()?;
+    let caps = r.u8()?;
+    let rtt_ms = r.u16()?;
+    let addr = r.str()?.parse().map_err(|_| {
+        anyhow::anyhow!("mesh rpc: адрес контакта не разбирается")
+    })?;
+    Ok(Node {
+        ed,
+        x,
+        addr,
+        caps,
+        rtt_ms,
+    })
+}
+
+/// RPC внутри mesh-сессии (типы [`MESH_PING`]…[`MESH_BYE`]).
+///
+/// Тело кадра — `counter(8) | ChaCha20-Poly1305(payload, aad = заголовок)`
+/// (тот же формат, что ctrl, [`crate::seal_ctrl`]): тип кадра и есть
+/// идентификатор RPC, поэтому тела не пересекаются.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rpc {
+    /// Проверка живости: `id u64 | ts_ms u64`.
+    Ping { id: u64, ts_ms: u64 },
+    /// Ответ: `id u64 | ts_ms u64 | load u8 | caps u8`. `load` — доля
+    /// использованной полосы релея 0..=255.
+    Pong {
+        id: u64,
+        ts_ms: u64,
+        load: u8,
+        caps: u8,
+    },
+    /// Актуальный контакт цели: `target 32 | found u8 | [Node]`.
+    Contact {
+        target: [u8; 32],
+        node: Option<Node>,
+    },
+    /// Запрос контакта цели: `target 32`.
+    GetContact { target: [u8; 32] },
+    /// DHT-поиск: `id u64 | target 32`.
+    FindNode { id: u64, target: [u8; 32] },
+    /// Ответ DHT: `id u64 | n u8 (≤ 16) | n × Node`.
+    Nodes { id: u64, nodes: Vec<Node> },
+    /// Поиск пути: `id u64 | target 32`.
+    Route { id: u64, target: [u8; 32] },
+    /// Путь найден: `id u64 | target 32 | up_ms u32 | down_ms u32 | load u8`.
+    RouteOk {
+        id: u64,
+        target: [u8; 32],
+        up_ms: u32,
+        down_ms: u32,
+        load: u8,
+    },
+    /// Пути нет: `id u64 | target 32 | code u8`.
+    RouteFail {
+        id: u64,
+        target: [u8; 32],
+        code: u8,
+    },
+    /// Релей принял кадр: `seq u64`.
+    ForwardAck { seq: u64 },
+    /// Релей отказал: `seq u64 | code u8`.
+    ForwardNack { seq: u64, code: u8 },
+    /// Вежливое закрытие: пустое тело.
+    Bye,
+}
+
+impl Rpc {
+    /// Тип кадра этого RPC.
+    pub fn typ(&self) -> u8 {
+        match self {
+            Rpc::Ping { .. } => MESH_PING,
+            Rpc::Pong { .. } => MESH_PONG,
+            Rpc::GetContact { .. } => MESH_GET_CONTACT,
+            Rpc::Contact { .. } => MESH_CONTACT,
+            Rpc::FindNode { .. } => MESH_FIND_NODE,
+            Rpc::Nodes { .. } => MESH_NODES,
+            Rpc::Route { .. } => MESH_ROUTE,
+            Rpc::RouteOk { .. } => MESH_ROUTE_OK,
+            Rpc::RouteFail { .. } => MESH_ROUTE_FAIL,
+            Rpc::ForwardAck { .. } => MESH_FORWARD_ACK,
+            Rpc::ForwardNack { .. } => MESH_FORWARD_NACK,
+            Rpc::Bye => MESH_BYE,
+        }
+    }
+
+    /// Тело кадра. Список контактов длиннее [`MAX_RPC_NODES`] обрезается
+    /// (как в остальных кодеках: размер ответа не растёт из-за вызывающего).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(80);
+        match self {
+            Rpc::Ping { id, ts_ms } => {
+                put_u64(&mut v, *id);
+                put_u64(&mut v, *ts_ms);
+            }
+            Rpc::Pong {
+                id,
+                ts_ms,
+                load,
+                caps,
+            } => {
+                put_u64(&mut v, *id);
+                put_u64(&mut v, *ts_ms);
+                v.push(*load);
+                v.push(*caps);
+            }
+            Rpc::GetContact { target } => put_pub(&mut v, target),
+            Rpc::Contact { target, node } => {
+                put_pub(&mut v, target);
+                match node {
+                    Some(n) => {
+                        v.push(1);
+                        put_node(&mut v, n);
+                    }
+                    None => v.push(0),
+                }
+            }
+            Rpc::FindNode { id, target } => {
+                put_u64(&mut v, *id);
+                put_pub(&mut v, target);
+            }
+            Rpc::Nodes { id, nodes } => {
+                put_u64(&mut v, *id);
+                let n = nodes.len().min(MAX_RPC_NODES);
+                v.push(n as u8);
+                for node in &nodes[..n] {
+                    put_node(&mut v, node);
+                }
+            }
+            Rpc::Route { id, target } => {
+                put_u64(&mut v, *id);
+                put_pub(&mut v, target);
+            }
+            Rpc::RouteOk {
+                id,
+                target,
+                up_ms,
+                down_ms,
+                load,
+            } => {
+                put_u64(&mut v, *id);
+                put_pub(&mut v, target);
+                put_u32(&mut v, *up_ms);
+                put_u32(&mut v, *down_ms);
+                v.push(*load);
+            }
+            Rpc::RouteFail { id, target, code } => {
+                put_u64(&mut v, *id);
+                put_pub(&mut v, target);
+                v.push(*code);
+            }
+            Rpc::ForwardAck { seq } => put_u64(&mut v, *seq),
+            Rpc::ForwardNack { seq, code } => {
+                put_u64(&mut v, *seq);
+                v.push(*code);
+            }
+            Rpc::Bye => {}
+        }
+        v
+    }
+
+    /// Готовый кадр открытым текстом (тело потом шифруется сессией; для
+    /// тестов и локальной проверки).
+    pub fn to_frame(&self) -> Vec<u8> {
+        crate::plain_frame(self.typ(), &self.encode())
+    }
+
+    /// Разбор тела по типу кадра. Лишние байты — ошибка: формат фиксирован.
+    pub fn decode(typ: u8, body: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(body);
+        let rpc = match typ {
+            MESH_PING => Rpc::Ping {
+                id: r.u64()?,
+                ts_ms: r.u64()?,
+            },
+            MESH_PONG => Rpc::Pong {
+                id: r.u64()?,
+                ts_ms: r.u64()?,
+                load: r.u8()?,
+                caps: r.u8()?,
+            },
+            MESH_GET_CONTACT => Rpc::GetContact {
+                target: r.pub_key()?,
+            },
+            MESH_CONTACT => {
+                let target = r.pub_key()?;
+                let found = r.u8()?;
+                ensure!(found <= 1, "mesh rpc: флаг контакта {found}");
+                let node = (found == 1).then(|| read_node(&mut r)).transpose()?;
+                Rpc::Contact { target, node }
+            }
+            MESH_FIND_NODE => Rpc::FindNode {
+                id: r.u64()?,
+                target: r.pub_key()?,
+            },
+            MESH_NODES => {
+                let id = r.u64()?;
+                let n = r.u8()? as usize;
+                ensure!(n <= MAX_RPC_NODES, "mesh rpc: контактов {n} > {MAX_RPC_NODES}");
+                let mut nodes = Vec::with_capacity(r.capacity_for(n, NODE_MIN));
+                for _ in 0..n {
+                    nodes.push(read_node(&mut r)?);
+                }
+                Rpc::Nodes { id, nodes }
+            }
+            MESH_ROUTE => Rpc::Route {
+                id: r.u64()?,
+                target: r.pub_key()?,
+            },
+            MESH_ROUTE_OK => Rpc::RouteOk {
+                id: r.u64()?,
+                target: r.pub_key()?,
+                up_ms: r.u32()?,
+                down_ms: r.u32()?,
+                load: r.u8()?,
+            },
+            MESH_ROUTE_FAIL => Rpc::RouteFail {
+                id: r.u64()?,
+                target: r.pub_key()?,
+                code: r.u8()?,
+            },
+            MESH_FORWARD_ACK => Rpc::ForwardAck { seq: r.u64()? },
+            MESH_FORWARD_NACK => Rpc::ForwardNack {
+                seq: r.u64()?,
+                code: r.u8()?,
+            },
+            MESH_BYE => Rpc::Bye,
+            _ => anyhow::bail!("mesh rpc: тип {typ:#04x} — не RPC"),
+        };
+        ensure!(r.remaining() == 0, "mesh rpc: хвост {} байт", r.remaining());
+        Ok(rpc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +938,102 @@ mod tests {
         y[5] = 0x55;
         assert_eq!(x25519_distance(&x, &y), x25519_distance(&y, &x));
         assert_eq!(x25519_distance(&x, &y)[5], 0xFF);
+    }
+
+    #[test]
+    fn rpc_туда_обратно_и_обрезки() {
+        let node = Node {
+            ed: [1; 32],
+            x: [2; 32],
+            addr: "203.0.113.7:4000".parse().unwrap(),
+            caps: caps::MESH | caps::RELAY,
+            rtt_ms: 42,
+        };
+        let all = vec![
+            Rpc::Ping {
+                id: 7,
+                ts_ms: 1_700_000_000_000,
+            },
+            Rpc::Pong {
+                id: 7,
+                ts_ms: 1_700_000_000_001,
+                load: 200,
+                caps: 3,
+            },
+            Rpc::GetContact { target: [3; 32] },
+            Rpc::Contact {
+                target: [3; 32],
+                node: Some(node.clone()),
+            },
+            Rpc::Contact {
+                target: [3; 32],
+                node: None,
+            },
+            Rpc::FindNode {
+                id: 9,
+                target: [4; 32],
+            },
+            Rpc::Nodes {
+                id: 9,
+                nodes: vec![node.clone(), Node { rtt_ms: 0, ..node.clone() }],
+            },
+            Rpc::Route {
+                id: 11,
+                target: [5; 32],
+            },
+            Rpc::RouteOk {
+                id: 11,
+                target: [5; 32],
+                up_ms: 12,
+                down_ms: 40,
+                load: 7,
+            },
+            Rpc::RouteFail {
+                id: 11,
+                target: [5; 32],
+                code: code::NO_ROUTE,
+            },
+            Rpc::ForwardAck { seq: 123 },
+            Rpc::ForwardNack {
+                seq: 123,
+                code: code::BUDGET,
+            },
+            Rpc::Bye,
+        ];
+        for rpc in all {
+            let body = rpc.encode();
+            assert_eq!(
+                Rpc::decode(rpc.typ(), &body).unwrap(),
+                rpc,
+                "{rpc:?}: туда-обратно"
+            );
+            // Любая обрезка — ошибка, не паника.
+            for n in 0..body.len() {
+                assert!(Rpc::decode(rpc.typ(), &body[..n]).is_err(), "{rpc:?} обрезка {n}");
+            }
+            // Хвост — ошибка: формат фиксирован.
+            let mut tail = body.clone();
+            tail.push(0);
+            assert!(Rpc::decode(rpc.typ(), &tail).is_err(), "{rpc:?} хвост");
+        }
+        // Список контактов сверх лимита обрезается на кодировании.
+        let many: Vec<Node> = (0..MAX_RPC_NODES + 5).map(|_| node.clone()).collect();
+        let body = Rpc::Nodes { id: 1, nodes: many }.encode();
+        match Rpc::decode(MESH_NODES, &body).unwrap() {
+            Rpc::Nodes { nodes, .. } => assert_eq!(nodes.len(), MAX_RPC_NODES),
+            other => panic!("не Nodes: {other:?}"),
+        }
+        // Заявленное число контактов больше лимита — ошибка без аллокации.
+        let mut bad = vec![0u8; 8];
+        bad.push(u8::MAX);
+        assert!(Rpc::decode(MESH_NODES, &bad).is_err());
+        // Флаг контакта — только 0/1.
+        let mut bad = vec![0u8; 32];
+        bad.push(2);
+        assert!(Rpc::decode(MESH_CONTACT, &bad).is_err());
+        // Не-RPC тип — ошибка.
+        assert!(Rpc::decode(MESH_FORWARD, &[]).is_err());
+        assert!(Rpc::decode(MESH_HELLO, &[]).is_err());
     }
 
     #[test]
