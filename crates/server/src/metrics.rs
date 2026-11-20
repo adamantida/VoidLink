@@ -67,6 +67,11 @@ pub struct Metrics {
     pub bytes_relayed: AtomicU64,
     /// Пробы доступности (`PROBE_REQ`, этап 9).
     pub probes_total: AtomicU64,
+    /// Закреплённые (TOFU) серверы-пиры федерации (этап 9, T4a).
+    pub fed_peers: AtomicU64,
+    /// Отклонённые подсказки/рукопожатия федерации: чужой ключ/адрес/срок
+    /// (этап 9, T4a).
+    pub fed_hint_rejected: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -114,7 +119,7 @@ impl Metrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 11] {
+    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 13] {
         use Kind::*;
         [
             (
@@ -177,6 +182,18 @@ impl Metrics {
                 "Пробы доступности (PROBE_REQ)",
                 Counter,
                 &self.probes_total,
+            ),
+            (
+                "voidlink_fed_peers",
+                "Закреплённые серверы-пиры федерации",
+                Gauge,
+                &self.fed_peers,
+            ),
+            (
+                "voidlink_fed_hint_rejected_total",
+                "Отклонённые подсказки/рукопожатия федерации",
+                Counter,
+                &self.fed_hint_rejected,
             ),
         ]
     }
@@ -430,8 +447,8 @@ mod tests {
             let (k, v) = line.split_once(' ').unwrap();
             values.insert(k.to_string(), v.parse::<u64>().unwrap());
         }
-        assert_eq!(types, 11);
-        assert_eq!(values.len(), 11);
+        assert_eq!(types, 13);
+        assert_eq!(values.len(), 13);
         assert_eq!(values["voidlink_sessions"], 3);
         assert_eq!(values["voidlink_relayed_frames_total"], 2);
         assert_eq!(values["voidlink_bytes_relayed_total"], 150);

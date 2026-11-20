@@ -184,6 +184,15 @@ pub struct Config {
     pub tcp: bool,
     /// Адрес HTTP-эндпоинта метрик (`--metrics`); `None` — выключен.
     pub metrics: Option<SocketAddr>,
+    /// Федерация серверов (этап 9, T4a): `--federate`. Без флага кадры
+    /// 0x40..=0x4F не разбираются вовсе.
+    pub federate: bool,
+    /// Явные пины `--peer <addr>` (повторяемый): ключ закрепляется TOFU по
+    /// первому ответу.
+    pub peers: Vec<SocketAddr>,
+    /// Задел T4b: пул адресов федерации (`--fed-pool`, повторяемый).
+    /// Разбирается, но пока не используется — репликация адресов в T4b.
+    pub fed_pool: Vec<SocketAddr>,
 }
 
 impl Default for Config {
@@ -196,6 +205,9 @@ impl Default for Config {
             limits: Limits::default(),
             tcp: true,
             metrics: None,
+            federate: false,
+            peers: Vec::new(),
+            fed_pool: Vec::new(),
         }
     }
 }
@@ -271,6 +283,12 @@ impl Server {
             alive: AtomicUsize::new(0),
             expected_threads: AtomicUsize::new(usize::MAX),
             last_tick: AtomicU64::new(0),
+            fed: Mutex::new(federation::Fed::new(
+                cfg.federate,
+                loaded.fed_pins,
+                &cfg.peers,
+                &cfg.fed_pool,
+            )),
         });
         if !cfg.quiet {
             if fresh {
@@ -382,6 +400,10 @@ impl Server {
             None => None,
         };
         let metrics_addr = metrics_srv.as_ref().map(|m| m.local_addr());
+        // Федерация: рукопожатие с закреплёнными пирами и `--peer`. После
+        // TCP-реестра — `send_to` уже знает про фолбэк (своего порта
+        // федерация не заводит).
+        federation::bootstrap(&shared);
         shared.log(format!("listening on {addr}, воркеров: {workers}"));
         if let Some(t) = tcp_addr {
             shared.log(format!("TCP-фолбэк на {t}"));
@@ -815,6 +837,12 @@ struct Shared {
     expected_threads: AtomicUsize,
     /// `now_ms` последнего прохода housekeeping.
     last_tick: AtomicU64,
+    /// Федерация серверов (этап 9, T4a): пиры, попытки, сессии. Отдельная
+    /// блокировка — федеративные рукопожатия не должны ждать/держать
+    /// состояние групп. Порядок блокировок: `state` → `fed` (в `on_hint`
+    /// подсказка обрабатывается под записью состояния); `fed` никогда не
+    /// удерживается при взятии `state`.
+    fed: Mutex<federation::Fed>,
 }
 
 /// Учёт живого потока: декремент при выходе, в том числе по панике.
@@ -839,10 +867,13 @@ fn healthy(sh: &Shared) -> bool {
 /// Датчики метрик — из авторитетного состояния.
 fn refresh_gauges(sh: &Shared) {
     let now = unix_ms();
+    // Таблица федерации — до `state`: `fed` не удерживается при `state`.
+    let fed_peers = federation::pin_count(sh) as u64;
     let s = sh.state.read().unwrap();
     let m = &sh.metrics;
     metrics::Metrics::set(&m.sessions, s.sessions.len() as u64);
     metrics::Metrics::set(&m.groups, s.groups.len() as u64);
+    metrics::Metrics::set(&m.fed_peers, fed_peers);
     metrics::Metrics::set(
         &m.members,
         s.groups.values().map(|g| g.members.len() as u64).sum(),
@@ -1064,6 +1095,8 @@ struct Loaded {
     next_gid: u32,
     groups: HashMap<u32, Group>,
     leases: leases::Leases,
+    /// Закреплённые TOFU-пиры федерации (`federation.peers`).
+    fed_pins: Vec<federation::Pin>,
 }
 
 /// Адреса identity из `server.json`: сначала `user_ips` (v4), затем — для
@@ -1100,6 +1133,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             next_gid: GID_MIN,
             groups: HashMap::new(),
             leases: leases::Leases::default(),
+            fed_pins: Vec::new(),
         });
     };
     let links = p
@@ -1189,6 +1223,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         next_gid: p.next_gid.clamp(GID_MIN, GID_MAX),
         groups,
         leases,
+        fed_pins: federation::load_pins(&p.federation.peers),
     })
 }
 
@@ -1196,6 +1231,7 @@ fn snapshot(
     sh_identity: &proto::Identity,
     links: &[RotationLink],
     s: &State,
+    federation: persist::PFederation,
 ) -> persist::Persisted {
     persist::Persisted {
         ed_seed: sh_identity.ed_seed,
@@ -1203,6 +1239,7 @@ fn snapshot(
         next_gid: s.next_gid,
         rotations: links.iter().map(|l| hex(&l.to_bytes())).collect(),
         user_ips: s.leases.iter().map(|(k, ip)| (hex(k), ip)).collect(),
+        federation,
         groups: s
             .groups
             .values()
@@ -1267,7 +1304,10 @@ fn save_now(sh: &Shared) {
     if !sh.dirty.swap(false, Ordering::Relaxed) && sh.store.stamp() == *sh.written.lock().unwrap() {
         return;
     }
-    let mut snap = snapshot(&sh.identity, &sh.links, &sh.state.read().unwrap());
+    // Таблица пиров федерации — до взятия блокировки состояния: `fed` не
+    // удерживается при `state` (порядок блокировок, см. `Shared::fed`).
+    let fed = federation::persisted(sh);
+    let mut snap = snapshot(&sh.identity, &sh.links, &sh.state.read().unwrap(), fed);
     keep_rotated_key(sh, &mut snap);
     match sh.store.save(&snap) {
         Ok(()) => *sh.written.lock().unwrap() = sh.store.stamp(),
@@ -1344,6 +1384,8 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        // Федерация: переотправка SRV_HELLO, таймауты попыток и сессий.
+        federation::tick(&sh);
         refresh_gauges(&sh);
         if sh.list_dirty.swap(false, Ordering::Relaxed) {
             broadcast_group_list(&sh);
@@ -1517,7 +1559,9 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         // mesh-пиры получали бы RESET на каждый кадр (§4.3).
         sh.drop_frame();
     } else if proto::federation::is_fed(typ) {
-        // Федеративные кадры: T4; пока — молча отброшены.
+        // Федерация серверов (T4a): SRV_HELLO/ACK. Своего порта нет — только
+        // основной UDP-сокет (и TCP-фолбэк). Необработанный кадр (0x42..=0x4F
+        // — T4b) молча роняется, без RESET чужому серверу.
         if !federation::on_frame(sh, src, typ, body) {
             sh.drop_frame();
         }
@@ -5207,7 +5251,9 @@ mod tests {
         s.groups.insert(5, g);
         s.next_gid = 6;
         let id = proto::Identity::generate();
-        store.save(&snapshot(&id, &[], &s)).unwrap();
+        store
+            .save(&snapshot(&id, &[], &s, persist::PFederation::default()))
+            .unwrap();
 
         let l = load_state(&store).unwrap();
         let g = &l.groups[&5];
