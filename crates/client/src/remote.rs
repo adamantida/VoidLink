@@ -10,6 +10,10 @@
 //! (или они относятся к прошлому запуску демона) — отбрасываются; история при
 //! первом подключении отдаётся отдельно ([`EngineApi::take_history`]) — для
 //! лога без тостов.
+//!
+//! Демона нет — TUI всё равно работает: [`connect_offline`] поднимает
+//! [`crate::offline::ResilientEngine`] (движка нет, конфиг правится локально,
+//! очередь `ui-pending.json` уходит демону, когда тот появится).
 
 use std::collections::VecDeque;
 use std::io;
@@ -26,6 +30,7 @@ use tunnel_ipc::{AckResult, ClientError, ClientKind, Conn, DaemonMsg, IpcClient}
 use crate::api::{EngineApi, EngineMode, Me};
 use crate::engine::{Cmd, Event};
 use crate::snapshot::Snapshot;
+use crate::store::Config;
 
 /// Период переподключения к пропавшему демону.
 pub const RECONNECT_EVERY: Duration = Duration::from_secs(1);
@@ -194,17 +199,47 @@ pub struct IpcEngine {
     ui_dir: Option<PathBuf>,
 }
 
-/// Снимок из JSON демона. Демон без движка (служба до интеграции) шлёт
-/// `{"engine": null, …}` — это не снимок.
+/// Снимок из JSON демона. Демон без движка (служба не поднялась, TUN не
+/// создался, нет сервера) шлёт `{"engine": null, "error": …}` — это не ошибка,
+/// а офлайн-состояние: TUI открывается и правит конфиг сам.
 fn parse_snapshot(v: serde_json::Value) -> Result<Snapshot, String> {
     if v.get("engine").is_some() {
         let why = v
             .get("error")
             .and_then(|e| e.as_str())
+            .filter(|s| !s.trim().is_empty())
             .unwrap_or("движок не запущен");
-        return Err(format!("демон работает без движка: {why}"));
+        let mut s = Snapshot::default();
+        s.meta.connected = false;
+        s.meta.offline = true;
+        s.meta.offline_reason = Some(why.to_string());
+        return Ok(s);
     }
     serde_json::from_value(v).map_err(|e| format!("неверный снимок демона: {e}"))
+}
+
+/// Офлайн-режим TUI: демона (или движка в нём) нет. `cfg` — общий
+/// `Arc<Mutex<Config>>` с вызывающим: правки не теряются; `identity` — для
+/// friend code в шапке. Причина офлайна неизвестна (её уточнит фон).
+pub fn connect_offline(
+    dir: &Path,
+    cfg: Arc<Mutex<Config>>,
+    identity: tunnel_protocol::Identity,
+) -> Result<crate::offline::ResilientEngine> {
+    connect_offline_with_reason(dir, cfg, identity, None)
+}
+
+/// То же, но с готовой причиной офлайна (демон есть, движка в нём нет;
+/// демон не отвечает) — она сразу попадает в снимок и лог.
+pub fn connect_offline_with_reason(
+    dir: &Path,
+    cfg: Arc<Mutex<Config>>,
+    identity: tunnel_protocol::Identity,
+    reason: Option<String>,
+) -> Result<crate::offline::ResilientEngine> {
+    Ok(crate::offline::ResilientEngine::new(
+        dir, cfg, identity, reason,
+    ))
 }
 
 /// `Subscribe` и чтение до первого снимка: события до него — история кольца.
@@ -451,13 +486,15 @@ mod tests {
     }
 
     #[test]
-    fn снимок_без_движка_не_снимок() {
-        assert!(parse_snapshot(serde_json::json!({"engine": null})).is_err());
-        assert!(
-            parse_snapshot(serde_json::json!({"engine": null, "error": "нет TUN"}))
-                .unwrap_err()
-                .contains("нет TUN")
-        );
+    fn снимок_без_движка_это_офлайн_состояние() {
+        // Демон без движка — не ошибка: TUI открывается офлайном с причиной.
+        let s = parse_snapshot(serde_json::json!({"engine": null})).unwrap();
+        assert!(s.meta.offline);
+        assert!(!s.meta.connected);
+        assert_eq!(s.meta.offline_reason.as_deref(), Some("движок не запущен"));
+        let s = parse_snapshot(serde_json::json!({"engine": null, "error": "нет TUN"})).unwrap();
+        assert!(s.meta.offline);
+        assert_eq!(s.meta.offline_reason.as_deref(), Some("нет TUN"));
         let s = serde_json::to_value(Snapshot::default()).unwrap();
         assert_eq!(parse_snapshot(s).unwrap(), Snapshot::default());
     }

@@ -223,12 +223,11 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         return;
     }
 
-    let (pill_text, pill_style) = if app.daemon_down {
-        (" ○ демон недоступен ", th.pill(th.c.danger))
-    } else if app.connected {
-        (" ● подключено ", th.pill(th.c.success))
-    } else {
-        (" ○ реконнект ", th.pill(th.c.danger))
+    let (pill_text, pill_style) = match app.conn {
+        ConnState::Online => (" ● в сети ", th.pill(th.c.success)),
+        ConnState::Reconnecting => (" ○ сервер недоступен ", th.pill(th.c.danger)),
+        ConnState::DaemonDown => (" ⚠ демон недоступен ", th.pill(th.c.danger)),
+        ConnState::NoServer => (" ○ нет сервера ", th.pill(th.c.warn)),
     };
     let pill_w = Span::raw(pill_text).width() as u16;
     let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(pill_w + 1)]).split(body);
@@ -871,15 +870,12 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     // транспорт, прямые/релейные пиры.
     let state = BadgeState {
         pending_invites: app.pending_invites(),
-        conn: if app.connected {
-            ConnState::Online
-        } else {
-            ConnState::Reconnecting
-        },
+        conn: app.conn,
         invisible: app.invisible,
         transport: app.transport,
         direct,
         relay,
+        pending_edits: app.pending_edits,
     };
     let badges_area = Rect {
         x: rest.x + left_w + 1,
@@ -1678,6 +1674,7 @@ mod tests {
         app.my_name = "alpha".into();
         app.my_status = "в сети".into();
         app.connected = true;
+        app.conn = ConnState::Online;
         app.server_addr = "127.0.0.1:5599".into();
         app.groups = vec![
             GroupView {
@@ -1754,7 +1751,7 @@ mod tests {
         assert!(text.contains("direct"), "нет метки direct");
         assert!(text.contains("7 мс"), "нет RTT");
         assert!(text.contains("100.66.1.2"), "нет своего IP");
-        assert!(text.contains("подключено"), "нет статуса соединения");
+        assert!(text.contains("● в сети"), "нет статуса соединения");
     }
 
     #[test]
@@ -2583,7 +2580,7 @@ mod tests {
         });
         let s = frame(&app, 200, 40);
         let last: String = s[39].iter().collect();
-        assert!(last.contains("В сети"), "{last}");
+        assert!(last.contains("● в сети"), "{last}");
         assert!(last.contains("✦ 1"), "{last}");
         assert!(last.contains("невидимка"), "{last}");
         assert!(last.contains("UDP"), "{last}");
@@ -2594,17 +2591,40 @@ mod tests {
         // Клик по бейджу приглашений — клавиша «o».
         let (x, y) = find(&s, "✦ 1", 0);
         assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Char('o'))));
-        // Без связи — «Переподключение», без приглашений бейджа нет.
+        // Без связи — «сервер недоступен», без приглашений бейджа нет.
         app.connected = false;
+        app.conn = ConnState::Reconnecting;
         app.later_invites.clear();
         let s = frame(&app, 200, 40);
         let last: String = s[39].iter().collect();
         assert!(
-            last.contains("Переподключение") && !last.contains('✦'),
+            last.contains("○ сервер недоступен") && !last.contains('✦'),
             "{last}"
         );
         // Узко — не паникует.
         let _ = frame(&app, 40, 20);
+    }
+
+    #[test]
+    fn пилюли_офлайна_и_ожидающих_правок() {
+        // Демон недоступен + отложенные правки (офлайн-очередь).
+        let mut app = demo_app();
+        app.conn = ConnState::DaemonDown;
+        app.pending_edits = 2;
+        let s = frame(&app, 200, 40);
+        let header: String = s[1].iter().collect();
+        assert!(header.contains("⚠ демон недоступен"), "{header}");
+        let last: String = s[39].iter().collect();
+        assert!(last.contains("ожидает применения (2)"), "{last}");
+        // Без серверов — «нет сервера», правок нет — нет бейджа.
+        app.conn = ConnState::NoServer;
+        app.pending_edits = 0;
+        app.servers.clear();
+        let s = frame(&app, 200, 40);
+        let header: String = s[1].iter().collect();
+        assert!(header.contains("○ нет сервера"), "{header}");
+        let last: String = s[39].iter().collect();
+        assert!(!last.contains("ожидает применения"), "{last}");
     }
 
     #[test]

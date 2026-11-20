@@ -53,6 +53,9 @@ pub enum EngineMode {
     Embedded,
     /// В демоне; мы — тонкий клиент по IPC.
     Remote,
+    /// Движка нет: TUI правит конфиг сам, правки уходят демону позже
+    /// (офлайн-режим, `offline::ResilientEngine`).
+    Offline,
 }
 
 impl EngineMode {
@@ -60,6 +63,7 @@ impl EngineMode {
         match self {
             EngineMode::Embedded => "embedded",
             EngineMode::Remote => "демон",
+            EngineMode::Offline => "офлайн",
         }
     }
 }

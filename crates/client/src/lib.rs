@@ -13,6 +13,8 @@ pub mod invites;
 pub mod ipv6;
 /// Mesh-подсистема (L2) — каркас T3.
 pub mod mesh;
+/// Офлайн-TUI: движка нет — конфиг правится локально, очередь `ui-pending`.
+pub mod offline;
 pub mod path;
 /// Проба сервера (PROBE_REQ/RESP) — каркас T2.
 pub mod probe;
