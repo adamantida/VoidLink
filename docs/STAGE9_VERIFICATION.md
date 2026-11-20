@@ -519,4 +519,5 @@ codegraph node "start_probe"       # Called by ← do_cmd / probe_local
 | Гейты на финальном `dev` | **PASS** | `01bd7af`: `fmt` 0, `clippy -D warnings` 0, `cargo test --workspace -- --test-threads=1` — 565 passed, 0 failed |
 | Счёт тестов | 565 на Windows | совпадает в README, TESTING, PLAN, CHANGELOG |
 
-Финальное состояние: `dev` = `01bd7af`; код, приёмка и документация — **PASS**.
+Финальное состояние: `dev` = `c39d8d6` (после `01bd7af` — только правка вердикта в этом отчёте);
+код, приёмка и документация — **PASS**.
