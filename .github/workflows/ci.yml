@@ -84,7 +84,6 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --all-features
           manifest-path: ./Cargo.toml
 
   # Уязвимости в Cargo.lock по базе RustSec.

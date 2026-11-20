@@ -9,6 +9,9 @@ target/
 # CodeGraph local state
 .codegraph/
 
+# Локальные скиллы DSH для этого проекта (см. AGENTS.md)
+.dsh/
+
 # Editor / OS
 .vscode/
 .idea/

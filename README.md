@@ -7,7 +7,7 @@
 Соберите друзей, команду или парк машин в защищённую виртуальную сеть
 за пару минут — как будто все подключены к одному свитчу.
 
-[![CI](https://github.com/adamantida/VoidLink2/actions/workflows/ci.yml/badge.svg)](https://github.com/adamantida/VoidLink2/actions/workflows/ci.yml)
+[![CI](https://github.com/adamantida/VoidLink/actions/workflows/ci.yml/badge.svg)](https://github.com/adamantida/VoidLink/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
 ![Protocol](https://img.shields.io/badge/протокол-v4%2B-6f42c1)
 ![Platforms](https://img.shields.io/badge/Windows%20·%20Linux%20·%20macOS-0a7bbb)
