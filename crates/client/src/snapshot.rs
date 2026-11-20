@@ -28,6 +28,9 @@ pub struct Snapshot {
     pub cfg: CfgView,
     /// Неотвеченные приглашения (см. `invites::PendingInvites::list`).
     pub pending_invites: Vec<Invite>,
+    /// Доступные федерированные группы сервера (`FED_GROUPS`, T4) — по
+    /// возрастанию локального gid. Вход по uuid — `Cmd::JoinFed`.
+    pub fed_groups: Vec<FedGroupSnap>,
 }
 
 /// Участник группы.
@@ -93,6 +96,10 @@ pub struct GroupSnap {
     pub my_ip: u32,
     /// Сколько секунд мы в группе.
     pub joined_s_ago: u64,
+    /// Группа пришла с другого сервера (`FED_GROUPS`, T4): в UI — метка
+    /// «федерация». `false` — своя группа или сервер без федерации.
+    #[serde(default)]
+    pub federated: bool,
     /// Участники по возрастанию IP.
     pub members: Vec<PeerSnap>,
 }
@@ -112,6 +119,7 @@ impl GroupSnap {
             private: g.private,
             my_ip: g.my_ip,
             joined_s_ago: now.saturating_duration_since(g.since).as_secs(),
+            federated: g.fed_uuid.is_some(),
             members,
         }
     }
@@ -140,6 +148,37 @@ pub struct GroupSummarySnap {
     pub mine: bool,
     pub online: u32,
     pub total: u32,
+}
+
+/// Доступная федерированная группа (`FED_GROUPS`, T4). `uuid` — имя группы в
+/// федерации (вход по нему), `gid` — локальный номер на этом сервере.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FedGroupSnap {
+    /// uuid группы в федерации (16 байт).
+    pub uuid: [u8; 16],
+    pub gid: u32,
+    pub name: String,
+    pub owner: [u8; 32],
+    pub members: u16,
+    /// uuid коротким hex — для подсказок/лога UI.
+    pub uuid_short: String,
+}
+
+impl FedGroupSnap {
+    pub fn from_info(g: &crate::engine::FedGroupInfo) -> Self {
+        Self {
+            uuid: g.uuid,
+            gid: g.gid,
+            name: g.name.clone(),
+            owner: g.owner,
+            members: g.members,
+            uuid_short: g.uuid_short(),
+        }
+    }
+
+    pub fn from_infos(list: &[crate::engine::FedGroupInfo]) -> Vec<Self> {
+        list.iter().map(Self::from_info).collect()
+    }
 }
 
 impl From<&payloads::GroupSummary> for GroupSummarySnap {
@@ -366,6 +405,7 @@ mod tests {
                 private: true,
                 my_ip: 0x0A00_0002,
                 joined_s_ago: 42,
+                federated: false,
                 members: vec![PeerSnap {
                     pubkey: [1; 32],
                     name: "bravo".into(),
@@ -439,6 +479,14 @@ mod tests {
                 from_name: "charlie".into(),
                 received_ms_ago: 1500,
                 expires_in_s: Some(604_800),
+            }],
+            fed_groups: vec![FedGroupSnap {
+                uuid: [7; 16],
+                gid: 12,
+                name: "чужой сервер".into(),
+                owner: [4; 32],
+                members: 3,
+                uuid_short: "07070707".into(),
             }],
         }
     }

@@ -22,7 +22,7 @@ use tunnel_protocol as proto;
 use crate::engine::{self, Cmd, Engine, Event, Groups, Meta, Stats};
 use crate::invites::{IncomingInvite, InviteOutcome, PendingInvites};
 use crate::path::PathTable;
-use crate::snapshot::{CfgView, GroupSnap, MetaSnap, Snapshot, StatsSnap};
+use crate::snapshot::{CfgView, FedGroupSnap, GroupSnap, MetaSnap, Snapshot, StatsSnap};
 use crate::store::Config;
 
 /// Кто я: pubkey и friend code (секретов нет).
@@ -148,12 +148,14 @@ impl LocalEngine {
         let groups = GroupSnap::from_groups(&lock(&self.groups), &self.paths, now);
         let meta = MetaSnap::from_meta(&lock(&self.meta), now);
         let cfg = CfgView::from_cfg(&lock(&self.cfg));
+        let fed_groups = FedGroupSnap::from_infos(&lock(&self.meta).fed_groups);
         Snapshot {
             groups,
             meta,
             stats: StatsSnap::from_stats(&self.stats),
             cfg,
             pending_invites: lock(&self.invites).list(now),
+            fed_groups,
         }
     }
 
