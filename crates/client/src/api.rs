@@ -21,6 +21,7 @@ use tunnel_protocol as proto;
 
 use crate::engine::{self, Cmd, Engine, Event, Groups, Meta, Stats};
 use crate::invites::{IncomingInvite, InviteOutcome, PendingInvites};
+use crate::path::PathTable;
 use crate::snapshot::{CfgView, GroupSnap, MetaSnap, Snapshot, StatsSnap};
 use crate::store::Config;
 
@@ -99,6 +100,8 @@ pub struct LocalEngine {
     groups: Groups,
     meta: Arc<Mutex<Meta>>,
     stats: Arc<Stats>,
+    /// Таблица путей (этап 9) — для `path` в снимке.
+    paths: Arc<PathTable>,
     cfg: Arc<Mutex<Config>>,
     me: Me,
     cmds: Mutex<Sender<Cmd>>,
@@ -121,6 +124,7 @@ impl LocalEngine {
             groups: eng.groups.clone(),
             meta: eng.meta.clone(),
             stats: eng.stats.clone(),
+            paths: eng.paths.clone(),
             cfg: eng.cfg.clone(),
             me: Me {
                 my_pub: eng.my_pub,
@@ -137,7 +141,7 @@ impl LocalEngine {
     /// Снимок по значению (то же, что [`EngineApi::snapshot`]).
     pub fn snapshot_now(&self) -> Snapshot {
         let now = Instant::now();
-        let groups = GroupSnap::from_groups(&lock(&self.groups), now);
+        let groups = GroupSnap::from_groups(&lock(&self.groups), &self.paths, now);
         let meta = MetaSnap::from_meta(&lock(&self.meta), now);
         let cfg = CfgView::from_cfg(&lock(&self.cfg));
         Snapshot {

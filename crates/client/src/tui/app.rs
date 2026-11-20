@@ -939,6 +939,29 @@ impl App {
                         self.toast(MsgKind::Error, format!("пинг {}: таймаут", addr));
                     }
                 }
+                // Проба сервера (этап 9, §3.7): доступен/недоступен, RTT,
+                // совпадение ключа с закреплённым. Экран «Серверы» — T2.
+                E::ProbeResult {
+                    addr,
+                    success,
+                    rtt_ms,
+                    key_match,
+                } => {
+                    if !success {
+                        self.toast(MsgKind::Error, format!("проба {}: недоступен", addr));
+                    } else if key_match == Some(false) {
+                        self.toast(
+                            MsgKind::Warn,
+                            format!("проба {}: сервер отвечает чужим ключом", addr),
+                        );
+                    } else if let Some(rtt) = rtt_ms {
+                        self.toast(MsgKind::Ok, format!("проба {}: {} мс", addr, rtt));
+                    } else {
+                        self.toast(MsgKind::Ok, format!("проба {}: доступен", addr));
+                    }
+                }
+                // Колонка «путь» и счётчик релея — T5 (TUI этапа 9).
+                E::PathChanged { .. } | E::PathLost { .. } | E::RelayStats { .. } => {}
                 E::Error(e) => {
                     self.log(MsgKind::Error, e.clone());
                     self.toast(MsgKind::Error, e);

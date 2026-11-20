@@ -65,6 +65,8 @@ pub struct Metrics {
     pub challenge_total: AtomicU64,
     pub ctrl_frames: AtomicU64,
     pub bytes_relayed: AtomicU64,
+    /// Пробы доступности (`PROBE_REQ`, этап 9).
+    pub probes_total: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +114,7 @@ impl Metrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 10] {
+    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 11] {
         use Kind::*;
         [
             (
@@ -169,6 +171,12 @@ impl Metrics {
                 "Байты релея",
                 Counter,
                 &self.bytes_relayed,
+            ),
+            (
+                "voidlink_probes_total",
+                "Пробы доступности (PROBE_REQ)",
+                Counter,
+                &self.probes_total,
             ),
         ]
     }
@@ -422,13 +430,14 @@ mod tests {
             let (k, v) = line.split_once(' ').unwrap();
             values.insert(k.to_string(), v.parse::<u64>().unwrap());
         }
-        assert_eq!(types, 10);
-        assert_eq!(values.len(), 10);
+        assert_eq!(types, 11);
+        assert_eq!(values.len(), 11);
         assert_eq!(values["voidlink_sessions"], 3);
         assert_eq!(values["voidlink_relayed_frames_total"], 2);
         assert_eq!(values["voidlink_bytes_relayed_total"], 150);
         assert_eq!(values["voidlink_hello_total"], 7);
         assert_eq!(values["voidlink_dropped_frames_total"], 0);
+        assert_eq!(values["voidlink_probes_total"], 0);
         s.stop();
     }
 

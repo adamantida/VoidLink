@@ -14,6 +14,7 @@ use tunnel_protocol::payloads;
 
 use crate::engine::{GroupSess, Meta, PeerSess, Stats};
 use crate::invites::Invite;
+use crate::path::{PathKind, PathTable};
 use crate::store::Config;
 
 /// Полный снимок.
@@ -45,10 +46,27 @@ pub struct PeerSnap {
     /// Последний фрейм напрямую (не через релей), мс назад.
     pub last_direct_ms_ago: Option<u64>,
     pub rtt_ms: Option<u64>,
+    /// Выбранный путь доставки (этап 9): прямой / сервер / через пира.
+    /// `None` — пути ещё нет (не было пересчёта).
+    #[serde(default)]
+    pub path: Option<PathSnap>,
+}
+
+/// Путь доставки в снимке: вид, RTT и (для реле) ключ пира.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathSnap {
+    pub kind: PathKind,
+    /// Измеренный RTT выбранного пути (у сервера может быть неизвестен).
+    #[serde(default)]
+    pub rtt_ms: Option<u64>,
 }
 
 impl PeerSnap {
-    pub fn from_sess(p: &PeerSess, now: Instant) -> Self {
+    pub fn from_sess(p: &PeerSess, paths: &PathTable, now: Instant) -> Self {
+        let path = paths.current(p.ip).map(|kind| PathSnap {
+            kind,
+            rtt_ms: paths.current_rtt(p.ip).map(u64::from),
+        });
         Self {
             pubkey: p.pubkey,
             name: p.name.clone(),
@@ -60,6 +78,7 @@ impl PeerSnap {
             last_rx_ms_ago: ms_ago(p.last_rx, now),
             last_direct_ms_ago: p.last_direct.map(|t| ms_ago(t, now)),
             rtt_ms: p.rtt_ms,
+            path,
         }
     }
 }
@@ -79,11 +98,11 @@ pub struct GroupSnap {
 }
 
 impl GroupSnap {
-    pub fn from_sess(gid: u32, g: &GroupSess, now: Instant) -> Self {
+    pub fn from_sess(gid: u32, g: &GroupSess, paths: &PathTable, now: Instant) -> Self {
         let mut members: Vec<PeerSnap> = g
             .members
             .values()
-            .map(|p| PeerSnap::from_sess(p, now))
+            .map(|p| PeerSnap::from_sess(p, paths, now))
             .collect();
         members.sort_by_key(|p| p.ip);
         Self {
@@ -98,10 +117,14 @@ impl GroupSnap {
     }
 
     /// Все группы движка, по возрастанию gid.
-    pub fn from_groups(groups: &HashMap<u32, GroupSess>, now: Instant) -> Vec<Self> {
+    pub fn from_groups(
+        groups: &HashMap<u32, GroupSess>,
+        paths: &PathTable,
+        now: Instant,
+    ) -> Vec<Self> {
         let mut v: Vec<Self> = groups
             .iter()
-            .map(|(gid, g)| Self::from_sess(*gid, g, now))
+            .map(|(gid, g)| Self::from_sess(*gid, g, paths, now))
             .collect();
         v.sort_by_key(|g| g.gid);
         v
@@ -146,6 +169,16 @@ pub struct MetaSnap {
     pub tx_hist: Vec<u64>,
     /// Сколько секунд работает движок.
     pub uptime_s: u64,
+    /// RTT до сервера по CTRL_PONG с меткой (`None` — ещё не измерен или
+    /// старый сервер без метки).
+    #[serde(default)]
+    pub server_rtt_ms: Option<u32>,
+    /// Mesh включён клиентом (`Config.mesh.enabled`).
+    #[serde(default)]
+    pub mesh_enabled: bool,
+    /// Сколько байт этот клиент отрелеил через mesh (T3).
+    #[serde(default)]
+    pub relay_bytes: u64,
 }
 
 impl MetaSnap {
@@ -158,6 +191,9 @@ impl MetaSnap {
             rx_hist: m.rx_hist.iter().copied().collect(),
             tx_hist: m.tx_hist.iter().copied().collect(),
             uptime_s: now.saturating_duration_since(m.started).as_secs(),
+            server_rtt_ms: m.server_rtt_ms,
+            mesh_enabled: m.mesh_enabled,
+            relay_bytes: m.relay_bytes,
         }
     }
 }
@@ -212,6 +248,18 @@ pub struct CfgView {
     /// Невидимка (`Cmd::SetInvisible`).
     #[serde(default)]
     pub invisible: bool,
+    /// Mesh включён (этап 9).
+    #[serde(default)]
+    pub mesh_enabled: bool,
+    /// Релей через пиров разрешён.
+    #[serde(default)]
+    pub relay_enabled: bool,
+    /// Лимит отдачи реле, кбит/с.
+    #[serde(default)]
+    pub relay_budget_kbps: u32,
+    /// Ручные закрепления путей (`"<ip>" → "direct"|"server"|"relay:<hex>"`).
+    #[serde(default)]
+    pub pinned_paths: std::collections::BTreeMap<String, String>,
 }
 
 impl CfgView {
@@ -238,6 +286,10 @@ impl CfgView {
                 .collect(),
             autojoin: c.autojoin.clone(),
             invisible: c.invisible,
+            mesh_enabled: c.mesh.enabled,
+            relay_enabled: c.mesh.relay_enabled,
+            relay_budget_kbps: c.mesh.relay_budget_kbps,
+            pinned_paths: c.pinned_paths.clone(),
         }
     }
 
@@ -267,6 +319,13 @@ impl CfgView {
                 .collect(),
             autojoin: self.autojoin.clone(),
             invisible: self.invisible,
+            mesh: crate::store::MeshConfig {
+                enabled: self.mesh_enabled,
+                relay_enabled: self.relay_enabled,
+                relay_budget_kbps: self.relay_budget_kbps,
+                ..Default::default()
+            },
+            pinned_paths: self.pinned_paths.clone(),
             ..Config::default()
         }
     }
@@ -302,6 +361,10 @@ mod tests {
                     last_rx_ms_ago: 120,
                     last_direct_ms_ago: None,
                     rtt_ms: Some(33),
+                    path: Some(PathSnap {
+                        kind: PathKind::Direct,
+                        rtt_ms: Some(33),
+                    }),
                 }],
             }],
             meta: MetaSnap {
@@ -319,6 +382,9 @@ mod tests {
                 rx_hist: vec![1, 2, 3],
                 tx_hist: vec![4, 5],
                 uptime_s: 3600,
+                server_rtt_ms: Some(48),
+                mesh_enabled: true,
+                relay_bytes: 1024,
             },
             stats: StatsSnap {
                 rx_bytes: 10,
@@ -340,6 +406,13 @@ mod tests {
                 }],
                 autojoin: vec![7],
                 invisible: true,
+                mesh_enabled: true,
+                relay_enabled: false,
+                relay_budget_kbps: 4096,
+                pinned_paths: std::collections::BTreeMap::from([(
+                    "100.66.0.2".to_string(),
+                    "server".to_string(),
+                )]),
             },
             pending_invites: vec![Invite {
                 gid: 11,
@@ -411,7 +484,8 @@ mod tests {
             last_direct: Some(base),
             rtt_ms: None,
         };
-        let p = PeerSnap::from_sess(&peer, now);
+        let paths = PathTable::empty();
+        let p = PeerSnap::from_sess(&peer, &paths, now);
         assert_eq!(p.last_rx_ms_ago, 250);
         assert_eq!(p.last_direct_ms_ago, Some(10_000));
         assert_eq!(p.endpoint.as_deref(), Some("1.2.3.4:5"));
