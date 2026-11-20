@@ -2009,6 +2009,10 @@ fn push_group_state(s: &State, g: &Group, addr: SocketAddr, ses: &Session, out: 
 
 /// Снимок своей (авторитетной здесь) группы для публикации пирам.
 fn group_snap(g: &Group) -> Option<federation::GroupSnap> {
+    let mut members: Vec<([u8; 32], u32)> = g.members.iter().map(|(pk, m)| (*pk, m.ip)).collect();
+    // Порядок детерминирован: `publish` сравнивает записи как значения, и
+    // случайный порядок HashMap давал бы ложные «изменения».
+    members.sort_unstable();
     Some(federation::GroupSnap {
         uuid: g.fed_uuid?,
         gid: g.id,
@@ -2018,7 +2022,7 @@ fn group_snap(g: &Group) -> Option<federation::GroupSnap> {
         key: g.key,
         epoch: g.epoch,
         rev: g.rev,
-        members: g.members.iter().map(|(pk, m)| (*pk, m.ip)).collect(),
+        members,
     })
 }
 
@@ -2592,6 +2596,10 @@ fn join_fed(
     uuid: &[u8; 16],
     out: &mut Outbox,
 ) -> Result<()> {
+    anyhow::ensure!(
+        federation::enabled(sh),
+        "федерация серверов выключена (--federate)"
+    );
     let gid = s
         .groups
         .values()
@@ -2640,6 +2648,15 @@ fn join_fed(
             // ключ и пришлёт дельту).
             federation::request_join(sh, uuid, &owner, *me, ip, rev, out);
         }
+        // Адрес вошедшего — в общий пул: пиры должны знать, где он живёт
+        // (иначе релей до него не найдёт сервер).
+        let claim = proto::federation::FedAddrClaim {
+            pk: *me,
+            ip,
+            server: sh.identity.ed_pub(),
+            ts_ms: unix_ms(),
+        };
+        federation::publish_claims(sh, &[claim], out);
         sh.log(format!(
             "join_fed: {} → {} \"{}\" as {}",
             uname,
