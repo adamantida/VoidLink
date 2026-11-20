@@ -391,7 +391,29 @@ fn e2e_dht_переживает_мёртвый_сервер_и_смену_адр
             .any(|p| p.pubkey == b_pk && p.endpoint == Some(b.addr()))
     });
     deliver(&a, &b, gid, "dht-after-move", T);
+    // Переезд найден, прямой канал поднят на новом адресе; сервер больше не
+    // нужен — сессии и адрес должны жить без него.
+    let b_ip = b.my_ip(gid);
+    wait_until(
+        "прямой путь после переезда",
+        PATHS_T,
+        || a.eng.paths.current(b_ip) == Some(PathKind::Direct),
+    );
     server.stop();
+    std::thread::sleep(Duration::from_millis(300));
+    deliver(&a, &b, gid, "dht-after-move-dead-server", T);
+    assert!(
+        a.sessions() >= 1 && b.sessions() >= 1,
+        "mesh-сессия не пережила смерть сервера после переезда"
+    );
+    assert!(
+        a.cfg()
+            .mesh
+            .contacts
+            .iter()
+            .any(|c| c.ed == proto::hex_of(&b_pk)),
+        "DHT потерял переехавшего пира"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -510,6 +532,209 @@ fn e2e_switch_server_не_теряет_dht() {
         a.cfg().mesh.contacts.len(),
         saved,
         "SwitchServer потерял DHT-контакты"
+    );
+    s1.stop();
+    s2.stop();
+    let _ = std::fs::remove_dir_all(&dir1);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// E2E 3, сквозной сценарий §10.1: переключение server → peer → server,
+/// ручное закрепление сильнее автоматики (даже когда прямой путь дешевле),
+/// недоступное закрепление даёт `PathLost` и откат на автоматику (само
+/// закрепление остаётся в `client.json`), а закрепление переживает рестарт.
+#[test]
+fn e2e_путь_сервер_пир_пин_блокирует_и_откатывает() {
+    let dir = temp_dir("pin3");
+    let server = start_server(&dir, 47615);
+    let (mut a, b, c, gid) = three(&server);
+    let (b_ip, c_pk) = (b.my_ip(gid), c.identity.ed_pub());
+    // 1. Прямой канал: автоматика выбирает direct — он дешевле сервера.
+    deliver(&a, &b, gid, "pin3-warmup", T);
+    wait_until("прямой путь A→B", PATHS_T, || {
+        a.eng.paths.current(b_ip) == Some(PathKind::Direct)
+    });
+    // 2. PIN_PATH блокирует автоматику: сервер дороже прямого, но пин
+    //    держится и после пересчёта путей (раз в 10 с).
+    a.eng
+        .cmds
+        .send(Cmd::PinPath {
+            ip: b_ip,
+            path: PathKind::Server,
+        })
+        .unwrap();
+    wait_until("пин сервера", T, || {
+        a.eng.paths.current(b_ip) == Some(PathKind::Server)
+    });
+    let hold = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < hold {
+        assert_eq!(
+            a.eng.paths.current(b_ip),
+            Some(PathKind::Server),
+            "автоматика сменила закреплённый путь"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    deliver(&a, &b, gid, "pin3-server", T);
+    assert_eq!(
+        a.cfg().pinned_paths.get(&crate::path::ip_key(b_ip)),
+        Some(&"server".to_string())
+    );
+    // 3. Переключение server → peer: закреплён релей через C, кадры идут
+    //    через него (счётчик релея у C растёт).
+    a.eng
+        .cmds
+        .send(Cmd::PinPath {
+            ip: b_ip,
+            path: PathKind::PeerRelay { via: c_pk },
+        })
+        .unwrap();
+    wait_until("пин peer-пути через C", MESH_T, || {
+        a.eng.paths.current(b_ip) == Some(PathKind::PeerRelay { via: c_pk })
+    });
+    let relayed = c.relay_bytes();
+    deliver(&a, &b, gid, "pin3-peer", T);
+    wait_until("C отрелеил кадр", T, || {
+        c.relay_bytes() > relayed
+    });
+    // 4. Закрепление на недоступный релей: `PathLost` и откат на автоматику;
+    //    закрепление в конфиге не удаляется — путь может ожить. Старые
+    //    события (пин на peer мог применяться не с первого пересчёта) чистим,
+    //    чтобы ждать `PathLost` именно от недоступного закрепления.
+    while a.eng.events.try_recv().is_ok() {}
+    let ghost = proto::Identity::generate().ed_pub();
+    let ghost_pin = format!("relay:{}", proto::hex_of(&ghost));
+    a.eng
+        .cmds
+        .send(Cmd::PinPath {
+            ip: b_ip,
+            path: PathKind::PeerRelay { via: ghost },
+        })
+        .unwrap();
+    a.wait(
+        "PathLost недоступного релея",
+        T,
+        |e| matches!(e, Event::PathLost { ip, .. } if *ip == b_ip),
+    );
+    wait_until("откат на автоматику", T, || {
+        matches!(
+            a.eng.paths.current(b_ip),
+            Some(PathKind::Direct) | Some(PathKind::Server)
+        )
+    });
+    assert_eq!(
+        a.cfg().pinned_paths.get(&crate::path::ip_key(b_ip)),
+        Some(&ghost_pin),
+        "нерабочее закрепление удалено из конфига"
+    );
+    deliver(&a, &b, gid, "pin3-rollback", T);
+    // 5. Закрепление сервера переживает рестарт движка (конфиг — источник
+    //    правды, таблица путей его перечитывает).
+    a.eng
+        .cmds
+        .send(Cmd::PinPath {
+            ip: b_ip,
+            path: PathKind::Server,
+        })
+        .unwrap();
+    wait_until(
+        "пин сервера перед рестартом",
+        T,
+        || a.eng.paths.current(b_ip) == Some(PathKind::Server),
+    );
+    let a = a.restart(&server);
+    wait_until(
+        "группа вернулась после рестарта",
+        PATHS_T,
+        || a.eng.groups.lock().unwrap().contains_key(&gid),
+    );
+    wait_until(
+        "пин сервера после рестарта",
+        PATHS_T,
+        || a.eng.paths.current(b_ip) == Some(PathKind::Server),
+    );
+    assert_eq!(
+        a.cfg().pinned_paths.get(&crate::path::ip_key(b_ip)),
+        Some(&"server".to_string())
+    );
+    deliver(&a, &b, gid, "pin3-after-restart", T);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// E2E 7, продолжение: после `SwitchServer` mesh-сессии и DHT не только
+/// сохраняются, но и работают — на новом сервере группа снова доставляет
+/// трафик по поднятому раньше mesh-каналу, без повторного рукопожатия.
+#[test]
+fn e2e_switch_server_не_рвёт_mesh_и_связь() {
+    let dir1 = temp_dir("sw3-1");
+    let dir2 = temp_dir("sw3-2");
+    let s1 = start_server(&dir1, 47616);
+    let s2 = start_server(&dir2, 47617);
+    let mut a = Node::start("alpha", &s1);
+    let gid = a.create("switch-live");
+    let mut b = Node::start("bravo", &s1);
+    b.join(gid);
+    let b_pk = b.identity.ed_pub();
+    wait_until("DHT A знает B", Duration::from_secs(30), || {
+        a.cfg()
+            .mesh
+            .contacts
+            .iter()
+            .any(|c| c.ed == proto::hex_of(&b_pk))
+    });
+    wait_until(
+        "mesh-сессии до переключения",
+        MESH_T,
+        || a.sessions() >= 1 && b.sessions() >= 1,
+    );
+    // Оба клиента уходят на S2: группы S1 забываются, mesh-сессии и
+    // DHT-контакты — состояние пиров, не сервера.
+    for n in [&mut a, &mut b] {
+        n.eng
+            .cmds
+            .send(Cmd::SwitchServer {
+                addr: local(s2.addr),
+                pubkey: s2.pubkey,
+                label: "s2".into(),
+            })
+            .unwrap();
+    }
+    a.wait(
+        "A переключён на S2",
+        T,
+        |e| matches!(e, Event::ServerSwitched { addr, .. } if *addr == local(s2.addr)),
+    );
+    b.wait(
+        "B переключён на S2",
+        T,
+        |e| matches!(e, Event::ServerSwitched { addr, .. } if *addr == local(s2.addr)),
+    );
+    wait_until("оба подключены к S2", T, || {
+        a.connected() && b.connected()
+    });
+    assert!(
+        a.sessions() >= 1 && b.sessions() >= 1,
+        "SwitchServer закрыл mesh-сессии"
+    );
+    // Новая группа на S2: доставка идёт по mesh-каналу, поднятому на S1.
+    let gid2 = a.create("after-switch");
+    b.join(gid2);
+    wait_until("состав группы на S2", T, || {
+        a.eng.groups.lock().unwrap()[&gid2].members.len() == 1
+    });
+    deliver(&a, &b, gid2, "switch-after", T);
+    assert!(
+        a.sessions() >= 1 && b.sessions() >= 1,
+        "mesh-сессия пропала после переключения"
+    );
+    assert!(
+        a.cfg()
+            .mesh
+            .contacts
+            .iter()
+            .any(|c| c.ed == proto::hex_of(&b_pk)),
+        "SwitchServer потерял контакт переключившегося пира"
     );
     s1.stop();
     s2.stop();
