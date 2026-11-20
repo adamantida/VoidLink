@@ -1110,7 +1110,8 @@ fn run_offline_tui(
     }
     let ui = ui_cfg(dir, cfg);
     let shared = Arc::new(std::sync::Mutex::new(cfg.clone()));
-    let eng = tunnel_client::remote::connect_offline(dir, shared, identity.clone(), reason)?;
+    let eng =
+        tunnel_client::remote::connect_offline_with_reason(dir, shared, identity.clone(), reason)?;
     tui::run_remote(eng, &ui)
 }
 

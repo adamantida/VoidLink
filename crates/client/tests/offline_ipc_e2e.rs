@@ -234,7 +234,7 @@ fn очередь_уходит_демону_и_очищается() {
         my_pub: id.ed_pub(),
         my_code: id.friend_code(),
     };
-    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id, None).expect("офлайн-движок");
+    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id).expect("офлайн-движок");
     assert_eq!(eng.mode(), EngineMode::Offline);
     assert!(eng.unavailable(), "демона нет");
 
@@ -299,7 +299,7 @@ fn причина_демона_без_движка_видна_tui() {
         my_code: id.friend_code(),
     };
     let d = FakeDaemon::start(&dir, me, Config::default());
-    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id, None).expect("офлайн-движок");
+    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id).expect("офлайн-движок");
     assert!(eng.wait_remote(T), "демон доступен");
     assert!(!eng.is_live(), "движка в демоне нет");
     assert!(

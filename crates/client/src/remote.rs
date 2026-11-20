@@ -220,8 +220,18 @@ fn parse_snapshot(v: serde_json::Value) -> Result<Snapshot, String> {
 
 /// Офлайн-режим TUI: демона (или движка в нём) нет. `cfg` — общий
 /// `Arc<Mutex<Config>>` с вызывающим: правки не теряются; `identity` — для
-/// friend code в шапке; `reason` — почему движка нет (в снимке, для шапки/лога).
+/// friend code в шапке. Причина офлайна неизвестна (её уточнит фон).
 pub fn connect_offline(
+    dir: &Path,
+    cfg: Arc<Mutex<Config>>,
+    identity: tunnel_protocol::Identity,
+) -> Result<crate::offline::ResilientEngine> {
+    connect_offline_with_reason(dir, cfg, identity, None)
+}
+
+/// То же, но с готовой причиной офлайна (демон есть, движка в нём нет;
+/// демон не отвечает) — она сразу попадает в снимок и лог.
+pub fn connect_offline_with_reason(
     dir: &Path,
     cfg: Arc<Mutex<Config>>,
     identity: tunnel_protocol::Identity,

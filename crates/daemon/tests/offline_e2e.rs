@@ -162,7 +162,7 @@ fn офлайн_правки_уходят_демону_после_его_ста�
     let dir = temp_dir("d");
     let (cfg, id) = write_identity(&dir);
 
-    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id, None).expect("офлайн-движок");
+    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id).expect("офлайн-движок");
     assert_eq!(eng.mode(), EngineMode::Offline);
     assert!(eng.unavailable(), "демона нет");
     assert!(eng.snapshot().meta.offline);
@@ -228,7 +228,7 @@ fn tui_добавляет_сервер_демону_в_состоянии_нет
         e
     });
 
-    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id, None).expect("офлайн-движок");
+    let eng = connect_offline(&dir, Arc::new(Mutex::new(cfg)), id).expect("офлайн-движок");
     assert!(eng.wait_remote(T), "демон доступен");
     assert!(!eng.is_live(), "движка в демоне нет");
     assert!(
