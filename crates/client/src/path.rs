@@ -434,6 +434,53 @@ impl PathTable {
         recalc_target_pinned(ip, t, pin, ctx, &mut out);
         out
     }
+
+    /// Выбрать путь доставки для `route_packet`: пересчитать получателя
+    /// (гистерезис и закрепление — те же, что в [`PathTable::recalc`]) и
+    /// вернуть текущий путь. Изменения — вторым элементом: движок рассылает
+    /// их событиями. У получателя без записи она заводится (участник группы).
+    pub fn choose(
+        &self,
+        ip: u32,
+        now_ms: u64,
+        server_up: bool,
+    ) -> (Option<PathKind>, Vec<PathChange>) {
+        self.ensure_target(ip);
+        let changes = self.recalc_one(ip, now_ms, server_up);
+        (self.current(ip), changes)
+    }
+
+    /// Доступные сейчас пути получателя по возрастанию стоимости (для
+    /// отката, когда выбранный путь отказал).
+    pub fn fallbacks(&self, ip: u32, now_ms: u64, server_up: bool) -> Vec<PathKind> {
+        let p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = Ctx {
+            server: p.server,
+            server_up,
+            relay: p.relay_enabled,
+            now_ms,
+        };
+        let Some(t) = p.targets.get(&ip) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(f64, PathKind)> = Vec::new();
+        for kind in [
+            Some(PathKind::Direct),
+            Some(PathKind::Server),
+            t.peer.map(|r| PathKind::PeerRelay { via: r.via }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some((cost, _)) = cost_of(t, kind, ctx)
+                && cost.is_finite()
+            {
+                v.push((cost, kind));
+            }
+        }
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v.into_iter().map(|(_, k)| k).collect()
+    }
 }
 
 /// Неизменяемые входы пересчёта: связь с сервером, режим релея, время.
@@ -1042,5 +1089,105 @@ mod tests {
         for h in hs {
             h.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod choose_tests {
+    use super::*;
+
+    const IP: u32 = 0x6442_0002;
+    const VIA: [u8; 32] = [7; 32];
+
+    #[test]
+    fn choose_заводит_цель_и_возвращает_путь_сразу() {
+        let t = PathTable::empty();
+        // Цели ещё нет в таблице: choose заводит её (участник группы).
+        let (path, changes) = t.choose(IP, 0, false);
+        assert_eq!(path, None, "без связи и измерений пути нет");
+        assert!(changes.is_empty());
+        // Связь есть, замер сервера есть — сервер (путь по умолчанию).
+        t.record_server_rtt(50, 5);
+        let (path, changes) = t.choose(IP, 10, true);
+        assert_eq!(path, Some(PathKind::Server));
+        assert_eq!(
+            changes,
+            vec![PathChange::Changed {
+                ip: IP,
+                from: None,
+                to: PathKind::Server,
+                rtt_ms: Some(50)
+            }]
+        );
+        // Прямой дешевле — choose возвращает его без ожидания тика.
+        t.record_direct_rtt(IP, 5, 20);
+        let (path, changes) = t.choose(IP, 30, true);
+        assert_eq!(path, Some(PathKind::Direct));
+        assert!(matches!(
+            changes.as_slice(),
+            [PathChange::Changed {
+                from: Some(PathKind::Server),
+                to: PathKind::Direct,
+                rtt_ms: Some(5),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn choose_выбирает_реле_по_стоимости() {
+        let t = PathTable::empty();
+        t.record_server_rtt(60, 0); // cost 65
+        t.record_direct_rtt(IP, 20, 0); // cost 20 — прямой дешевле
+        let (path, _) = t.choose(IP, 10, true);
+        assert_eq!(path, Some(PathKind::Direct));
+        // Реле: 5 + 5 + 15 + 0 = 25 > 20 — гистерезис (20 %: порог 16)
+        // не даёт переключиться, хотя реле уже дешевле сервера.
+        t.record_peer_rtt(IP, VIA, 5, 5, 0.0, 10);
+        let (path, changes) = t.choose(IP, 20, true);
+        assert_eq!(path, Some(PathKind::Direct));
+        assert!(changes.is_empty(), "дребезг не нужен");
+        // Прямой подорожал до 40 — реле (25) дешевле на 37 % → переключение.
+        t.record_direct_rtt(IP, 40, 30);
+        let (path, changes) = t.choose(IP, 40, true);
+        assert_eq!(path, Some(PathKind::PeerRelay { via: VIA }));
+        assert!(matches!(
+            changes.as_slice(),
+            [PathChange::Changed {
+                from: Some(PathKind::Direct),
+                to: PathKind::PeerRelay { via },
+                rtt_ms: Some(10),
+                ..
+            }] if *via == VIA
+        ));
+        // Релей запрещён: L2 недоступен, но гистерезиса нет — пересчёт
+        // берёт лучший из оставшихся (прямой 40 дешевле сервера 65).
+        t.set_relay_enabled(false);
+        let (path, changes) = t.choose(IP, 50, true);
+        assert_eq!(path, Some(PathKind::Direct));
+        assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn fallbacks_по_возрастанию_стоимости() {
+        let t = PathTable::empty();
+        t.record_server_rtt(50, 0);
+        t.record_direct_rtt(IP, 10, 0);
+        t.record_peer_rtt(IP, VIA, 5, 5, 0.0, 0);
+        let v = t.fallbacks(IP, 10, true);
+        // Прямой 10, реле 25, сервер 55.
+        assert_eq!(
+            v,
+            vec![
+                PathKind::Direct,
+                PathKind::PeerRelay { via: VIA },
+                PathKind::Server
+            ]
+        );
+        // Без связи сервер недоступен, протухшие замеры не выдумываются.
+        let v = t.fallbacks(IP, 100_000, false);
+        assert!(v.is_empty(), "все замеры устарели: {v:?}");
+        // Неизвестный получатель — пусто.
+        assert!(t.fallbacks(0x6442_00FF, 10, true).is_empty());
     }
 }

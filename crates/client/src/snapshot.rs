@@ -179,6 +179,9 @@ pub struct MetaSnap {
     /// Сколько байт этот клиент отрелеил через mesh (T3).
     #[serde(default)]
     pub relay_bytes: u64,
+    /// Живых mesh-сессий (пир ↔ пир, T3).
+    #[serde(default)]
+    pub mesh_sessions: u32,
     /// Движка нет: TUI работает офлайн (демон без движка, демона нет).
     /// Правки конфига при этом сохраняются, сетевые команды — отказ.
     #[serde(default)]
@@ -205,6 +208,7 @@ impl MetaSnap {
             server_rtt_ms: m.server_rtt_ms,
             mesh_enabled: m.mesh_enabled,
             relay_bytes: m.relay_bytes,
+            mesh_sessions: m.mesh_sessions,
             ..MetaSnap::default()
         }
     }
@@ -397,6 +401,7 @@ mod tests {
                 server_rtt_ms: Some(48),
                 mesh_enabled: true,
                 relay_bytes: 1024,
+                mesh_sessions: 2,
                 ..MetaSnap::default()
             },
             stats: StatsSnap {
@@ -496,6 +501,8 @@ mod tests {
             last_rx: base + Duration::from_millis(9_750),
             last_direct: Some(base),
             rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
         };
         let paths = PathTable::empty();
         let p = PeerSnap::from_sess(&peer, &paths, now);

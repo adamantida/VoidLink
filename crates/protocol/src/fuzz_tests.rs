@@ -88,6 +88,12 @@ fn feed_all(
         let _ = h.signing_payload();
     }
     let _ = MeshForward::decode(b);
+    // RPC внутри mesh-сессии: каждый тип и «чужой» тип на том же входе.
+    for typ in crate::mesh::MESH_PING..=crate::mesh::MESH_BYE {
+        let _ = crate::mesh::Rpc::decode(typ, b);
+    }
+    let _ = crate::mesh::Rpc::decode(crate::mesh::MESH_FORWARD, b);
+    let _ = crate::mesh::Rpc::decode(0xFF, b);
     let _ = read_member(&mut Reader::new(b));
     let _ = handshake::hello_version(b);
     let _ = Hello3::decode(b).map(|h| h.verify());
