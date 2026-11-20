@@ -5515,4 +5515,186 @@ mod tests {
         assert_eq!(p.user_ips.get(&hex(&y)), Some(&ip(7, 2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---------- этап 9: mesh-контракт и проба ----------
+
+    #[test]
+    fn ctrl_pong_эхо_метки_и_старый_клиент() {
+        let (server, dir) = test_server("pong-label");
+        let a = Raw::connect(server.addr, "alpha");
+        a.sync();
+        // 8-байтовая метка возвращается как есть — по ней клиент считает RTT.
+        let label = 0x0102_0304_0506_0708u64;
+        a.send(ctrl::CTRL_PING, &label.to_be_bytes());
+        assert_eq!(a.expect(ctrl::CTRL_PONG), label.to_be_bytes());
+        // Пустой payload (старый клиент) — пустой ответ, а не ошибка.
+        a.send(ctrl::CTRL_PING, &[]);
+        assert!(a.expect(ctrl::CTRL_PONG).is_empty());
+        // Метка другой длины не считается меткой: ответ пустой.
+        a.send(ctrl::CTRL_PING, &[1, 2, 3]);
+        assert!(a.expect(ctrl::CTRL_PONG).is_empty());
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_отвечает_без_сессии_и_не_длиннее_запроса() {
+        let (server, dir) = test_server("probe");
+        let srv = server.addr;
+        // Обычный сокет без рукопожатия: проба не должна требовать сессии.
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let req = payloads::ProbeReq {
+            nonce: [9; payloads::PROBE_NONCE_LEN],
+            ts_ms: unix_ms(),
+            want_key: true,
+        };
+        let frame = proto::plain_frame(ctrl::PROBE_REQ, &payloads::enc_probe_req(&req));
+        sock.send_to(&frame, srv).unwrap();
+        let (body, resp) =
+            recv_plain(&sock, ctrl::PROBE_RESP, Duration::from_secs(3)).expect("нет PROBE_RESP");
+        // Ответ не длиннее запроса (24/56 ≤ 64) и с тем же nonce/ts.
+        assert!(resp.len() <= frame.len(), "ответ длиннее запроса");
+        let got = payloads::dec_probe_resp(&body).unwrap();
+        assert_eq!((got.nonce, got.ts_ms), (req.nonce, req.ts_ms));
+        assert!(got.ed_pub.is_some(), "want_key — ключ сервера в ответе");
+        // Просроченный запрос — молчание, не ответ.
+        let stale = payloads::ProbeReq {
+            ts_ms: unix_ms().saturating_sub(probe::PROBE_TS_SKEW_MS + 1),
+            ..req
+        };
+        let frame = proto::plain_frame(ctrl::PROBE_REQ, &payloads::enc_probe_req(&stale));
+        sock.send_to(&frame, srv).unwrap();
+        assert!(
+            recv_plain(&sock, ctrl::PROBE_RESP, Duration::from_millis(500)).is_none(),
+            "ответ на просроченную пробу"
+        );
+        // Битые длины — молчание (и никакой сессии/ошибки).
+        for n in [0usize, 32, 63, 65] {
+            let f = proto::plain_frame(ctrl::PROBE_REQ, &vec![0u8; n]);
+            sock.send_to(&f, srv).unwrap();
+        }
+        assert!(recv_plain(&sock, ctrl::PROBE_RESP, Duration::from_millis(500)).is_none());
+        // И сервер всё ещё работает: обычный клиент подключается.
+        let a = Raw::connect(srv, "alpha");
+        a.sync();
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mesh_info_даёт_seed_и_mesh_секцию_group_state() {
+        let (server, dir) = test_server("mesh-info");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let st = a.create("mesh", false);
+        let gid = st.gid;
+        let b = Raw::connect(srv, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let st_b = b.state();
+        assert_eq!(st_b.members.len(), 2);
+
+        // Оба публикуют mesh-контакт: x-ключ + возможности.
+        let (ax, bx) = ([0xAAu8; 32], [0xBBu8; 32]);
+        let caps_a = proto::mesh::caps::MESH | proto::mesh::caps::RELAY;
+        a.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&ax, caps_a));
+        // A получает семя: B (единственная другая сессия), ed/x/адрес — как
+        // публиковалось, и GROUP_UPDATE с mesh-хвостом.
+        let seed = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.expect(ctrl::MESH_SEED);
+
+        // Семя A: контакт B с тем же x-ключом и его реальным адресом.
+        let seed_all = payloads::dec_mesh_seed(&{
+            a.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&ax, caps_a));
+            a.expect(ctrl::MESH_SEED)
+        })
+        .unwrap();
+        let b_addr = b.sock.local_addr().unwrap();
+        assert!(
+            seed_all
+                .iter()
+                .any(|s| s.ed_pub == b.pk && s.x_pub == bx && s.addr == b_addr),
+            "в семени нет B: {seed_all:?}"
+        );
+        assert!(!seed_all.iter().any(|s| s.ed_pub == a.pk), "себя не выдаём");
+
+        // GROUP_STATE несёт mesh-секцию: обе записи, адреса — из состава.
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        let st = a.state();
+        let ip_a = st.members.iter().find(|m| m.pubkey == a.pk).unwrap().ip;
+        let ip_b = st.members.iter().find(|m| m.pubkey == b.pk).unwrap().ip;
+        assert_eq!(st.mesh.len(), 2, "mesh-секция: {:?}", st.mesh);
+        assert_eq!(
+            st.mesh
+                .iter()
+                .find(|e| e.ip == ip_a)
+                .map(|e| (e.x_pub, e.caps)),
+            Some((ax, caps_a))
+        );
+        assert_eq!(
+            st.mesh.iter().find(|e| e.ip == ip_b).map(|e| e.x_pub),
+            Some(bx)
+        );
+        // Записи упорядочены по ip (сопоставление с участниками — по ip).
+        let mut sorted = st.mesh.clone();
+        sorted.sort_by_key(|e| e.ip);
+        assert_eq!(st.mesh, sorted);
+
+        // GROUP_UPDATE kind 1 несёт mesh-хвост изменившегося участника:
+        // смена caps у B — дельта A получает x-ключ и caps.
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(
+                &bx,
+                proto::mesh::caps::MESH | proto::mesh::caps::ACCEPT_RELAY,
+            ),
+        );
+        let upd = a.update();
+        assert!(matches!(upd.delta, payloads::GroupDelta::Member(_)));
+        assert_eq!(upd.mesh.len(), 1);
+        assert_eq!(upd.mesh[0].x_pub, bx);
+        assert_eq!(
+            upd.mesh[0].caps,
+            proto::mesh::caps::MESH | proto::mesh::caps::ACCEPT_RELAY
+        );
+
+        // Старый клиент (v4) видит то же состояние: хвост он игнорирует, а
+        // участники/ключ на месте — проверяем, что GET_GROUP не сломался.
+        b.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().members.len(), 2);
+        // MESH_SEED — до 16 записей; больше сессий в тесте нет.
+        assert!(seed.len() <= payloads::MAX_MESH_SEED);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn невидимка_не_выдаётся_в_mesh_seed() {
+        let (server, dir) = test_server("mesh-invisible");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        a.sync();
+        // Невидимка публикует mesh-контакт, но её endpoint — тайна.
+        let inv = Raw::connect_with(
+            srv,
+            "ghost",
+            &proto::Identity::generate(),
+            hs::HELLO_FLAG_INVISIBLE,
+        );
+        inv.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&[0xCC; 32], 1));
+        inv.expect(ctrl::MESH_SEED);
+        a.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&[0xDD; 32], 1));
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.ed_pub == inv.pk),
+            "адрес невидимки утёк в MESH_SEED"
+        );
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -46,7 +46,10 @@ mod tests {
             assert!(is_fed(t));
             assert!(!crate::mesh::is_mesh(t));
             assert!(!crate::grp::is_group(t));
-            assert!(!crate::ctrl::is_plaintext(t), "федерация не ctrl-плейнтекст");
+            assert!(
+                !crate::ctrl::is_plaintext(t),
+                "федерация не ctrl-плейнтекст"
+            );
         }
         assert!(!is_fed(0x3F) && !is_fed(0x50));
         assert!(is_fed(SRV_HELLO) && is_fed(SRV_HELLO_ACK) && is_fed(FED_RELAY));

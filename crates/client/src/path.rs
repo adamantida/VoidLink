@@ -237,25 +237,25 @@ impl PathTable {
             }
         }
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for ip in parsed.keys() {
+            p.targets.entry(*ip).or_default().pin_broken = false;
+        }
         p.pins = parsed;
     }
 
     /// Закрепить (`Some`) или открепить (`None`) путь получателя.
     pub fn set_pin(&self, ip: u32, kind: Option<PathKind>) {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Запись получателя заводится и закреплением: иначе пересчёт не знал
+        // бы о цели, у которой ещё нет ни одного замера.
+        let t = p.targets.entry(ip).or_default();
+        t.pin_broken = false;
         match kind {
             Some(k) => {
                 p.pins.insert(ip, k);
-                // Новое закрепление проверяется сразу на следующем пересчёте.
-                if let Some(t) = p.targets.get_mut(&ip) {
-                    t.pin_broken = false;
-                }
             }
             None => {
                 p.pins.remove(&ip);
-                if let Some(t) = p.targets.get_mut(&ip) {
-                    t.pin_broken = false;
-                }
             }
         }
     }
@@ -297,15 +297,20 @@ impl PathTable {
 
     /// Замер RTT сервера (CTRL_PONG с меткой).
     pub fn record_server_rtt(&self, rtt_ms: u32, now_ms: u64) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .server = Some((rtt_ms, now_ms));
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).server = Some((rtt_ms, now_ms));
     }
 
     /// Замер маршрута через пира `via`: `up_ms` — мы→реле, `down_ms` —
     /// реле→получатель (из `MESH_ROUTE_OK`), `load` — загрузка реле 0..1.
-    pub fn record_peer_rtt(&self, ip: u32, via: [u8; 32], up_ms: u32, down_ms: u32, load: f64, now_ms: u64) {
+    pub fn record_peer_rtt(
+        &self,
+        ip: u32,
+        via: [u8; 32],
+        up_ms: u32,
+        down_ms: u32,
+        load: f64,
+        now_ms: u64,
+    ) {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let t = p.targets.entry(ip).or_default();
         t.peer = Some(PeerRoute {
@@ -395,23 +400,18 @@ impl PathTable {
     /// рассылает их событиями. `server_up` — есть ли связь с сервером.
     pub fn recalc(&self, now_ms: u64, server_up: bool) -> Vec<PathChange> {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let relay = p.relay_enabled;
-        let server = p.server;
         // Закрепления копируются: иначе нельзя одновременно держать
         // `targets.iter_mut()` и `pins.get()` (один и тот же `Paths`).
         let pins = p.pins.clone();
+        let ctx = Ctx {
+            server: p.server,
+            server_up,
+            relay: p.relay_enabled,
+            now_ms,
+        };
         let mut changes = Vec::new();
         for (ip, t) in p.targets.iter_mut() {
-            recalc_target_pinned(
-                *ip,
-                t,
-                pins.get(ip).copied(),
-                server,
-                server_up,
-                relay,
-                now_ms,
-                &mut changes,
-            );
+            recalc_target_pinned(*ip, t, pins.get(ip).copied(), ctx, &mut changes);
             // Закрепление переживает падение: «нерабочее» — не «удалённое».
         }
         changes
@@ -420,39 +420,46 @@ impl PathTable {
     /// Пересчёт одного получателя (движок может позвать точечно).
     pub fn recalc_one(&self, ip: u32, now_ms: u64, server_up: bool) -> Vec<PathChange> {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let relay = p.relay_enabled;
-        let server = p.server;
+        let ctx = Ctx {
+            server: p.server,
+            server_up,
+            relay: p.relay_enabled,
+            now_ms,
+        };
         let pin = p.pins.get(&ip).copied();
         let Some(t) = p.targets.get_mut(&ip) else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        recalc_target_pinned(ip, t, pin, server, server_up, relay, now_ms, &mut out);
+        recalc_target_pinned(ip, t, pin, ctx, &mut out);
         out
     }
 }
 
-/// Стоимость и RTT пути, если он сейчас доступен.
-fn cost_of(
-    t: &Target,
+/// Неизменяемые входы пересчёта: связь с сервером, режим релея, время.
+#[derive(Clone, Copy)]
+struct Ctx {
     server: Option<(u32, u64)>,
     server_up: bool,
     relay: bool,
     now_ms: u64,
-    kind: PathKind,
-) -> Option<(f64, Option<u32>)> {
+}
+
+/// Стоимость и RTT пути, если он сейчас доступен.
+fn cost_of(t: &Target, kind: PathKind, ctx: Ctx) -> Option<(f64, Option<u32>)> {
     match kind {
         PathKind::Direct => {
             let ms = t.direct_ms?;
-            (now_ms.saturating_sub(t.direct_at) <= DIRECT_FRESH_MS).then_some((ms as f64, Some(ms)))
+            (ctx.now_ms.saturating_sub(t.direct_at) <= DIRECT_FRESH_MS)
+                .then_some((ms as f64, Some(ms)))
         }
         PathKind::Server => {
-            if !server_up {
+            if !ctx.server_up {
                 return None;
             }
-            match server {
+            match ctx.server {
                 // Свежий замер — сравниваем по стоимости.
-                Some((rtt, at)) if now_ms.saturating_sub(at) <= SERVER_FRESH_MS => {
+                Some((rtt, at)) if ctx.now_ms.saturating_sub(at) <= SERVER_FRESH_MS => {
                     Some((rtt as f64 + HOP_PENALTY_SERVER_MS, Some(rtt)))
                 }
                 // Связь есть, RTT ещё не измерили: путь доступен, но пока
@@ -461,11 +468,11 @@ fn cost_of(
             }
         }
         PathKind::PeerRelay { via } => {
-            if !relay {
+            if !ctx.relay {
                 return None;
             }
             let r = t.peer?;
-            if r.via != via || now_ms.saturating_sub(r.at) > PEER_FRESH_MS {
+            if r.via != via || ctx.now_ms.saturating_sub(r.at) > PEER_FRESH_MS {
                 return None;
             }
             Some((r.cost(), Some(r.rtt())))
@@ -477,13 +484,10 @@ fn recalc_target_pinned(
     ip: u32,
     t: &mut Target,
     pin: Option<PathKind>,
-    server: Option<(u32, u64)>,
-    server_up: bool,
-    relay: bool,
-    now_ms: u64,
+    ctx: Ctx,
     out: &mut Vec<PathChange>,
 ) {
-    let cost = |t: &Target, kind: PathKind| cost_of(t, server, server_up, relay, now_ms, kind);
+    let cost = |t: &Target, kind: PathKind| cost_of(t, kind, ctx);
 
     // 1. Ручное закрепление сильнее автоматики.
     if let Some(want) = pin {
@@ -511,9 +515,12 @@ fn recalc_target_pinned(
         if !t.pin_broken {
             t.pin_broken = true;
             out.push(PathChange::Lost { ip, from: want });
+            // Снимаем текущий путь только при первом падении: дальше уже
+            // работает автоматика (с её гистерезисом), и сбрасывать её выбор
+            // каждый пересчёт нельзя.
+            t.current = None;
+            t.current_cost = None;
         }
-        t.current = None;
-        t.current_cost = None;
     }
 
     // 2. Автоматика: все доступные пути, лучший по стоимости.
@@ -578,7 +585,7 @@ fn recalc_target_pinned(
                 return;
             }
             // Ничего измеренного: сервер — единственный заведомо рабочий путь.
-            if server_up {
+            if ctx.server_up {
                 t.current = Some(PathKind::Server);
                 t.current_cost = None;
                 out.push(PathChange::Changed {
@@ -748,7 +755,13 @@ mod tests {
         // Сняли пин — автоматика возвращает прямой.
         t.set_pin(IP, None);
         let c = one(t.recalc(400, true));
-        assert!(matches!(c, PathChange::Changed { to: PathKind::Direct, .. }));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                to: PathKind::Direct,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1015,7 +1028,7 @@ mod tests {
             hs.push(std::thread::spawn(move || {
                 for j in 0..200u32 {
                     let now = (i * 1000 + j) as u64;
-                    t.record_direct_rtt(IP + (j % 3), (j % 90) as u32 + 1, now);
+                    t.record_direct_rtt(IP + (j % 3), (j % 90) + 1, now);
                     t.record_server_rtt(j % 80, now);
                     let _ = t.recalc(now, j % 2 == 0);
                     let _ = t.current(IP + (j % 3));

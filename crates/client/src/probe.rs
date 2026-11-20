@@ -51,10 +51,7 @@ impl ProbeState {
 
     /// Сколько проб ждёт ответа (диагностика/тесты).
     pub fn pending(&self) -> usize {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Начать пробу сервера. T2: сгенерировать nonce/ts, запомнить ожидание,
@@ -90,8 +87,8 @@ impl ProbeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnel_protocol::payloads::ProbeResp;
     use tunnel_protocol::ctrl;
+    use tunnel_protocol::payloads::ProbeResp;
 
     fn addr() -> SocketAddr {
         "203.0.113.9:5555".parse().unwrap()
@@ -101,13 +98,10 @@ mod tests {
         let started = Instant::now()
             .checked_sub(std::time::Duration::from_millis(ago_ms))
             .unwrap_or_else(Instant::now);
-        st.pending.lock().unwrap().insert(
-            nonce,
-            Pending {
-                started,
-                pinned,
-            },
-        );
+        st.pending
+            .lock()
+            .unwrap()
+            .insert(nonce, Pending { started, pinned });
     }
 
     fn resp(nonce: [u8; PROBE_NONCE_LEN], key: Option<[u8; 32]>) -> Vec<u8> {
@@ -123,14 +117,19 @@ mod tests {
         let st = ProbeState::new();
         let pin = [5u8; 32];
         track(&st, [1u8; PROBE_NONCE_LEN], Some(pin), 42);
-        let r = st.on_response(addr(), &resp([1u8; PROBE_NONCE_LEN], Some(pin))).unwrap();
+        let r = st
+            .on_response(addr(), &resp([1u8; PROBE_NONCE_LEN], Some(pin)))
+            .unwrap();
         assert_eq!(r.addr, addr());
         assert_eq!(r.key, Some(pin));
         assert_eq!(r.key_match, Some(true));
         assert!(r.rtt_ms.unwrap() >= 42, "RTT {:?}", r.rtt_ms);
         // Ответ учтён один раз: повтор (и подделка с тем же nonce) — не наша
         // проба.
-        assert!(st.on_response(addr(), &resp([1u8; PROBE_NONCE_LEN], Some(pin))).is_none());
+        assert!(
+            st.on_response(addr(), &resp([1u8; PROBE_NONCE_LEN], Some(pin)))
+                .is_none()
+        );
         assert_eq!(st.pending(), 0);
     }
 
@@ -138,17 +137,23 @@ mod tests {
     fn чужой_ключ_и_без_пина() {
         let st = ProbeState::new();
         track(&st, [2u8; PROBE_NONCE_LEN], Some([5u8; 32]), 1);
-        let r = st.on_response(addr(), &resp([2u8; PROBE_NONCE_LEN], Some([6u8; 32]))).unwrap();
+        let r = st
+            .on_response(addr(), &resp([2u8; PROBE_NONCE_LEN], Some([6u8; 32])))
+            .unwrap();
         assert_eq!(r.key_match, Some(false), "сервер отвечает чужим ключом");
         // Без закреплённого ключа сверять не с чем.
         let st = ProbeState::new();
         track(&st, [3u8; PROBE_NONCE_LEN], None, 1);
-        let r = st.on_response(addr(), &resp([3u8; PROBE_NONCE_LEN], Some([6u8; 32]))).unwrap();
+        let r = st
+            .on_response(addr(), &resp([3u8; PROBE_NONCE_LEN], Some([6u8; 32])))
+            .unwrap();
         assert_eq!(r.key_match, None);
         // Сервер не вернул ключ (want_key = 0) — rtt есть, сверки нет.
         let st = ProbeState::new();
         track(&st, [4u8; PROBE_NONCE_LEN], Some([5u8; 32]), 1);
-        let r = st.on_response(addr(), &resp([4u8; PROBE_NONCE_LEN], None)).unwrap();
+        let r = st
+            .on_response(addr(), &resp([4u8; PROBE_NONCE_LEN], None))
+            .unwrap();
         assert_eq!((r.key, r.key_match), (None, None));
     }
 
@@ -157,7 +162,10 @@ mod tests {
         let st = ProbeState::new();
         track(&st, [1u8; PROBE_NONCE_LEN], None, 0);
         // Не тот nonce, битая длина, пустой payload, мусор.
-        assert!(st.on_response(addr(), &resp([9u8; PROBE_NONCE_LEN], None)).is_none());
+        assert!(
+            st.on_response(addr(), &resp([9u8; PROBE_NONCE_LEN], None))
+                .is_none()
+        );
         for b in [
             vec![],
             vec![0u8; 23],
@@ -168,7 +176,10 @@ mod tests {
             assert!(st.on_response(addr(), &b).is_none());
         }
         // Ожидание не съедено мусором: настоящий ответ ещё принимается.
-        assert!(st.on_response(addr(), &resp([1u8; PROBE_NONCE_LEN], None)).is_some());
+        assert!(
+            st.on_response(addr(), &resp([1u8; PROBE_NONCE_LEN], None))
+                .is_some()
+        );
         // start_probe — честная ошибка до T2, не паника.
         let err = st.start_probe(addr(), 0).unwrap_err().to_string();
         assert!(err.contains("T2"), "{err}");

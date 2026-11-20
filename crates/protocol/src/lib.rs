@@ -47,9 +47,7 @@ pub use handshake::{
     CookieSecret, DirKeys, EphemeralKey, Hello3, PinResolution, Role, RotationLink, SessionKeys,
     Welcome, resolve_pin, session_keys,
 };
-pub use mesh::{
-    MeshForward, MeshHello, MeshHelloAck, MeshKeys, mesh_keys, x25519_distance,
-};
+pub use mesh::{MeshForward, MeshHello, MeshHelloAck, MeshKeys, mesh_keys, x25519_distance};
 pub use replay::ReplayWindow;
 
 pub const MAGIC: [u8; 4] = *b"TNL2";

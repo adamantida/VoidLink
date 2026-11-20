@@ -14,9 +14,9 @@ pub mod ipv6;
 /// Mesh-подсистема (L2) — каркас T3.
 pub mod mesh;
 pub mod path;
-pub mod profile;
 /// Проба сервера (PROBE_REQ/RESP) — каркас T2.
 pub mod probe;
+pub mod profile;
 pub mod remote;
 pub mod remote_cli;
 pub mod snapshot;

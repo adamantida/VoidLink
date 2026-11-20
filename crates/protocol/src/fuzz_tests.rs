@@ -48,7 +48,13 @@ fn mutate(rng: &mut StdRng, src: &[u8]) -> Vec<u8> {
 /// `mesh_ed` — ed-ключ, которого ждём в mesh-рукопожатии: на нём проверяется
 /// ветка «свой ключ → проверка просрочки и подписи», а не только дешёвый
 /// отказ по чужому ed.
-fn feed_all(b: &[u8], client_ed: &[u8; 32], client_eph: &[u8; 32], pin: &[u8; 32], mesh_ed: &[u8; 32]) {
+fn feed_all(
+    b: &[u8],
+    client_ed: &[u8; 32],
+    client_eph: &[u8; 32],
+    pin: &[u8; 32],
+    mesh_ed: &[u8; 32],
+) {
     let _ = dec_create_group(b);
     let _ = dec_gid(b);
     let _ = dec_gid_target(b);

@@ -330,7 +330,10 @@ mod tests {
         assert_eq!(cfg.mtu(), DEFAULT_MTU);
         // Этап 9: старый client.json без секции mesh и пинов читается.
         assert_eq!(cfg.mesh, MeshConfig::default());
-        assert!(cfg.mesh.enabled && cfg.mesh.relay_enabled, "mesh включается по умолчанию");
+        assert!(
+            cfg.mesh.enabled && cfg.mesh.relay_enabled,
+            "mesh включается по умолчанию"
+        );
         assert_eq!(cfg.mesh.relay_budget_kbps, DEFAULT_RELAY_KBPS);
         assert!(cfg.mesh.contacts.is_empty());
         assert!(cfg.pinned_paths.is_empty());

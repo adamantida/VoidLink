@@ -47,12 +47,7 @@ pub fn on_frame(_st: &MeshState, _src: SocketAddr, _typ: u8, _body: &[u8]) -> bo
 
 /// Собрать исходящий mesh-кадр (рукопожатие/RPC). `None` — T1: отправлять
 /// пока нечего; T3 заполнит.
-pub fn send_frame(
-    _st: &MeshState,
-    _to: SocketAddr,
-    _typ: u8,
-    _payload: &[u8],
-) -> Option<Vec<u8>> {
+pub fn send_frame(_st: &MeshState, _to: SocketAddr, _typ: u8, _payload: &[u8]) -> Option<Vec<u8>> {
     None
 }
 

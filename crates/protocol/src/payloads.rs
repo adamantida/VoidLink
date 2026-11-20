@@ -172,11 +172,7 @@ pub fn dec_update_mesh_tail(r: &mut Reader) -> Result<Vec<MeshEntry>> {
     let _magic = r.u32()?;
     let x_pub = r.pub_key()?;
     let caps = r.u8()?;
-    Ok(vec![MeshEntry {
-        ip: 0,
-        x_pub,
-        caps,
-    }])
+    Ok(vec![MeshEntry { ip: 0, x_pub, caps }])
 }
 
 // ---------- клиент -> сервер ----------
@@ -464,7 +460,11 @@ pub fn dec_mesh_seed(p: &[u8]) -> Result<Vec<MeshSeed>> {
         let ed_pub = r.pub_key()?;
         let x_pub = r.pub_key()?;
         if let Ok(addr) = r.str()?.parse() {
-            out.push(MeshSeed { ed_pub, x_pub, addr });
+            out.push(MeshSeed {
+                ed_pub,
+                x_pub,
+                addr,
+            });
         }
     }
     Ok(out)
@@ -1525,7 +1525,10 @@ pub(crate) mod tests {
         );
         // Хвост — ровно после участников, ничего не сдвинулось.
         assert_eq!(&enc[..plain.len()], &plain[..]);
-        assert_eq!(u32::from_be_bytes(enc[plain.len()..plain.len() + 4].try_into().unwrap()), MESH_MAGIC);
+        assert_eq!(
+            u32::from_be_bytes(enc[plain.len()..plain.len() + 4].try_into().unwrap()),
+            MESH_MAGIC
+        );
         // Пустой mesh не кодируется: старые серверы не платят за фичу.
         assert_eq!(
             enc_group_state(&GroupState {
@@ -1538,7 +1541,10 @@ pub(crate) mod tests {
         // короче магии — «чужое расширение» и тоже игнорируется.
         assert_eq!(dec_group_state(&enc[..plain.len()]).unwrap(), group_state());
         for n in plain.len() + 1..plain.len() + 4 {
-            assert!(dec_group_state(&enc[..n]).is_ok(), "хвост короче магии: {n}");
+            assert!(
+                dec_group_state(&enc[..n]).is_ok(),
+                "хвост короче магии: {n}"
+            );
         }
         // Обрезка внутри хвоста (магия и записи) — ошибка.
         for n in plain.len() + 4..enc.len() {
@@ -1572,11 +1578,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            dec_mesh_section(&mut Reader::new(&[]))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(dec_mesh_section(&mut Reader::new(&[])).unwrap().is_empty());
     }
 
     #[test]
@@ -1613,23 +1615,34 @@ pub(crate) mod tests {
             mesh: Vec::new(),
             ..u.clone()
         };
-        assert!(dec_group_update(&enc_group_update(&no_mesh)).unwrap().mesh.is_empty());
+        assert!(
+            dec_group_update(&enc_group_update(&no_mesh))
+                .unwrap()
+                .mesh
+                .is_empty()
+        );
         // Обрезка внутри хвоста — ошибка; ровно без хвоста (и короче магии) —
         // валидно, хвост считается чужим/отсутствующим.
         let base = enc_group_update(&no_mesh);
         assert_eq!(dec_group_update(&enc[..base.len()]).unwrap().mesh, vec![]);
         for n in base.len() + 1..base.len() + 4 {
-            assert!(dec_group_update(&enc[..n]).is_ok(), "хвост короче магии: {n}");
+            assert!(
+                dec_group_update(&enc[..n]).is_ok(),
+                "хвост короче магии: {n}"
+            );
         }
         for n in base.len() + 4..enc.len() {
             assert!(dec_group_update(&enc[..n]).is_err(), "обрезка до {n}");
         }
         // Хвост не для kind 1 не кодируется (у Removed/Meta нет x_pub).
-        for delta in [GroupDelta::Removed([7; 32]), GroupDelta::Meta {
-            name: "n".into(),
-            owner: [8; 32],
-            private: false,
-        }] {
+        for delta in [
+            GroupDelta::Removed([7; 32]),
+            GroupDelta::Meta {
+                name: "n".into(),
+                owner: [8; 32],
+                private: false,
+            },
+        ] {
             let u = GroupUpdate {
                 delta,
                 mesh: vec![MeshEntry {
@@ -1640,27 +1653,42 @@ pub(crate) mod tests {
                 ..u.clone()
             };
             let enc = enc_group_update(&u);
-            assert_eq!(enc, enc_group_update(&GroupUpdate {
-                mesh: Vec::new(),
-                ..u.clone()
-            }));
+            assert_eq!(
+                enc,
+                enc_group_update(&GroupUpdate {
+                    mesh: Vec::new(),
+                    ..u.clone()
+                })
+            );
             assert!(dec_group_update(&enc).unwrap().mesh.is_empty());
         }
     }
 
     #[test]
     fn mesh_info_и_server_hint() {
-        let enc = enc_mesh_info(&[0xAB; 32], crate::mesh::caps::MESH | crate::mesh::caps::RELAY);
+        let enc = enc_mesh_info(
+            &[0xAB; 32],
+            crate::mesh::caps::MESH | crate::mesh::caps::RELAY,
+        );
         assert_eq!(enc.len(), 33);
         assert_eq!(
             dec_mesh_info(&enc).unwrap(),
-            ([0xAB; 32], crate::mesh::caps::MESH | crate::mesh::caps::RELAY)
+            (
+                [0xAB; 32],
+                crate::mesh::caps::MESH | crate::mesh::caps::RELAY
+            )
         );
         truncations_fail(&enc, dec_mesh_info);
         // Хвост после известных полей допускается (расширение без смены версии).
         let mut tail = enc.clone();
         tail.push(0);
-        assert_eq!(dec_mesh_info(&tail).unwrap(), ([0xAB; 32], crate::mesh::caps::MESH | crate::mesh::caps::RELAY));
+        assert_eq!(
+            dec_mesh_info(&tail).unwrap(),
+            (
+                [0xAB; 32],
+                crate::mesh::caps::MESH | crate::mesh::caps::RELAY
+            )
+        );
 
         let items = vec![
             ServerHint {
@@ -1698,7 +1726,10 @@ pub(crate) mod tests {
         let enc = enc_probe_req(&req);
         assert_eq!(enc.len(), PROBE_REQ_LEN, "запрос всегда 64 байта");
         assert_eq!(dec_probe_req(&enc).unwrap(), req);
-        assert!(enc[PROBE_NONCE_LEN + 8 + 1..].iter().all(|b| *b == 0), "падинг нулевой");
+        assert!(
+            enc[PROBE_NONCE_LEN + 8 + 1..].iter().all(|b| *b == 0),
+            "падинг нулевой"
+        );
         // Ответ не длиннее запроса при любом want_key.
         let key = [9u8; 32];
         let with_key = enc_probe_resp(&ProbeResp {
@@ -1711,7 +1742,10 @@ pub(crate) mod tests {
             ts_ms: req.ts_ms,
             ed_pub: None,
         });
-        assert_eq!((with_key.len(), without.len()), (PROBE_RESP_KEY_LEN, PROBE_RESP_LEN));
+        assert_eq!(
+            (with_key.len(), without.len()),
+            (PROBE_RESP_KEY_LEN, PROBE_RESP_LEN)
+        );
         assert!(with_key.len() <= enc.len() && without.len() <= enc.len());
         assert_eq!(
             dec_probe_resp(&with_key).unwrap(),
@@ -1735,7 +1769,10 @@ pub(crate) mod tests {
         }
         assert!(dec_probe_req(&[0u8; PROBE_REQ_LEN + 1]).is_err());
         for n in 0..PROBE_RESP_LEN {
-            assert!(dec_probe_resp(&without[..n]).is_err(), "обрезка ответа до {n}");
+            assert!(
+                dec_probe_resp(&without[..n]).is_err(),
+                "обрезка ответа до {n}"
+            );
         }
         assert!(dec_probe_resp(&[0u8; PROBE_RESP_LEN + 1]).is_err());
         assert!(dec_probe_resp(&[0u8; PROBE_RESP_KEY_LEN - 1]).is_err());
@@ -1785,7 +1822,10 @@ pub(crate) mod tests {
                 addr: sa("10.0.0.1:1"),
             })
             .collect();
-        assert_eq!(dec_mesh_seed(&enc_mesh_seed(&many)).unwrap().len(), MAX_MESH_SEED);
+        assert_eq!(
+            dec_mesh_seed(&enc_mesh_seed(&many)).unwrap().len(),
+            MAX_MESH_SEED
+        );
     }
 
     #[test]

@@ -1920,7 +1920,11 @@ pub fn start_with_tun(
         if c.activate_server(server) {
             save(&c);
         }
-        (server_label(&c, server), c.pinned_paths.clone(), c.mesh.enabled)
+        (
+            server_label(&c, server),
+            c.pinned_paths.clone(),
+            c.mesh.enabled,
+        )
     };
     let meta = Arc::new(Mutex::new(Meta {
         connected: false,
@@ -3042,9 +3046,7 @@ pub fn check_cfg_cmd(cfg: &Config, current: SocketAddr, cmd: &Cmd) -> Option<Str
                 return Some(format!("{} — не адрес оверлея", proto::ip_str(*ip)));
             }
             match path {
-                PathKind::PeerRelay { via } if *via == [0u8; 32] => {
-                    Some("у реле нет ключа".into())
-                }
+                PathKind::PeerRelay { via } if *via == [0u8; 32] => Some("у реле нет ключа".into()),
                 _ => None,
             }
         }
@@ -3446,15 +3448,20 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         ctrl::CTRL_PONG => {
             // RTT до сервера: 8-байтовая метка в payload отличает наш ответ
             // от чужого/запоздалого. Пустой payload — старый сервер без метки:
-            // «RTT неизвестен», но ответ подлинный.
-            let label: Option<u64> = if payload.len() == 8 {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(payload);
-                Some(u64::from_be_bytes(b))
-            } else {
-                None
+            // «RTT неизвестен», но ответ подлинный. Прочая длина — не метка и
+            // не старый ответ: не трогаем ожидание.
+            let label: Option<u64> = match payload.len() {
+                0 => None,
+                8 => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(payload);
+                    Some(u64::from_be_bytes(b))
+                }
+                _ => return,
             };
-            let Some(p) = st.pending_ping.take() else { return };
+            let Some(p) = st.pending_ping.take() else {
+                return;
+            };
             if label.is_some_and(|l| l != p.label) {
                 // Не наша метка: ожидание не съедаем (ответ придёт отдельно).
                 st.pending_ping = Some(p);
@@ -4807,5 +4814,253 @@ mod tests {
         assert_eq!(fmt_secs(42 * 60), "42 мин");
         assert_eq!(fmt_secs(5 * 3600 + 600), "5 ч 10 мин");
         assert_eq!(fmt_secs(7 * 86_400), "7 д 0 ч");
+    }
+
+    // ---------- этап 9: CTRL_PONG с меткой, пути, проба ----------
+
+    /// Заглушка адаптера: движку для тестов Env адаптер не нужен.
+    struct NullTun;
+
+    impl TunDev for NullTun {
+        fn inject(&self, _packet: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_address(&self, _ip: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Минимальный `Env` без потоков: мета/группы/сокет/таблица путей.
+    fn test_env(server: SocketAddr) -> (Arc<Env>, mpsc::Receiver<Event>) {
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let meta = Arc::new(Mutex::new(Meta {
+            connected: true,
+            transport: Transport::Udp,
+            server,
+            server_label: String::new(),
+            group_list: Vec::new(),
+            rx_hist: VecDeque::new(),
+            tx_hist: VecDeque::new(),
+            started: Instant::now(),
+            server_rtt_ms: None,
+            mesh_enabled: true,
+            relay_bytes: 0,
+        }));
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let paths = Arc::new(PathTable::new(&std::collections::BTreeMap::new()));
+        let env = Arc::new(Env {
+            groups: Arc::new(Mutex::new(HashMap::new())),
+            meta,
+            stats: Arc::new(Stats::new()),
+            ev: ev_tx,
+            cfg: Arc::new(Mutex::new(Config::default())),
+            save: Arc::new(|_| {}),
+            identity: proto::Identity::generate(),
+            server: Mutex::new(server),
+            sock,
+            tcp: Mutex::new(None),
+            tun: Arc::new(NullTun),
+            quit: AtomicBool::new(false),
+            key_log: KeyLog::default(),
+            mesh: Arc::new(Mutex::new(mesh::MeshState::new(true))),
+            dht: Arc::new(Mutex::new(dht::Dht::new())),
+            paths: paths.clone(),
+            probes: Arc::new(probe::ProbeState::new()),
+        });
+        (env, ev_rx)
+    }
+
+    fn pending(label: u64, report: bool) -> PendingPong {
+        PendingPong {
+            addr: "203.0.113.9:5555".parse().unwrap(),
+            label,
+            at: Instant::now() - Duration::from_millis(30),
+            report,
+        }
+    }
+
+    #[test]
+    fn ctrl_pong_метка_даёт_rtt_и_питает_таблицу_путей() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, ev) = test_env(server);
+        let mut st = State::new([1; 32]);
+        // Явный пинг: RTT по совпавшей метке + событие.
+        st.pending_ping = Some(pending(42, true));
+        on_ctrl(&env, &mut st, ctrl::CTRL_PONG, &42u64.to_be_bytes());
+        match ev.try_recv().expect("нет события") {
+            Event::ServerPingResult {
+                addr,
+                rtt_ms: Some(rtt),
+                success: true,
+            } => {
+                assert_eq!(addr, server);
+                assert!(rtt >= 30, "RTT {rtt}");
+            }
+            other => panic!("неожиданное событие: {other:?}"),
+        }
+        assert!(ev.try_recv().is_err());
+        assert!(st.pending_ping.is_none());
+        assert!(env.meta.lock().unwrap().server_rtt_ms.is_some());
+        assert!(
+            env.paths.server_rtt().is_some(),
+            "RTT сервера — в таблицу путей"
+        );
+
+        // Периодический замер (report = false): RTT записан, события нет.
+        st.pending_ping = Some(pending(43, false));
+        on_ctrl(&env, &mut st, ctrl::CTRL_PONG, &43u64.to_be_bytes());
+        assert!(ev.try_recv().is_err(), "молчаливый замер не шлёт событие");
+        assert!(st.pending_ping.is_none());
+
+        // Чужая метка: это не наш ответ — ожидание не съедаем, RTT не врём.
+        st.pending_ping = Some(pending(7, true));
+        on_ctrl(&env, &mut st, ctrl::CTRL_PONG, &8u64.to_be_bytes());
+        assert!(st.pending_ping.is_some());
+        assert!(ev.try_recv().is_err());
+
+        // Пустой payload (старый сервер без метки): ответ подлинный, RTT
+        // неизвестен — событие есть, замер не пишется.
+        let before = env.paths.server_rtt();
+        st.pending_ping = Some(pending(7, true));
+        on_ctrl(&env, &mut st, ctrl::CTRL_PONG, &[]);
+        match ev.try_recv().expect("нет события") {
+            Event::ServerPingResult {
+                rtt_ms: None,
+                success: true,
+                ..
+            } => {}
+            other => panic!("неожиданное событие: {other:?}"),
+        }
+        assert!(st.pending_ping.is_none());
+        assert_eq!(env.paths.server_rtt(), before);
+
+        // Мусорная длина (не 8 и не 0) — не наша метка: ожидание цело.
+        st.pending_ping = Some(pending(9, true));
+        on_ctrl(&env, &mut st, ctrl::CTRL_PONG, &[1, 2, 3]);
+        assert!(st.pending_ping.is_some());
+        // Без ожидания PONG ничего не делает (не паникует).
+        st.pending_ping = None;
+        on_ctrl(&env, &mut st, ctrl::CTRL_PONG, &[]);
+        assert!(ev.try_recv().is_err());
+    }
+
+    #[test]
+    fn paths_round_заводит_участников_и_шлёт_событие_пути() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, ev) = test_env(server);
+        // Участник с прямым каналом и замером RTT.
+        let mut g = GroupSess::new(
+            &payloads::GroupState {
+                gid: 1,
+                rev: 1,
+                epoch: 1,
+                revoke_prev: false,
+                name: "g".into(),
+                owner: [1; 32],
+                private: false,
+                key: [2; 32],
+                deleted: false,
+                my_ip: 0x6442_0001,
+                members: Vec::new(),
+                mesh: Vec::new(),
+            },
+            Instant::now(),
+            KeyLog::default(),
+        );
+        let peer_ip = 0x6442_0102;
+        g.members.insert(
+            peer_ip,
+            PeerSess {
+                pubkey: [3; 32],
+                name: "bravo".into(),
+                status: String::new(),
+                online: true,
+                ip: peer_ip,
+                endpoint: None,
+                candidates: Vec::new(),
+                direct_addr: Some("198.51.100.7:4000".parse().unwrap()),
+                last_rx: Instant::now(),
+                last_direct: Some(Instant::now()),
+                rtt_ms: Some(20),
+            },
+        );
+        env.groups.lock().unwrap().insert(1, g);
+        env.paths.record_server_rtt(50, 0);
+        // Прямой замер приходит из RTT-раунда (PONG по прямому каналу).
+        env.paths.record_direct_rtt(peer_ip, 20, 0);
+        paths_round(&env, true, Instant::now());
+        // Сервер подключён и прямой канал дешевле → путь Direct; событие —
+        // PathChanged, и в снимке у участника будет путь.
+        match ev.try_recv().expect("нет события пути") {
+            Event::PathChanged {
+                ip,
+                name,
+                path: PathKind::Direct,
+                ..
+            } => {
+                assert_eq!((ip, name.as_str()), (peer_ip, "bravo"));
+            }
+            other => panic!("неожиданное событие: {other:?}"),
+        }
+        assert_eq!(env.paths.current(peer_ip), Some(PathKind::Direct));
+        // Второй раунд без изменений — без событий.
+        paths_round(&env, true, Instant::now());
+        assert!(ev.try_recv().is_err());
+    }
+
+    #[test]
+    fn проба_сервера_пока_не_реализована_но_не_паникует() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, ev) = test_env(server);
+        let mut st = State::new([1; 32]);
+        do_cmd(&env, &mut st, Cmd::ProbeServer { addr: server });
+        match ev.try_recv().expect("нет события пробы") {
+            Event::ProbeResult {
+                addr,
+                success: false,
+                rtt_ms: None,
+                key_match: None,
+            } => assert_eq!(addr, server),
+            other => panic!("неожиданное событие: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn команды_путей_пишут_конфиг_и_таблицу() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, ev) = test_env(server);
+        let mut st = State::new([1; 32]);
+        let ip = 0x6442_0102;
+        do_cmd(
+            &env,
+            &mut st,
+            Cmd::PinPath {
+                ip,
+                path: PathKind::Server,
+            },
+        );
+        assert_eq!(
+            env.cfg.lock().unwrap().pinned_paths.get("100.66.1.2"),
+            Some(&"server".to_string())
+        );
+        assert_eq!(env.paths.pin_of(ip), Some(PathKind::Server));
+        do_cmd(&env, &mut st, Cmd::SetRelayEnabled(false));
+        assert!(!env.cfg.lock().unwrap().mesh.relay_enabled);
+        do_cmd(&env, &mut st, Cmd::SetMeshEnabled(false));
+        assert!(!env.cfg.lock().unwrap().mesh.enabled);
+        assert!(!env.mesh.lock().unwrap().enabled());
+        assert!(!env.meta.lock().unwrap().mesh_enabled);
+        do_cmd(&env, &mut st, Cmd::UnpinPath { ip });
+        assert!(env.cfg.lock().unwrap().pinned_paths.is_empty());
+        assert_eq!(env.paths.pin_of(ip), None);
+        // Все команды — локальные: по сети ничего не ушло, но и Notic'ов
+        // ровно по одному на команду.
+        let mut notices = 0;
+        while let Ok(ev) = ev.try_recv() {
+            if matches!(ev, Event::Notice(_)) {
+                notices += 1;
+            }
+        }
+        assert_eq!(notices, 4);
     }
 }

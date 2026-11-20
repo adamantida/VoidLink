@@ -352,7 +352,8 @@ impl MeshForward {
         let inner_len = u16::try_from(self.inner.len()).map_err(|_| {
             anyhow::anyhow!("mesh forward: inner {} не влезает в u16", self.inner.len())
         })?;
-        let mut v = Vec::with_capacity(MESH_FORWARD_MIN + self.visited.len() * 32 + self.inner.len());
+        let mut v =
+            Vec::with_capacity(MESH_FORWARD_MIN + self.visited.len() * 32 + self.inner.len());
         put_pub(&mut v, &self.dst_ed);
         put_pub(&mut v, &self.src_ed);
         v.push(self.hops);
@@ -393,8 +394,14 @@ impl MeshForward {
             hops as usize == visited.len(),
             "mesh forward: hops {hops} != visited {vlen}"
         );
-        ensure!(!visited.contains(&dst_ed), "mesh forward: получатель в visited");
-        ensure!(!visited.contains(&src_ed), "mesh forward: источник в visited");
+        ensure!(
+            !visited.contains(&dst_ed),
+            "mesh forward: получатель в visited"
+        );
+        ensure!(
+            !visited.contains(&src_ed),
+            "mesh forward: источник в visited"
+        );
         let inner_len = r.u16()? as usize;
         ensure!(
             inner_len <= MAX_GROUP_PAYLOAD,
@@ -441,7 +448,13 @@ mod tests {
     }
 
     fn hello(me: &Identity, e: &EphemeralKey) -> MeshHello {
-        MeshHello::new(me, e.public(), [7u8; MESH_NONCE_LEN], 1_700_000_000_000, caps::MESH)
+        MeshHello::new(
+            me,
+            e.public(),
+            [7u8; MESH_NONCE_LEN],
+            1_700_000_000_000,
+            caps::MESH,
+        )
     }
 
     #[test]
@@ -460,8 +473,14 @@ mod tests {
         let err = got.verify_from(&b.ed_pub(), 1_700_000_000_000).unwrap_err();
         assert!(format!("{err:#}").contains("чужой ed"), "{err:#}");
         // Просрочка/будущее — отказ.
-        assert!(got.verify_from(&a.ed_pub(), 1_700_000_000_000 + MESH_TS_SKEW_MS + 1).is_err());
-        assert!(got.verify_from(&a.ed_pub(), 1_700_000_000_000 - MESH_TS_SKEW_MS - 1).is_err());
+        assert!(
+            got.verify_from(&a.ed_pub(), 1_700_000_000_000 + MESH_TS_SKEW_MS + 1)
+                .is_err()
+        );
+        assert!(
+            got.verify_from(&a.ed_pub(), 1_700_000_000_000 - MESH_TS_SKEW_MS - 1)
+                .is_err()
+        );
         // Подмена любого подписанного поля — отказ.
         for i in 0..MESH_HELLO_LEN - 64 {
             let mut t = body.clone();

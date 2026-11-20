@@ -11,8 +11,8 @@
 
 use std::net::SocketAddr;
 
-use tunnel_protocol::payloads::ServerHint;
 use tunnel_protocol::federation;
+use tunnel_protocol::payloads::ServerHint;
 
 use crate::Shared;
 

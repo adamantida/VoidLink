@@ -17,8 +17,8 @@
 
 use std::net::SocketAddr;
 
-use tunnel_protocol::payloads::{self as pl, ProbeResp};
 use tunnel_protocol::ctrl;
+use tunnel_protocol::payloads::{self as pl, ProbeResp};
 
 use crate::{Shared, metrics};
 
@@ -57,14 +57,12 @@ pub(crate) fn handle_probe_req(sh: &Shared, src: SocketAddr, body: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnel_protocol::payloads::{PROBE_REQ_LEN, PROBE_RESP_KEY_LEN, PROBE_RESP_LEN};
+    use tunnel_protocol::payloads::PROBE_REQ_LEN;
 
     #[test]
     fn ответ_не_длиннее_запроса() {
         // Формат: ответ 24/56, запрос ровно 64 — правило выполняется всегда,
         // при любом want_key.
-        assert!(PROBE_RESP_KEY_LEN <= PROBE_REQ_LEN);
-        assert!(PROBE_RESP_LEN <= PROBE_REQ_LEN);
         let req = pl::ProbeReq {
             nonce: [1u8; pl::PROBE_NONCE_LEN],
             ts_ms: 1_700_000_000_000,
