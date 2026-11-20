@@ -40,11 +40,14 @@
 //!   dns on|off                  — встроенный DNS для имён пиров (*.vl)
 //!   invisible on|off            — невидимка (другие видят нас офлайн)
 //!   run                         — поднять туннель (autojoin-группы)
-//!   tui [--embedded|--remote]   — интерфейс: при работающем демоне — тонкий
-//!                                 клиент (без прав админа), иначе свой движок
+//!   tui [--embedded|--remote|--offline] — интерфейс: при работающем демоне —
+//!                                 тонкий клиент (без прав админа), иначе
+//!                                 офлайн-TUI; --embedded — свой движок
 //!
-//! Если в конфиге нет имени или серверов, `tui` сначала показывает
-//! экран первичной настройки (tui::setup): имя, сервер, адаптер, dll.
+//! TUI открывается всегда (этап 9, §3.8): без серверов — пилюля «нет
+//! сервера», без демона — офлайн-режим (правки копятся в `ui-pending.json`
+//! и уходят демону, когда он появится). Экран первичной настройки
+//! (tui::setup) показывается, только если в конфиге нет имени.
 //!
 //! Демон (PLAN.md 7.4): если он доступен, сетевые команды и правки конфига
 //! идут ему по IPC (`remote_cli`) — свой ctrl-сеанс вытеснил бы его сессию.
@@ -69,8 +72,12 @@ use store::{Config, StoredFriend, StoredServer};
 /// Режим TUI, заданный флагом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiMode {
+    /// Свой движок в этом процессе.
     Embedded,
+    /// Только тонкий клиент демона (демона нет — ошибка).
     Remote,
+    /// Офлайн-TUI: демона не ищем, правки копятся в `ui-pending.json`.
+    Offline,
 }
 
 /// Глобальные флаги CLI (в любом месте командной строки).
@@ -151,14 +158,14 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
         } else if a == "--debug" {
             g.debug = true;
             args.remove(i);
-        } else if a == "--embedded" || a == "--remote" {
-            let m = if a == "--embedded" {
-                UiMode::Embedded
-            } else {
-                UiMode::Remote
+        } else if a == "--embedded" || a == "--remote" || a == "--offline" {
+            let m = match a {
+                "--embedded" => UiMode::Embedded,
+                "--remote" => UiMode::Remote,
+                _ => UiMode::Offline,
             };
             if g.ui_mode.is_some_and(|x| x != m) {
-                bail!("--embedded и --remote взаимоисключающие");
+                bail!("--embedded, --remote и --offline взаимоисключающие");
             }
             g.ui_mode = Some(m);
             args.remove(i);
@@ -883,27 +890,20 @@ fn main() -> Result<()> {
         "run" | "tui" | "ui" => {
             let tui_mode = cmd != "run";
             if !tui_mode && ui_mode.is_some() {
-                bail!("--embedded / --remote — только для tui");
+                bail!("--embedded / --remote / --offline — только для tui");
             }
-            // tui: демон есть → тонкий клиент; Hello не прошёл → ошибка без
-            // фолбэка (два движка с одной identity выбивают друг друга).
-            if tui_mode && ui_mode != Some(UiMode::Embedded) {
-                let ep = Endpoint::for_data_dir(&dir);
-                let live = ep.open().with_context(|| {
-                    format!("демон ({}) есть, но подключиться нельзя", ep.describe())
-                })?;
-                match live {
-                    Some(_probe) => return run_remote_tui(&ep, &dir, &cfg),
-                    None if ui_mode == Some(UiMode::Remote) => {
-                        bail!(
-                            "демон не запущен ({}); без --remote tui поднимет свой движок",
-                            ep.describe()
-                        )
-                    }
-                    None => {}
-                }
+            if tui_mode {
+                return run_tui(
+                    &dir,
+                    &mut cfg,
+                    &identity,
+                    ui_mode,
+                    server_sel.as_deref(),
+                    &mut adapter,
+                    &mut dll,
+                );
             }
-            // Свой движок: замок single-instance (демон / другой TUI / run).
+            // Консольный `run`: свой движок, замок single-instance.
             let _lock = match InstanceLock::acquire(&dir) {
                 Ok(l) => l,
                 Err(LockError::Busy) => bail!(
@@ -912,28 +912,6 @@ fn main() -> Result<()> {
                 ),
                 Err(e) => bail!("{e}"),
             };
-            // Первичная настройка: если конфиг не заполнен (нет имени или
-            // серверов) и флаги не заданы — спрашиваем прямо в TUI, до старта
-            // движка. Консольному `run` достаточно CLI-подсказки.
-            if tui_mode && (cfg.name.is_empty() || cfg.servers.is_empty()) {
-                // Свой движок: адаптер и dll — наши, спрашиваем и запоминаем.
-                if !tui::setup::run(
-                    &mut cfg,
-                    &mut adapter,
-                    &mut dll,
-                    true,
-                    &identity.friend_code(),
-                )? {
-                    bail!(
-                        "настройка не завершена; запусти ещё раз или задай параметры командами CLI"
-                    );
-                }
-                // Адаптер и dll — в конфиг: иначе введённое при первом старте
-                // терялось и следующий запуск спрашивал бы заново.
-                cfg.adapter = adapter.clone();
-                cfg.dll = dll.clone().unwrap_or_default();
-                save(&cfg)?;
-            }
             if cfg.name.is_empty() {
                 bail!(
                     "задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)"
@@ -943,16 +921,11 @@ fn main() -> Result<()> {
             save(&cfg)?;
             let cfg = Arc::new(cfg);
             let store = Arc::new(store::Store::new(&dir));
-            if !tui_mode {
-                // Автовход, ротация ключа сервера, невидимка — в client.json.
-                let save_store = store.clone();
-                let save = Arc::new(move |c: &Config| {
-                    let _ = save_store.save(c);
-                });
-                engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll, save)?;
-            } else {
-                tui::run(cfg, server, pub_key, identity.clone(), &adapter, dll, store)?;
-            }
+            let save_store = store.clone();
+            let save = Arc::new(move |c: &Config| {
+                let _ = save_store.save(c);
+            });
+            engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll, save)?;
         }
         other => {
             eprintln!("неизвестная команда: {other:?}");
@@ -963,12 +936,109 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// `tui` тонким клиентом демона. Первичная настройка — командами демону.
-fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Result<()> {
+/// `tui`: открывается всегда (этап 9, §3.8). Выбор режима:
+/// 1. `--embedded` — свой движок (TUN, InstanceLock, первичная настройка);
+/// 2. живой демон с движком — тонкий клиент по IPC;
+/// 3. демон без движка / демона нет — офлайн-TUI: конфиг правится локально,
+///    очередь `ui-pending.json` уходит демону, когда тот появится.
+///
+/// Без серверов TUI тоже открывается (пилюля «○ нет сервера», F3/F4) —
+/// настройка не блокирует интерфейс.
+fn run_tui(
+    dir: &std::path::Path,
+    cfg: &mut Config,
+    identity: &proto::Identity,
+    ui_mode: Option<UiMode>,
+    server_sel: Option<&str>,
+    adapter: &mut String,
+    dll: &mut Option<String>,
+) -> Result<()> {
     use tunnel_client::api::EngineApi;
-    let eng = IpcEngine::connect(ep, Some(dir.to_path_buf()))?;
+    match ui_mode {
+        Some(UiMode::Embedded) => {
+            return run_embedded_tui(dir, cfg, identity, server_sel, adapter, dll);
+        }
+        Some(UiMode::Offline) => return run_offline_tui(dir, cfg, identity, None),
+        _ => {}
+    }
+    let ep = Endpoint::for_data_dir(dir);
+    match IpcEngine::connect(&ep, Some(dir.to_path_buf())) {
+        Ok(eng) => {
+            let snap = eng.snapshot();
+            if snap.meta.offline {
+                // Демон есть, движка в нём нет (TUN/сервер): офлайн с причиной.
+                let reason = snap
+                    .meta
+                    .offline_reason
+                    .clone()
+                    .unwrap_or_else(|| "демон без движка".to_string());
+                drop(eng);
+                return run_offline_tui(dir, cfg, identity, Some(reason));
+            }
+            run_thin_tui(eng, dir, cfg)
+        }
+        Err(e) => {
+            if ui_mode == Some(UiMode::Remote) {
+                // Явно просили тонкий клиент — без молчаливого фолбэка.
+                return Err(e);
+            }
+            // Демона нет — штатный офлайн; демон есть, но не отвечает —
+            // офлайн с причиной.
+            let reason = match ep.open() {
+                Ok(None) => None,
+                _ => Some(e.to_string()),
+            };
+            run_offline_tui(dir, cfg, identity, reason)
+        }
+    }
+}
+
+/// Свой движок в этом процессе (`--embedded`): замок single-instance и
+/// первичная настройка с адаптером (нужны права на TUN).
+fn run_embedded_tui(
+    dir: &std::path::Path,
+    cfg: &mut Config,
+    identity: &proto::Identity,
+    server_sel: Option<&str>,
+    adapter: &mut String,
+    dll: &mut Option<String>,
+) -> Result<()> {
+    // Свой движок: замок single-instance (демон / другой TUI / run).
+    let _lock = match InstanceLock::acquire(dir) {
+        Ok(l) => l,
+        Err(LockError::Busy) => bail!(
+            "движок уже запущен (embedded TUI, run или демон без IPC) — второй с той же identity \
+выбил бы его с сервера; закройте его или подключайтесь к демону"
+        ),
+        Err(e) => bail!("{e}"),
+    };
+    if cfg.name.is_empty() || cfg.servers.is_empty() {
+        // Свой движок: адаптер и dll — наши, спрашиваем и запоминаем.
+        if !tui::setup::run(cfg, adapter, dll, true, &identity.friend_code())? {
+            bail!("настройка не завершена; запусти ещё раз или задай параметры командами CLI");
+        }
+        cfg.adapter = adapter.clone();
+        cfg.dll = dll.clone().unwrap_or_default();
+        save_cfg(dir, cfg)?;
+    }
+    if cfg.name.is_empty() {
+        bail!(
+            "задай имя: set-name <имя> (или запусти `tunnel-client tui --embedded` — настройка там)"
+        );
+    }
+    let (server, pub_key) = pick_server(cfg, server_sel)?;
+    save_cfg(dir, cfg)?;
+    let cfg = Arc::new(cfg.clone());
+    let store = Arc::new(store::Store::new(dir));
+    tui::run(cfg, server, pub_key, identity.clone(), adapter, dll.clone(), store)
+}
+
+/// Тонкий клиент демона с живым движком. Без имени — первичная настройка
+/// командами демону (без серверов TUI открывается: пилюля «нет сервера»).
+fn run_thin_tui(eng: IpcEngine, dir: &std::path::Path, cfg: &mut Config) -> Result<()> {
+    use tunnel_client::api::EngineApi;
     let snap = eng.snapshot();
-    if snap.cfg.name.is_empty() || snap.cfg.servers.is_empty() {
+    if snap.cfg.name.trim().is_empty() {
         let mut c = snap.cfg.to_config();
         // Адаптер и dll в тонком режиме задаёт демон (служба): спрашивать их
         // здесь нельзя — поле было бы обязательным, а применять его некуда,
@@ -999,14 +1069,55 @@ fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Resul
         // иначе настройка молча пропала бы (имя/сервер не сохранены).
         let want: Vec<String> = c.servers.iter().map(|s| s.addr.clone()).collect();
         wait_daemon_cfg(&eng, &c.name, &want, std::time::Duration::from_secs(10))?;
+        cfg.name = c.name.clone();
+        cfg.servers = c.servers.clone();
     }
-    // Тема — локальная: ui.json (client.json при демоне — его).
-    let mut ui = local.clone();
+    // Тема — локальная (ui.json); остальное App берёт из снимка демона.
+    let ui = ui_cfg(dir, cfg);
+    tui::run_remote(eng, &ui)
+}
+
+/// Офлайн-TUI: движка нет. Конфиг правится локально (общий `Arc`), правки
+/// копятся в `ui-pending.json` и уходят демону, когда он появится.
+fn run_offline_tui(
+    dir: &std::path::Path,
+    cfg: &mut Config,
+    identity: &proto::Identity,
+    reason: Option<String>,
+) -> Result<()> {
+    // Без имени TUI безымянный: спрашиваем до старта (сервер необязателен).
+    if cfg.name.trim().is_empty() {
+        let (mut adapter, mut dll) = (String::new(), None);
+        if !tui::setup::run(cfg, &mut adapter, &mut dll, false, &identity.friend_code())? {
+            bail!("настройка не завершена; запусти ещё раз или задай параметры командами CLI");
+        }
+        if !adapter.is_empty() {
+            cfg.adapter = adapter;
+        }
+        if let Some(d) = dll {
+            cfg.dll = d;
+        }
+        save_cfg(dir, cfg)?;
+    }
+    let ui = ui_cfg(dir, cfg);
+    let shared = Arc::new(std::sync::Mutex::new(cfg.clone()));
+    let eng = tunnel_client::remote::connect_offline(dir, shared, identity.clone(), reason)?;
+    tui::run_remote(eng, &ui)
+}
+
+/// Локальные настройки TUI: тема из `ui.json` (иначе — из client.json).
+fn ui_cfg(dir: &std::path::Path, cfg: &Config) -> Config {
+    let mut ui = cfg.clone();
     let prefs = UiPrefs::load(dir);
     if !prefs.theme.is_empty() {
         ui.theme = prefs.theme;
     }
-    tui::run_remote(eng, &ui)
+    ui
+}
+
+/// Сохранить конфиг в каталог данных клиента.
+fn save_cfg(dir: &std::path::Path, cfg: &Config) -> Result<()> {
+    store::Store::new(dir).save(cfg).context("запись конфига")
 }
 
 /// Ждёт, пока демон применит правки конфига: снимок с нужным именем и
@@ -1088,12 +1199,18 @@ global: --dir <path> --profile <имя> --debug --server <N|addr|label> (по у
   dns on|off                  встроенный DNS для имён пиров (*.vl)
   invisible on|off            невидимка: другие видят вас офлайн
   run                         поднять туннель (global: --adapter --dll --server <N>, см. ниже)
-  tui [--embedded|--remote]   то же, но с графическим интерфейсом (ratatui);
-                              при работающем демоне — тонкий клиент без прав админа
+  tui [--embedded|--remote|--offline]
+                              интерфейс (ratatui): демон есть — тонкий клиент
+                              без прав админа, нет — офлайн-TUI (правки
+                              копятся и уйдут демону); --embedded — свой
+                              движок, --remote — только демон, --offline —
+                              сразу офлайн
 peer = friend code (TUN-…) | hex | alias
 
-Если при запуске tui имя или сервер не заданы — сначала открывается
-экран первичной настройки (Enter — применить, Esc — отмена).
+TUI открывается всегда: без серверов — пилюля «нет сервера» (F3/F4), без
+демона — офлайн-режим (жёлтая пилюля «⏳ ожидает применения»).
+Если при запуске tui нет имени — сначала открывается экран первичной
+настройки (Enter — применить, Esc — отмена).
 При работающем демоне команды уходят ему (IPC), а не своим сеансом."#
     );
     println!("run/tui: {}", run_flags_help());
