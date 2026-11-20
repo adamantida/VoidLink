@@ -48,6 +48,10 @@ fn pool() -> impl Iterator<Item = u32> {
 pub struct Leases {
     by_pub: HashMap<[u8; 32], u32>,
     by_ip: HashMap<u32, [u8; 32]>,
+    /// Адреса, закреплённые общим пулом федерации за identity других
+    /// серверов (`FED_ADDR_PUSH`): локальному пулу они не выдаются. Пока
+    /// федерации нет, множество пусто и выдача не меняется.
+    reserved: std::collections::HashSet<u32>,
     /// Номер адреса пула, с которого искать свободный: выдача подряд не
     /// перебирает каждый раз уже выданные с начала пула.
     next: u32,
@@ -56,6 +60,37 @@ pub struct Leases {
 impl Leases {
     pub fn get(&self, pk: &[u8; 32]) -> Option<u32> {
         self.by_pub.get(pk).copied()
+    }
+
+    /// Чья это identity по адресу (для конфликта федерации: адрес занят
+    /// локальным участником).
+    pub fn owner_of(&self, ip: u32) -> Option<[u8; 32]> {
+        self.by_ip.get(&ip).copied()
+    }
+
+    /// Зарезервировать адрес чужой identity (федеративный пул): локально он
+    /// не выдаётся. Уже занятый своим адресом — не резервируется.
+    pub fn reserve(&mut self, ip: u32) {
+        if !self.by_ip.contains_key(&ip) {
+            self.reserved.insert(ip);
+        }
+    }
+
+    /// Снять резерв (identity ушла из пула/адрес перевыдан).
+    pub fn unreserve(&mut self, ip: u32) {
+        self.reserved.remove(&ip);
+    }
+
+    /// Адрес зарезервирован за чужой identity.
+    pub fn is_reserved(&self, ip: u32) -> bool {
+        self.reserved.contains(&ip)
+    }
+
+    /// Забрать адрес у identity (конфликт федерации): адрес снова свободен.
+    pub fn revoke(&mut self, pk: &[u8; 32]) -> Option<u32> {
+        let ip = self.by_pub.remove(pk)?;
+        self.by_ip.remove(&ip);
+        Some(ip)
     }
 
     #[cfg(test)]
@@ -70,7 +105,11 @@ impl Leases {
     /// Закрепить `ip` за `pk` (загрузка `server.json`). Отказ — адрес вне
     /// пула или занят, либо у `pk` уже есть адрес.
     pub fn assign(&mut self, pk: [u8; 32], ip: u32) -> bool {
-        if !valid(ip) || self.by_ip.contains_key(&ip) || self.by_pub.contains_key(&pk) {
+        if !valid(ip)
+            || self.by_ip.contains_key(&ip)
+            || self.by_pub.contains_key(&pk)
+            || self.reserved.contains(&ip)
+        {
             return false;
         }
         self.by_pub.insert(pk, ip);
@@ -91,7 +130,10 @@ impl Leases {
         }
         let free = (0..POOL_SIZE)
             .map(|i| (self.next + i) % POOL_SIZE)
-            .find(|&i| !self.by_ip.contains_key(&pool_ip(i)));
+            .find(|&i| {
+                let ip = pool_ip(i);
+                !self.by_ip.contains_key(&ip) && !self.reserved.contains(&ip)
+            });
         let ip = match free {
             Some(i) => {
                 self.next = (i + 1) % POOL_SIZE;
@@ -101,7 +143,7 @@ impl Leases {
                 let (old, ip) = self
                     .by_pub
                     .iter()
-                    .find(|(k, _)| **k != pk && !in_use(k))
+                    .find(|(k, ip)| **k != pk && !self.reserved.contains(*ip) && !in_use(k))
                     .map(|(k, ip)| (*k, *ip))?;
                 self.by_pub.remove(&old);
                 self.by_ip.remove(&ip);
@@ -186,5 +228,52 @@ mod tests {
         assert_eq!(l.get_or_alloc(pk(n), |k| *k != idle), Some(freed));
         assert!(l.get(&idle).is_none());
         assert_eq!(l.len(), n as usize);
+    }
+
+    // ---------- общий пул федерации (T4b1) ----------
+
+    #[test]
+    fn зарезервированный_адрес_не_выдаётся() {
+        let mut l = Leases::default();
+        // Первый свободный адрес занят заявкой чужой identity.
+        l.reserve(ip(1, 1));
+        assert!(l.is_reserved(ip(1, 1)));
+        assert_eq!(l.get_or_alloc(pk(1), |_| true), Some(ip(1, 2)));
+        assert!(!l.assign(pk(2), ip(1, 1)), "зарезервированный не выдаётся");
+        // Снятый резерв снова доступен.
+        l.unreserve(ip(1, 1));
+        assert!(!l.is_reserved(ip(1, 1)));
+        assert!(l.assign(pk(2), ip(1, 1)));
+        // Адрес своей identity не резервируется (он и так в пуле).
+        l.reserve(ip(1, 2));
+        assert!(!l.is_reserved(ip(1, 2)), "свой адрес не резерв");
+        assert_eq!(l.owner_of(ip(1, 2)), Some(pk(1)));
+    }
+
+    #[test]
+    fn revoke_освобождает_адрес_для_перевыдачи() {
+        let mut l = Leases::default();
+        let a = l.get_or_alloc(pk(1), |_| true).unwrap();
+        assert_eq!(l.revoke(&pk(1)), Some(a));
+        assert!(l.get(&pk(1)).is_none());
+        assert_eq!(l.revoke(&pk(1)), None, "повторный отзыв — None");
+        // Освобождённый адрес снова свободен: закрепляется без конфликта.
+        assert!(l.assign(pk(2), a));
+        assert_eq!(l.owner_of(a), Some(pk(2)));
+    }
+
+    #[test]
+    fn резерв_не_забирается_при_исчерпании_пула() {
+        let mut l = Leases::default();
+        let n = pool().count() as u32;
+        for i in 0..n {
+            l.get_or_alloc(pk(i), |_| true).unwrap();
+        }
+        // Один адрес уходит в заявку чужой identity — новой выдаче он не
+        // достанется, даже если identity освободит его (все «idle»).
+        let held = l.get(&pk(0)).unwrap();
+        l.revoke(&pk(0));
+        l.reserve(held);
+        assert_eq!(l.get_or_alloc(pk(n), |_| true), None);
     }
 }

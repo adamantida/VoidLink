@@ -13,16 +13,21 @@
 //!   `derive("voidlink-fed-v1", shared)` и два тега направлений (прямая
 //!   секретность на каждой сессии).
 //! * `0x42..=0x4F` — кадры федеративной сессии (AEAD того же формата, что
-//!   ctrl): репликация групп и адресов, кросс-серверный релей.
+//!   ctrl): репликация групп (`FED_GROUP_PUSH`/`DELTA`), общий пул адресов
+//!   (`FED_ADDR_PUSH`/`REVOKE`), кросс-серверный релей (`FED_RELAY` +
+//!   `ACK`/`NACK`).
 //!
-//! В T4a — кодеки рукопожатия и ключи сессии; кадры `0x42..=0x4F` остаются
-//! T4b (номера зафиксированы здесь). Кодеки не паникуют: любое чтение за
-//! концом — ошибка, длины проверяются `ensure!`.
+//! В T4a — кодеки рукопожатия и ключи сессии; в T4b1 — кодеки репликации и
+//! релея (здесь же), серверная часть — `tunnel-server`. Клиентская часть
+//! (`FED_GROUPS`/`JOIN_FED` на клиенте) — T4b2. Кодеки не паникуют: любое
+//! чтение за концом — ошибка, длины проверяются `ensure!`.
 
 use anyhow::{Result, ensure};
 
 use crate::handshake::EphemeralKey;
-use crate::{Identity, Reader, SymKey, derive_key, put_pub, put_u64};
+use crate::{
+    Identity, Reader, SymKey, derive_key, put_bool, put_pub, put_str, put_u16, put_u32, put_u64,
+};
 
 // ---------- типы кадров ----------
 
@@ -40,6 +45,10 @@ pub const FED_ADDR_PUSH: u8 = 0x44;
 pub const FED_ADDR_REVOKE: u8 = 0x45;
 /// Кросс-серверный релей группового кадра.
 pub const FED_RELAY: u8 = 0x46;
+/// Подтверждение доставки `FED_RELAY` получателю (его сервер доставил кадр).
+pub const FED_RELAY_ACK: u8 = 0x47;
+/// Отказ в доставке `FED_RELAY`: нет группы/отправителя-участника/сессии.
+pub const FED_RELAY_NACK: u8 = 0x48;
 
 /// Последний номер федеративного диапазона (включительно).
 pub const FED_LAST: u8 = 0x4F;
@@ -297,6 +306,426 @@ impl SrvHello {
 /// Ответ второй стороны: тот же формат, другое имя для читаемости кода.
 pub type SrvHelloAck = SrvHello;
 
+// ---------- репликация групп (T4b) ----------
+
+/// Наибольшее число участников реплицированной группы (совпадает с
+/// `server::MAX_MEMBERS`: больше сервер всё равно не примет).
+pub const FED_GROUP_MAX_MEMBERS: usize = 254;
+
+/// Участник реплицированной группы: identity и её адрес оверлея. Адрес
+/// выдаёт сервер участника, а общий пул подтверждает его остальным
+/// (`FED_ADDR_PUSH`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FedMember {
+    pub pk: [u8; 32],
+    pub ip: u32,
+}
+
+const FED_MEMBER_LEN: usize = 32 + 4;
+/// Минимальная длина тела [`FedGroup`]:
+/// `uuid(16) | owner(32) | gid(4) | rev(4) | epoch(4) | flags(1) | name_len(1) |
+/// key(32) | n(2)`.
+pub const FED_GROUP_MIN_LEN: usize = 16 + 32 + 4 + 4 + 4 + 1 + 1 + 32 + 2;
+/// Флаг группы: приватная (вход только по приглашению владельца).
+pub const FED_GROUP_PRIVATE: u8 = 0x01;
+/// Флаг группы: удалена владельцем (участникам — удалить локальную копию).
+pub const FED_GROUP_DELETED: u8 = 0x02;
+
+/// Полная запись реплицированной группы (`FED_GROUP_PUSH`).
+///
+/// Владелец — источник правды: запись целиком приходит от сервера владельца
+/// и применяется на остальных серверах федерации. `gid` — номер у владельца;
+/// каждый сервер назначает участникам свой локальный gid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FedGroup {
+    /// Идентификатор группы во всей федерации (не зависит от gid).
+    pub uuid: [u8; 16],
+    /// ed25519-ключ владельца группы.
+    pub owner: [u8; 32],
+    /// Локальный gid у владельца (диагностика/отладка; не адресация).
+    pub gid: u32,
+    pub name: String,
+    pub private: bool,
+    pub key: [u8; 32],
+    /// Номер ключа `key`.
+    pub epoch: u32,
+    /// Ревизия состояния у владельца (растёт на каждое видимое изменение).
+    pub rev: u32,
+    pub members: Vec<FedMember>,
+    pub deleted: bool,
+}
+
+impl FedGroup {
+    /// Тело кадра (без типа/AEAD — его добавляет серверный слой).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v =
+            Vec::with_capacity(FED_GROUP_MIN_LEN + self.name.len() + self.members.len() * 36);
+        v.extend_from_slice(&self.uuid);
+        put_pub(&mut v, &self.owner);
+        put_u32(&mut v, self.gid);
+        put_u32(&mut v, self.rev);
+        put_u32(&mut v, self.epoch);
+        let mut flags = 0u8;
+        if self.private {
+            flags |= FED_GROUP_PRIVATE;
+        }
+        if self.deleted {
+            flags |= FED_GROUP_DELETED;
+        }
+        v.push(flags);
+        put_str(&mut v, &self.name);
+        v.extend_from_slice(&self.key);
+        let n = self.members.len().min(FED_GROUP_MAX_MEMBERS);
+        put_u16(&mut v, n as u16);
+        for m in &self.members[..n] {
+            put_pub(&mut v, &m.pk);
+            put_u32(&mut v, m.ip);
+        }
+        v
+    }
+
+    /// Разбор тела: длины/счётчики проверяются, хвост — ошибка.
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(body);
+        let uuid: [u8; 16] = r.array()?;
+        let owner = r.pub_key()?;
+        let gid = r.u32()?;
+        let rev = r.u32()?;
+        let epoch = r.u32()?;
+        let flags = r.u8()?;
+        ensure!(
+            flags & !(FED_GROUP_PRIVATE | FED_GROUP_DELETED) == 0,
+            "fed group: неизвестные флаги {flags:#04x}"
+        );
+        let name = r.str()?;
+        let key: [u8; 32] = r.array()?;
+        let n = r.u16()? as usize;
+        ensure!(n <= FED_GROUP_MAX_MEMBERS, "fed group: участников {n}");
+        let mut members = Vec::with_capacity(r.capacity_for(n, FED_MEMBER_LEN));
+        for _ in 0..n {
+            members.push(FedMember {
+                pk: r.pub_key()?,
+                ip: r.u32()?,
+            });
+        }
+        r.finish()?;
+        Ok(Self {
+            uuid,
+            owner,
+            gid,
+            name,
+            private: flags & FED_GROUP_PRIVATE != 0,
+            key,
+            epoch,
+            rev,
+            members,
+            deleted: flags & FED_GROUP_DELETED != 0,
+        })
+    }
+}
+
+/// Изменение реплицированной группы (`FED_GROUP_DELTA`). Дешёвый путь для
+/// изменений, которые не требуют полной записи (вход/выход участника).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FedChange {
+    /// kind 1: участник добавлен/изменён (адрес оверлея).
+    MemberAdd { pk: [u8; 32], ip: u32 },
+    /// kind 2: участник удалён.
+    MemberRemove { pk: [u8; 32] },
+    /// kind 3: имя/владелец/приватность/ключ/эпоха (вход и выход меняют ключ).
+    Meta {
+        name: String,
+        owner: [u8; 32],
+        private: bool,
+        key: [u8; 32],
+        epoch: u32,
+    },
+    /// kind 4: группа удалена владельцем.
+    Deleted,
+}
+
+/// kind 1 — участник добавлен.
+pub const FED_CHANGE_MEMBER_ADD: u8 = 1;
+/// kind 2 — участник удалён.
+pub const FED_CHANGE_MEMBER_REMOVE: u8 = 2;
+/// kind 3 — метаданные/ключ.
+pub const FED_CHANGE_META: u8 = 3;
+/// kind 4 — группа удалена.
+pub const FED_CHANGE_DELETED: u8 = 4;
+
+impl FedChange {
+    pub fn kind(&self) -> u8 {
+        match self {
+            Self::MemberAdd { .. } => FED_CHANGE_MEMBER_ADD,
+            Self::MemberRemove { .. } => FED_CHANGE_MEMBER_REMOVE,
+            Self::Meta { .. } => FED_CHANGE_META,
+            Self::Deleted => FED_CHANGE_DELETED,
+        }
+    }
+}
+
+/// Дельта записи: `uuid(16) | owner(32) | rev(4) | base_rev(4) | n(1) |
+/// n × change`. `rev` — ревизия после изменений, `base_rev` — до; `n = 0`
+/// запрещено. Несколько изменений в одном кадре: вход участника — это и
+/// `MemberAdd`, и `Meta` (ротация ключа).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FedGroupDelta {
+    pub uuid: [u8; 16],
+    pub owner: [u8; 32],
+    pub rev: u32,
+    pub base_rev: u32,
+    pub changes: Vec<FedChange>,
+}
+
+/// Минимальная длина тела дельты.
+pub const FED_DELTA_MIN_LEN: usize = 16 + 32 + 4 + 4 + 1;
+/// Больше изменений в одной дельте не шлём (не влезет/проще полная запись).
+pub const FED_MAX_CHANGES: usize = 16;
+
+impl FedGroupDelta {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(FED_DELTA_MIN_LEN + 16 + 32);
+        v.extend_from_slice(&self.uuid);
+        put_pub(&mut v, &self.owner);
+        put_u32(&mut v, self.rev);
+        put_u32(&mut v, self.base_rev);
+        let n = self.changes.len().min(FED_MAX_CHANGES);
+        v.push(n as u8);
+        for change in &self.changes[..n] {
+            v.push(change.kind());
+            match change {
+                FedChange::MemberAdd { pk, ip } => {
+                    put_pub(&mut v, pk);
+                    put_u32(&mut v, *ip);
+                }
+                FedChange::MemberRemove { pk } => put_pub(&mut v, pk),
+                FedChange::Meta {
+                    name,
+                    owner,
+                    private,
+                    key,
+                    epoch,
+                } => {
+                    put_str(&mut v, name);
+                    put_pub(&mut v, owner);
+                    put_bool(&mut v, *private);
+                    v.extend_from_slice(key);
+                    put_u32(&mut v, *epoch);
+                }
+                FedChange::Deleted => {}
+            }
+        }
+        v
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(body);
+        let uuid: [u8; 16] = r.array()?;
+        let owner = r.pub_key()?;
+        let rev = r.u32()?;
+        let base_rev = r.u32()?;
+        let n = r.u8()? as usize;
+        ensure!(
+            (1..=FED_MAX_CHANGES).contains(&n),
+            "fed delta: изменений {n}"
+        );
+        let mut changes = Vec::with_capacity(r.capacity_for(n, 1));
+        for _ in 0..n {
+            let kind = r.u8()?;
+            changes.push(match kind {
+                FED_CHANGE_MEMBER_ADD => FedChange::MemberAdd {
+                    pk: r.pub_key()?,
+                    ip: r.u32()?,
+                },
+                FED_CHANGE_MEMBER_REMOVE => FedChange::MemberRemove { pk: r.pub_key()? },
+                FED_CHANGE_META => FedChange::Meta {
+                    name: r.str()?,
+                    owner: r.pub_key()?,
+                    private: r.boolean()?,
+                    key: r.array()?,
+                    epoch: r.u32()?,
+                },
+                FED_CHANGE_DELETED => FedChange::Deleted,
+                other => anyhow::bail!("fed delta: неизвестный kind {other}"),
+            });
+        }
+        r.finish()?;
+        Ok(Self {
+            uuid,
+            owner,
+            rev,
+            base_rev,
+            changes,
+        })
+    }
+}
+
+// ---------- общий пул адресов (T4b) ----------
+
+/// Длина тела [`FedAddrClaim`]: `pk(32) | ip(4) | server(32) | ts_ms(8)`.
+pub const FED_ADDR_LEN: usize = 32 + 4 + 32 + 8;
+
+/// Заявка на адрес оверлея в общем пуле федерации (`FED_ADDR_PUSH`) или её
+/// отзыв (`FED_ADDR_REVOKE`). `server` — ed25519-ключ сервера, выдавшего
+/// адрес: конфликт одной identity решается меньшим `server` (он же и
+/// подтверждает адрес), проигравший перевыдаёт адрес и уведомляет.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FedAddrClaim {
+    pub pk: [u8; 32],
+    pub ip: u32,
+    pub server: [u8; 32],
+    pub ts_ms: u64,
+}
+
+impl FedAddrClaim {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(FED_ADDR_LEN);
+        put_pub(&mut v, &self.pk);
+        put_u32(&mut v, self.ip);
+        put_pub(&mut v, &self.server);
+        put_u64(&mut v, self.ts_ms);
+        v
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        ensure!(
+            body.len() == FED_ADDR_LEN,
+            "fed addr: длина {} вместо {FED_ADDR_LEN}",
+            body.len()
+        );
+        let mut r = Reader::new(body);
+        Ok(Self {
+            pk: r.pub_key()?,
+            ip: r.u32()?,
+            server: r.pub_key()?,
+            ts_ms: r.u64()?,
+        })
+    }
+}
+
+// ---------- кросс-серверный релей (T4b) ----------
+
+/// Наибольшая длина заворачиваемого группового кадра: тело `FED_RELAY`
+/// должно влезть в u16 вместе с заголовком релея.
+pub const FED_RELAY_MAX_FRAME: usize = u16::MAX as usize - (16 + 32 + 32 + 2);
+
+/// Завёрнутый групповой кадр: `uuid(16) | sender(32) | dst(32) | len(2) |
+/// frame`. `sender` и `dst` — identity участников: первый должен быть
+/// участником реплицированной группы (проверяет получатель), второй — иметь
+/// сессию на принимающем сервере.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FedRelay {
+    pub uuid: [u8; 16],
+    pub sender: [u8; 32],
+    pub dst: [u8; 32],
+    pub frame: Vec<u8>,
+}
+
+/// Минимальная длина тела релея (пустой кадр не пересылается, но формат).
+pub const FED_RELAY_MIN_LEN: usize = 16 + 32 + 32 + 2;
+
+impl FedRelay {
+    pub fn encode(&self) -> Vec<u8> {
+        assert!(
+            self.frame.len() <= FED_RELAY_MAX_FRAME,
+            "relay frame too long"
+        );
+        let mut v = Vec::with_capacity(FED_RELAY_MIN_LEN + self.frame.len());
+        v.extend_from_slice(&self.uuid);
+        put_pub(&mut v, &self.sender);
+        put_pub(&mut v, &self.dst);
+        put_u16(&mut v, self.frame.len() as u16);
+        v.extend_from_slice(&self.frame);
+        v
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(body);
+        let uuid: [u8; 16] = r.array()?;
+        let sender = r.pub_key()?;
+        let dst = r.pub_key()?;
+        let n = r.u16()? as usize;
+        ensure!(
+            n > 0 && n <= FED_RELAY_MAX_FRAME,
+            "fed relay: длина кадра {n}"
+        );
+        let frame = r.bytes(n)?.to_vec();
+        r.finish()?;
+        Ok(Self {
+            uuid,
+            sender,
+            dst,
+            frame,
+        })
+    }
+}
+
+/// Причины отказа `FED_RELAY` (`FedRelayReply::reason`).
+pub mod nack {
+    /// Группы с таким uuid на этом сервере нет (не реплицирована).
+    pub const NO_GROUP: u8 = 1;
+    /// Отправитель не участник реплицированной группы.
+    pub const NO_SENDER: u8 = 2;
+    /// Получатель не участник группы / адрес не совпал.
+    pub const NO_DST: u8 = 3;
+    /// У получателя нет живой сессии на этом сервере.
+    pub const NO_SESSION: u8 = 4;
+    /// Внутренний кадр не разбирается (заголовок/длина/эпоха).
+    pub const BAD_FRAME: u8 = 5;
+
+    /// Текст причины для лога/диагностики.
+    pub fn text(code: u8) -> &'static str {
+        match code {
+            NO_GROUP => "группа не реплицирована",
+            NO_SENDER => "отправитель не участник группы",
+            NO_DST => "получатель не участник группы",
+            NO_SESSION => "у получателя нет сессии",
+            BAD_FRAME => "внутренний кадр не разбирается",
+            _ => "неизвестная причина",
+        }
+    }
+}
+
+/// Ответ на `FED_RELAY` (`FED_RELAY_ACK`/`FED_RELAY_NACK`):
+/// `uuid(16) | dst(32) | ok(1) | reason(1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FedRelayReply {
+    pub uuid: [u8; 16],
+    pub dst: [u8; 32],
+    pub ok: bool,
+    /// Причина отказа (0 при `ok`), см. [`nack`].
+    pub reason: u8,
+}
+
+/// Длина тела ответа на релей.
+pub const FED_RELAY_REPLY_LEN: usize = 16 + 32 + 1 + 1;
+
+impl FedRelayReply {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(FED_RELAY_REPLY_LEN);
+        v.extend_from_slice(&self.uuid);
+        put_pub(&mut v, &self.dst);
+        put_bool(&mut v, self.ok);
+        v.push(if self.ok { 0 } else { self.reason.max(1) });
+        v
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        ensure!(
+            body.len() == FED_RELAY_REPLY_LEN,
+            "fed relay reply: длина {} вместо {FED_RELAY_REPLY_LEN}",
+            body.len()
+        );
+        let mut r = Reader::new(body);
+        Ok(Self {
+            uuid: r.array()?,
+            dst: r.pub_key()?,
+            ok: r.boolean()?,
+            reason: r.u8()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,8 +900,189 @@ mod tests {
         assert_eq!(FED_ADDR_PUSH, 0x44);
         assert_eq!(FED_ADDR_REVOKE, 0x45);
         assert_eq!(FED_RELAY, 0x46);
+        assert_eq!(FED_RELAY_ACK, 0x47);
+        assert_eq!(FED_RELAY_NACK, 0x48);
         assert_eq!(FED_LAST, 0x4F);
         assert_eq!(SRV_HELLO_LEN, 185);
         assert_eq!(FED_VER, 1);
+    }
+
+    // ---------- репликация групп/адресов/релей (T4b) ----------
+
+    fn fed_group() -> FedGroup {
+        FedGroup {
+            uuid: [3; 16],
+            owner: [4; 32],
+            gid: 7,
+            name: "фед-группа".into(),
+            private: true,
+            key: [5; 32],
+            epoch: 2,
+            rev: 9,
+            members: vec![
+                FedMember {
+                    pk: [6; 32],
+                    ip: 0x6442_0101,
+                },
+                FedMember {
+                    pk: [7; 32],
+                    ip: 0x6442_0102,
+                },
+            ],
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn fed_group_кодируется_и_разбирается() {
+        let g = fed_group();
+        let enc = g.encode();
+        assert_eq!(FedGroup::decode(&enc).unwrap(), g);
+        // Хвост и обрезка — ошибка (формат строгий).
+        let mut longer = enc.clone();
+        longer.push(0);
+        assert!(FedGroup::decode(&longer).is_err());
+        for n in 0..enc.len() {
+            assert!(FedGroup::decode(&enc[..n]).is_err(), "len {n}");
+        }
+        // Пустая группа (без участников) и флаги.
+        let empty = FedGroup {
+            members: vec![],
+            private: false,
+            deleted: true,
+            ..g.clone()
+        };
+        let back = FedGroup::decode(&empty.encode()).unwrap();
+        assert!(back.deleted && !back.private && back.members.is_empty());
+        // Неизвестный флаг — отказ.
+        let mut bad = enc.clone();
+        let flags_at = 16 + 32 + 4 + 4 + 4;
+        bad[flags_at] |= 0x80;
+        assert!(FedGroup::decode(&bad).is_err());
+        // Счётчик участников больше лимита — отказ.
+        const { assert!(FED_GROUP_MAX_MEMBERS >= 254) };
+    }
+
+    #[test]
+    fn дельта_группы_все_виды() {
+        let base = FedGroupDelta {
+            uuid: [1; 16],
+            owner: [2; 32],
+            rev: 5,
+            base_rev: 4,
+            changes: vec![FedChange::MemberAdd {
+                pk: [3; 32],
+                ip: 0x6442_0103,
+            }],
+        };
+        assert_eq!(FedGroupDelta::decode(&base.encode()).unwrap(), base);
+        for change in [
+            FedChange::MemberRemove { pk: [4; 32] },
+            FedChange::Meta {
+                name: "новое имя".into(),
+                owner: [7; 32],
+                private: false,
+                key: [9; 32],
+                epoch: 8,
+            },
+            FedChange::Deleted,
+        ] {
+            let d = FedGroupDelta {
+                changes: vec![change],
+                rev: base.rev + 1,
+                base_rev: base.rev,
+                ..base.clone()
+            };
+            assert_eq!(FedGroupDelta::decode(&d.encode()).unwrap(), d);
+        }
+        // Несколько изменений в одном кадре (вход = MemberAdd + Meta).
+        let d = FedGroupDelta {
+            changes: vec![
+                FedChange::MemberAdd {
+                    pk: [5; 32],
+                    ip: 0x6442_0104,
+                },
+                FedChange::Meta {
+                    name: "x".into(),
+                    owner: [2; 32],
+                    private: true,
+                    key: [6; 32],
+                    epoch: 3,
+                },
+            ],
+            rev: 6,
+            base_rev: 5,
+            ..base.clone()
+        };
+        assert_eq!(FedGroupDelta::decode(&d.encode()).unwrap(), d);
+        // Ноль изменений и неизвестный kind — отказ.
+        let mut bad = base.encode();
+        let n_at = 16 + 32 + 4 + 4;
+        bad[n_at] = 0;
+        assert!(FedGroupDelta::decode(&bad).is_err());
+        let mut bad = base.encode();
+        bad[n_at] = 1;
+        let kind_at = n_at + 1;
+        bad[kind_at] = 0;
+        assert!(FedGroupDelta::decode(&bad).is_err());
+        // Обрезка — ошибка, не паника.
+        let enc = base.encode();
+        for n in 0..enc.len() {
+            assert!(FedGroupDelta::decode(&enc[..n]).is_err(), "len {n}");
+        }
+    }
+
+    #[test]
+    fn заявка_адреса_фиксированной_длины() {
+        let c = FedAddrClaim {
+            pk: [1; 32],
+            ip: 0x6442_0102,
+            server: [2; 32],
+            ts_ms: NOW,
+        };
+        let enc = c.encode();
+        assert_eq!(enc.len(), FED_ADDR_LEN);
+        assert_eq!(FedAddrClaim::decode(&enc).unwrap(), c);
+        let mut longer = enc.clone();
+        longer.push(0);
+        assert!(FedAddrClaim::decode(&longer).is_err());
+        assert!(FedAddrClaim::decode(&enc[..enc.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn релей_и_ответ() {
+        let r = FedRelay {
+            uuid: [8; 16],
+            sender: [1; 32],
+            dst: [2; 32],
+            frame: crate::plain_frame(crate::grp::DATA, &[9; 64]),
+        };
+        let back = FedRelay::decode(&r.encode()).unwrap();
+        assert_eq!(back, r);
+        // Пустой/битый кадр — отказ.
+        let mut bad = r.encode();
+        let len_at = 16 + 32 + 32;
+        bad[len_at..len_at + 2].copy_from_slice(&0u16.to_be_bytes());
+        assert!(FedRelay::decode(&bad).is_err());
+        assert!(FedRelay::decode(&[0u8; 10]).is_err());
+        // Длина за пределом — отказ без паники.
+        assert!(FedRelay::decode(&r.encode()[..r.encode().len() - 1]).is_err());
+
+        let ok = FedRelayReply {
+            uuid: r.uuid,
+            dst: r.dst,
+            ok: true,
+            reason: 0,
+        };
+        assert_eq!(FedRelayReply::decode(&ok.encode()).unwrap(), ok);
+        let no = FedRelayReply {
+            ok: false,
+            reason: nack::NO_SESSION,
+            ..ok
+        };
+        let back = FedRelayReply::decode(&no.encode()).unwrap();
+        assert!(!back.ok && back.reason == nack::NO_SESSION);
+        assert_eq!(no.encode().len(), FED_RELAY_REPLY_LEN);
+        assert!(!nack::text(nack::NO_GROUP).is_empty());
     }
 }

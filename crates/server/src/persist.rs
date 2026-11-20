@@ -36,6 +36,48 @@ pub struct PFederation {
     /// Закреплённые (TOFU) серверы-пиры.
     #[serde(default)]
     pub peers: Vec<PPeer>,
+    /// Группы федерации: uuid ↔ локальный gid и сервер-источник правды
+    /// (T4b1). Запись переживает рестарт: gid и uuid остаются теми же.
+    #[serde(default)]
+    pub groups: Vec<PFedGroup>,
+    /// Заявки на адреса оверлея в общем пуле (T4b1): адрес удалённой
+    /// identity закреплён за её сервером, локальный пул их не выдаёт.
+    #[serde(default)]
+    pub addr_claims: Vec<PAddrClaim>,
+}
+
+/// Группа федерации в `server.json`: `uuid`, локальный gid, владелец и
+/// сервер-источник правды (`origin`). Свои группы тоже пишутся — с
+/// `origin = <наш ed>`: после рестарта uuid не пересоздаётся, и пиры узнают
+/// группу под тем же идентификатором.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PFedGroup {
+    /// uuid группы, hex (16 байт).
+    pub uuid: String,
+    pub gid: u32,
+    /// hex ed25519 владельца группы.
+    #[serde(default)]
+    pub owner: String,
+    /// hex ed25519 сервера-источника правды.
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub rev: u32,
+    #[serde(default)]
+    pub epoch: u32,
+}
+
+/// Заявка на адрес в общем пуле: identity, адрес, сервер и время.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PAddrClaim {
+    /// hex ed25519 identity.
+    pub pk: String,
+    pub ip: u32,
+    /// hex ed25519 сервера, выдавшего адрес.
+    #[serde(default)]
+    pub server: String,
+    #[serde(default)]
+    pub ts_ms: u64,
 }
 
 /// Закреплённый сервер-пир: адрес, ed-ключ (якорь доверия) и x-ключ
