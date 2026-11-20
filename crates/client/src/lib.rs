@@ -3,12 +3,23 @@
 //! используют их через `tunnel_client::…`.
 
 pub mod api;
+pub mod dht;
 pub mod dns;
 pub mod engine;
 #[cfg(test)]
 mod engine_e2e;
+pub mod federation;
 pub mod invites;
 pub mod ipv6;
+/// Mesh-подсистема (L2) — каркас T3.
+pub mod mesh;
+#[cfg(test)]
+mod mesh_e2e;
+/// Офлайн-TUI: движка нет — конфиг правится локально, очередь `ui-pending`.
+pub mod offline;
+pub mod path;
+/// Проба сервера (PROBE_REQ/RESP) — каркас T2.
+pub mod probe;
 pub mod profile;
 pub mod remote;
 pub mod remote_cli;

@@ -32,9 +32,11 @@
 //!   чаще раза в `HOUSEKEEPING_EVERY`, а не на каждую команду;
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
+pub mod federation;
 pub mod leases;
 pub mod metrics;
 pub mod persist;
+pub mod probe;
 pub mod signals;
 pub mod tcp;
 
@@ -48,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use proto::ctrl;
+use proto::federation::{FedChange, FedRelay, FedRelayReply};
 use proto::handshake::{self as hs, Hello3, RotationLink, Welcome};
 use proto::payloads::{
     self as pl, AdminInfo, BanEntry, GroupDelta, GroupState, GroupSummary, GroupUpdate, MemberInfo,
@@ -182,6 +185,15 @@ pub struct Config {
     pub tcp: bool,
     /// Адрес HTTP-эндпоинта метрик (`--metrics`); `None` — выключен.
     pub metrics: Option<SocketAddr>,
+    /// Федерация серверов (этап 9, T4a): `--federate`. Без флага кадры
+    /// 0x40..=0x4F не разбираются вовсе.
+    pub federate: bool,
+    /// Явные пины `--peer <addr>` (повторяемый): ключ закрепляется TOFU по
+    /// первому ответу.
+    pub peers: Vec<SocketAddr>,
+    /// Серверы общего пула адресов федерации (`--fed-pool`, повторяемый):
+    /// кандидаты в пиры и участники обмена заявками адресов identity (T4b1).
+    pub fed_pool: Vec<SocketAddr>,
 }
 
 impl Default for Config {
@@ -194,6 +206,9 @@ impl Default for Config {
             limits: Limits::default(),
             tcp: true,
             metrics: None,
+            federate: false,
+            peers: Vec::new(),
+            fed_pool: Vec::new(),
         }
     }
 }
@@ -245,6 +260,8 @@ impl Server {
                 next_gid: loaded.next_gid,
                 invite_ttl_ms: duration_ms(cfg.limits.invite_ttl),
                 retired_eph: HashMap::new(),
+                fed_dirty: HashSet::new(),
+                fed_deleted: Vec::new(),
             }),
             identity: loaded.identity,
             links: loaded.links,
@@ -269,7 +286,23 @@ impl Server {
             alive: AtomicUsize::new(0),
             expected_threads: AtomicUsize::new(usize::MAX),
             last_tick: AtomicU64::new(0),
+            fed: Mutex::new(federation::Fed::new_with(
+                cfg.federate,
+                pubkey,
+                loaded.fed_pins,
+                &cfg.peers,
+                &cfg.fed_pool,
+                &loaded.fed_groups,
+                &loaded.fed_claims,
+            )),
         });
+        // С --federate у каждой своей группы должен быть uuid федерации:
+        // иначе после рестарта группа опубликовалась бы под новым
+        // идентификатором (пиры видели бы её как новую).
+        if cfg.federate {
+            init_fed_uuids(&shared);
+            init_fed_addrs(&shared);
+        }
         if !cfg.quiet {
             if fresh {
                 eprintln!("[server] новое состояние в {}", cfg.data_dir.display());
@@ -380,6 +413,10 @@ impl Server {
             None => None,
         };
         let metrics_addr = metrics_srv.as_ref().map(|m| m.local_addr());
+        // Федерация: рукопожатие с закреплёнными пирами и `--peer`. После
+        // TCP-реестра — `send_to` уже знает про фолбэк (своего порта
+        // федерация не заводит).
+        federation::bootstrap(&shared);
         shared.log(format!("listening on {addr}, воркеров: {workers}"));
         if let Some(t) = tcp_addr {
             shared.log(format!("TCP-фолбэк на {t}"));
@@ -582,6 +619,15 @@ struct Session {
     last_seen: AtomicU64,
     relay: Mutex<Bucket>,
     ctrl: Mutex<Bucket>,
+    /// Статический x25519-ключ клиента (MESH_INFO): идентификатор контакта
+    /// DHT и mesh-метаданные в GROUP_STATE (§4.2). `None` — клиент mesh не
+    /// поддерживает или ещё не публиковал.
+    x_pub: Option<[u8; 32]>,
+    /// Возможности mesh (`mesh::caps::*`) из MESH_INFO.
+    caps: u8,
+    /// Когда приходил MESH_INFO, unix мс (0 — ни разу). По TTL публикация
+    /// перестаёт попадать в MESH_SEED и mesh-секцию GROUP_STATE.
+    mesh_last_seen: u64,
 }
 
 struct Member {
@@ -621,6 +667,12 @@ struct Group {
     /// Недавно вышедшие (LEAVE) → когда: повторный вход без приглашения —
     /// не раньше `REJOIN_COOLDOWN`. Не сохраняется.
     left: HashMap<[u8; 32], Instant>,
+    /// uuid группы в федерации (этап 9, T4b1): `None` — группа не
+    /// федерирована (сервер без `--federate` либо uuid ещё не назначен).
+    fed_uuid: Option<[u8; 16]>,
+    /// `Some(ed)` — копия группы, реплицированная с сервера-владельца (не
+    /// источник правды); `None` — группа авторитетна здесь.
+    fed_origin: Option<[u8; 32]>,
 }
 
 impl Group {
@@ -642,6 +694,22 @@ impl Group {
         }
     }
 
+    /// Переставить адрес участника (перевыдача lease, репликация): индексы
+    /// `members`/`by_ip` остаются согласованными. `true` — адрес изменился.
+    fn set_member_ip(&mut self, pk: &[u8; 32], ip: u32) -> bool {
+        let Some(m) = self.members.get_mut(pk) else {
+            return false;
+        };
+        if m.ip == ip {
+            return false;
+        }
+        let old = m.ip;
+        m.ip = ip;
+        self.by_ip.remove(&old);
+        self.by_ip.insert(ip, *pk);
+        true
+    }
+
     fn full(&self) -> bool {
         self.members.len() >= MAX_MEMBERS
     }
@@ -661,6 +729,43 @@ impl Group {
         self.rev = self.rev.wrapping_add(1);
         base
     }
+
+    /// Локальная группа из реплицированной записи владельца (T4b1): владелец
+    /// — источник правды, здесь — копия с местным gid.
+    fn from_fed(gid: u32, rec: &proto::federation::FedGroup, from: [u8; 32]) -> Self {
+        let mut g = Self {
+            id: gid,
+            name: clean(&rec.name, GROUP_NAME_MAX_CHARS),
+            owner: rec.owner,
+            private: rec.private,
+            key: rec.key,
+            epoch: rec.epoch.max(1),
+            rev: rec.rev.max(1),
+            revoke_prev: false,
+            members: HashMap::new(),
+            by_ip: HashMap::new(),
+            banned: HashMap::new(),
+            invites: HashMap::new(),
+            joins: Bucket::full(),
+            left: HashMap::new(),
+            fed_uuid: Some(rec.uuid),
+            fed_origin: Some(from),
+        };
+        for m in &rec.members {
+            if !leases::valid(m.ip) || g.by_ip.contains_key(&m.ip) {
+                continue;
+            }
+            g.insert_member(
+                m.pk,
+                Member {
+                    ip: m.ip,
+                    name: "…".into(),
+                    status: String::new(),
+                },
+            );
+        }
+        g
+    }
 }
 
 struct State {
@@ -677,6 +782,11 @@ struct State {
     /// ключом (старая попытка клиента, повторённая в пределах срока cookie)
     /// игнорируется: иначе он пересоздавал бы живую сессию.
     retired_eph: HashMap<([u8; 32], [u8; 32]), Instant>,
+    /// Группы, изменённые владельцем-клиентом этого сервера: их надо
+    /// опубликовать пирам (`FED_GROUP_PUSH`/`DELTA`) — T4b1.
+    fed_dirty: HashSet<u32>,
+    /// uuid удалённых групп: пирам уходит `PUSH` с `deleted` (T4b1).
+    fed_deleted: Vec<federation::GroupSnap>,
 }
 
 impl State {
@@ -804,6 +914,12 @@ struct Shared {
     expected_threads: AtomicUsize,
     /// `now_ms` последнего прохода housekeeping.
     last_tick: AtomicU64,
+    /// Федерация серверов (этап 9, T4a): пиры, попытки, сессии. Отдельная
+    /// блокировка — федеративные рукопожатия не должны ждать/держать
+    /// состояние групп. Порядок блокировок: `state` → `fed` (в `on_hint`
+    /// подсказка обрабатывается под записью состояния); `fed` никогда не
+    /// удерживается при взятии `state`.
+    fed: Mutex<federation::Fed>,
 }
 
 /// Учёт живого потока: декремент при выходе, в том числе по панике.
@@ -828,10 +944,17 @@ fn healthy(sh: &Shared) -> bool {
 /// Датчики метрик — из авторитетного состояния.
 fn refresh_gauges(sh: &Shared) {
     let now = unix_ms();
+    // Таблица федерации — до `state`: `fed` не удерживается при `state`.
+    let fed_peers = federation::pin_count(sh) as u64;
+    let fed_groups = federation::repl_count(sh) as u64;
+    let fed_claims = federation::claim_count(sh) as u64;
     let s = sh.state.read().unwrap();
     let m = &sh.metrics;
     metrics::Metrics::set(&m.sessions, s.sessions.len() as u64);
     metrics::Metrics::set(&m.groups, s.groups.len() as u64);
+    metrics::Metrics::set(&m.fed_peers, fed_peers);
+    metrics::Metrics::set(&m.fed_groups, fed_groups);
+    metrics::Metrics::set(&m.fed_addr_claims, fed_claims);
     metrics::Metrics::set(
         &m.members,
         s.groups.values().map(|g| g.members.len() as u64).sum(),
@@ -965,7 +1088,7 @@ impl Shared {
 }
 
 /// Исходящие датаграммы, собранные под блокировкой и отправляемые после неё.
-type Outbox = Vec<(SocketAddr, Vec<u8>)>;
+pub(crate) type Outbox = Vec<(SocketAddr, Vec<u8>)>;
 
 fn hex(b: &[u8]) -> String {
     proto::hex_of(b)
@@ -1053,6 +1176,67 @@ struct Loaded {
     next_gid: u32,
     groups: HashMap<u32, Group>,
     leases: leases::Leases,
+    /// Закреплённые TOFU-пиры федерации (`federation.peers`).
+    fed_pins: Vec<federation::Pin>,
+    /// Группы федерации (`federation.groups`, T4b1).
+    fed_groups: Vec<persist::PFedGroup>,
+    /// Заявки на адреса общего пула (`federation.addr_claims`, T4b1).
+    fed_claims: Vec<persist::PAddrClaim>,
+}
+
+/// uuid группы федерации (hex 16 байт).
+fn unhex16(s: &str) -> Result<[u8; 16]> {
+    let v = proto::hex_to_bytes(s)?;
+    anyhow::ensure!(v.len() == 16, "bad uuid hex");
+    Ok(v.try_into().unwrap())
+}
+
+/// Новый uuid федерации: случайные 16 байт.
+fn new_fed_uuid() -> [u8; 16] {
+    let mut u = [0u8; 16];
+    rand::rng().fill_bytes(&mut u);
+    u
+}
+
+/// Назначить uuid федерации всем своим группам, у которых его ещё нет
+/// (старт с `--federate`, группы из server.json без секции `federation`).
+fn init_fed_uuids(sh: &Shared) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let gids: Vec<u32> = s
+            .groups
+            .values()
+            .filter(|g| g.fed_uuid.is_none())
+            .map(|g| g.id)
+            .collect();
+        for gid in gids {
+            if let Some(g) = s.groups.get_mut(&gid) {
+                g.fed_uuid = Some(new_fed_uuid());
+                s.fed_dirty.insert(gid);
+            }
+        }
+        fed_publish_dirty(sh, &mut s, &mut out);
+    }
+    sh.dirty.store(true, Ordering::Relaxed);
+    sh.flush(out);
+}
+
+/// Зарезервировать в локальном пуле адреса, заявленные пирами
+/// (`federation.addr_claims`): после рестарта чужие identity не должны
+/// получить тот же адрес.
+fn init_fed_addrs(sh: &Shared) {
+    let ips: Vec<u32> = federation::persisted_claims(sh)
+        .iter()
+        .map(|c| c.ip)
+        .collect();
+    if ips.is_empty() {
+        return;
+    }
+    let mut s = sh.state.write().unwrap();
+    for ip in ips {
+        s.leases.reserve(ip);
+    }
 }
 
 /// Адреса identity из `server.json`: сначала `user_ips` (v4), затем — для
@@ -1089,6 +1273,9 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             next_gid: GID_MIN,
             groups: HashMap::new(),
             leases: leases::Leases::default(),
+            fed_pins: Vec::new(),
+            fed_groups: Vec::new(),
+            fed_claims: Vec::new(),
         });
     };
     let links = p
@@ -1135,6 +1322,10 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             invites,
             joins: Bucket::full(),
             left: HashMap::new(),
+            // uuid/origin федерации подставит загрузка `federation.groups`
+            // (по gid) — см. ниже.
+            fed_uuid: None,
+            fed_origin: None,
         };
         for (k, _) in g.members {
             // Адрес участника — адрес его identity (`load_leases`); не
@@ -1168,6 +1359,26 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         invites.retain(|pk, _| !members.contains_key(pk) && !banned.contains_key(pk));
         groups.insert(g.id, group);
     }
+    // Федерация (T4b1): uuid и источник правды группы восстанавливаются по
+    // `federation.groups` — gid служит ключом, uuid при рестарте не меняется.
+    let me_pub = proto::Identity {
+        ed_seed: p.ed_seed,
+        x_seed: p.x_seed,
+    }
+    .ed_pub();
+    for rec in &p.federation.groups {
+        let (Ok(uuid), Ok(origin)) = (unhex16(&rec.uuid), unhex(&rec.origin)) else {
+            eprintln!(
+                "[server] ВНИМАНИЕ: federation.groups: пропущена битая запись uuid {:?}",
+                rec.uuid
+            );
+            continue;
+        };
+        if let Some(g) = groups.get_mut(&rec.gid) {
+            g.fed_uuid = Some(uuid);
+            g.fed_origin = (origin != me_pub).then_some(origin);
+        }
+    }
     Ok(Loaded {
         fresh: false,
         identity: proto::Identity {
@@ -1178,13 +1389,44 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         next_gid: p.next_gid.clamp(GID_MIN, GID_MAX),
         groups,
         leases,
+        fed_pins: federation::load_pins(&p.federation.peers),
+        fed_groups: p.federation.groups,
+        fed_claims: p.federation.addr_claims,
     })
+}
+
+/// Секция `federation` для server.json: пиры (их таблица живёт под своей
+/// блокировкой) и группы/заявки адресов из состояния.
+fn federation_snapshot(sh: &Shared, s: &State) -> persist::PFederation {
+    let me = sh.identity.ed_pub();
+    persist::PFederation {
+        peers: federation::persisted_peers(sh),
+        // Группы федерации: uuid ↔ gid и источник правды. Свои группы —
+        // origin = наш ключ. Без uuid группа не федерирована и в записи не
+        // нуждается.
+        groups: s
+            .groups
+            .values()
+            .filter_map(|g| {
+                Some(persist::PFedGroup {
+                    uuid: hex(g.fed_uuid.as_ref()?),
+                    gid: g.id,
+                    owner: hex(&g.owner),
+                    origin: hex(&g.fed_origin.unwrap_or(me)),
+                    rev: g.rev,
+                    epoch: g.epoch,
+                })
+            })
+            .collect(),
+        addr_claims: federation::persisted_claims(sh),
+    }
 }
 
 fn snapshot(
     sh_identity: &proto::Identity,
     links: &[RotationLink],
     s: &State,
+    federation: persist::PFederation,
 ) -> persist::Persisted {
     persist::Persisted {
         ed_seed: sh_identity.ed_seed,
@@ -1192,6 +1434,7 @@ fn snapshot(
         next_gid: s.next_gid,
         rotations: links.iter().map(|l| hex(&l.to_bytes())).collect(),
         user_ips: s.leases.iter().map(|(k, ip)| (hex(k), ip)).collect(),
+        federation,
         groups: s
             .groups
             .values()
@@ -1256,7 +1499,13 @@ fn save_now(sh: &Shared) {
     if !sh.dirty.swap(false, Ordering::Relaxed) && sh.store.stamp() == *sh.written.lock().unwrap() {
         return;
     }
-    let mut snap = snapshot(&sh.identity, &sh.links, &sh.state.read().unwrap());
+    // Таблица пиров федерации — до взятия блокировки состояния: `fed` не
+    // удерживается при `state` (порядок блокировок, см. `Shared::fed`).
+    let fed = {
+        let s = sh.state.read().unwrap();
+        federation_snapshot(sh, &s)
+    };
+    let mut snap = snapshot(&sh.identity, &sh.links, &sh.state.read().unwrap(), fed);
     keep_rotated_key(sh, &mut snap);
     match sh.store.save(&snap) {
         Ok(()) => *sh.written.lock().unwrap() = sh.store.stamp(),
@@ -1333,6 +1582,8 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        // Федерация: переотправка SRV_HELLO, таймауты попыток и сессий.
+        federation::tick(&sh);
         refresh_gauges(&sh);
         if sh.list_dirty.swap(false, Ordering::Relaxed) {
             broadcast_group_list(&sh);
@@ -1479,6 +1730,10 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
     };
     if proto::grp::is_group(typ) {
         relay_group(sh, src, datagram);
+    } else if typ == ctrl::PROBE_REQ {
+        // Проба доступности: открытым текстом, без сессии и рукопожатия,
+        // ответ не длиннее запроса (§3.7).
+        probe::handle_probe_req(sh, src, body);
     } else if typ == ctrl::HELLO || typ == ctrl::HELLO3 {
         // Один жетон на HELLO — он же покрывает ответ (CHALLENGE /
         // UNSUPPORTED / WELCOME): ответ без жетона не уходит.
@@ -1496,8 +1751,21 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         } else {
             handle_hello3(sh, src, body);
         }
+    } else if proto::mesh::is_mesh(typ) {
+        // Mesh-кадры — пир ↔ пир: серверу они не адресованы (пир не
+        // зарегистрирован сессией). Молча роняем, без RESET — иначе
+        // mesh-пиры получали бы RESET на каждый кадр (§4.3).
+        sh.drop_frame();
+    } else if proto::federation::is_fed(typ) {
+        // Федерация серверов (T4a/T4b1): рукопожатие SRV_HELLO/ACK и кадры
+        // сессии (репликация групп/адресов, релей). Необработанный кадр молча
+        // роняется, без RESET чужому серверу.
+        if !federation::on_frame(sh, src, typ, body) {
+            sh.drop_frame();
+        }
     } else if ctrl::is_plaintext(typ) {
-        // WELCOME / CHALLENGE / RESET / UNSUPPORTED от клиента — мусор.
+        // WELCOME / CHALLENGE / RESET / UNSUPPORTED / PROBE_RESP от клиента —
+        // мусор.
         sh.drop_frame();
     } else {
         handle_ctrl_frame(sh, src, typ, body);
@@ -1519,7 +1787,8 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         sh.drop_frame();
         return;
     };
-    let target = {
+    let mut fed_send: Option<(SocketAddr, Vec<u8>)> = None;
+    let local = {
         let s = sh.state.read().unwrap();
         let Some(ses) = s.sessions.get(&src) else {
             drop(s);
@@ -1539,12 +1808,11 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
                 return;
             }
         }
-        let Some(dst_pk) = g.by_ip.get(&h.dst) else {
+        let Some(dst_pk) = g.by_ip.get(&h.dst).copied() else {
             return;
         };
-        let Some(addr) = s.by_pub.get(dst_pk).copied() else {
-            return;
-        };
+        // Общий с локальным релеем лимит: иначе федеративный релей обходил бы
+        // `--relay-rate`.
         if !ses
             .relay
             .lock()
@@ -1554,11 +1822,28 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
             sh.drop_frame();
             return;
         }
-        addr
+        match s.by_pub.get(&dst_pk).copied() {
+            Some(addr) => Some(addr),
+            None => {
+                // Получатель не на этом сервере: если группа федерирована,
+                // кадр заворачивается серверу получателя (`FED_RELAY`).
+                if let Some(uuid) = g.fed_uuid {
+                    fed_send =
+                        federation::relay_for_peer(sh, &uuid, &ses.ed_pub, &dst_pk, datagram);
+                }
+                None
+            }
+        }
     };
-    sh.relayed.fetch_add(1, Ordering::Relaxed);
-    sh.metrics.relayed(datagram.len());
-    sh.send_to(datagram, target);
+    if let Some(addr) = local {
+        sh.relayed.fetch_add(1, Ordering::Relaxed);
+        sh.metrics.relayed(datagram.len());
+        sh.send_to(datagram, addr);
+    }
+    if let Some((addr, frame)) = fed_send {
+        sh.metrics.relayed(frame.len());
+        sh.send_to(&frame, addr);
+    }
 }
 
 // ---------- отправка ----------
@@ -1613,6 +1898,16 @@ fn member_info(s: &State, pk: &[u8; 32], m: &Member, viewer: &[u8; 32]) -> Membe
     }
 }
 
+/// Сколько живёт публикация mesh-контакта (`MESH_INFO`) без повтора: клиент
+/// шлёт её раз в 5 минут, а если mesh выключил — сервер перестаёт отдавать
+/// его x-ключ/caps через 15 минут (§3.2: контакт без подтверждения — мёртв).
+const MESH_TTL_MS: u64 = 15 * 60 * 1000;
+
+/// Публикация mesh-контакта сессии жива (MESH_INFO не старше `MESH_TTL_MS`).
+fn mesh_fresh(ses: &Session) -> bool {
+    ses.x_pub.is_some() && unix_ms().saturating_sub(ses.mesh_last_seen) < MESH_TTL_MS
+}
+
 fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
     let mut members: Vec<MemberInfo> = g
         .members
@@ -1620,6 +1915,26 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
         .map(|(pk, m)| member_info(s, pk, m, viewer))
         .collect();
     members.sort_by_key(|m| m.ip);
+    // Mesh-метаданные — только у тех, кто их опубликовал (MESH_INFO) и кто
+    // сейчас онлайн: офлайн-участник без сессии x_pub не имеет. Сортировка по
+    // ip — как у участников; сопоставление на клиенте по ip, не по индексу.
+    let mut mesh: Vec<pl::MeshEntry> = g
+        .members
+        .iter()
+        .filter_map(|(pk, m)| {
+            let (_, ses) = s.session_of(pk)?;
+            if !mesh_fresh(ses) {
+                return None;
+            }
+            let x_pub = ses.x_pub?;
+            Some(pl::MeshEntry {
+                ip: m.ip,
+                x_pub,
+                caps: ses.caps,
+            })
+        })
+        .collect();
+    mesh.sort_by_key(|e| e.ip);
     GroupState {
         gid: g.id,
         rev: g.rev,
@@ -1632,7 +1947,39 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
         deleted: false,
         my_ip: g.members.get(viewer).map(|m| m.ip).unwrap_or(0),
         members,
+        mesh,
     }
+}
+
+/// До `limit` ближайших к `me` онлайн-сессий по XOR ed-ключей — MESH_SEED
+/// (§3.3): клиент начинает DHT-таблицу с них, даже если сервер потом пропадёт.
+///
+/// Невидимки не выдаются: их endpoint — ровно то, что скрывает `invisible`
+/// (`member_info` им адреса тоже не показывает).
+fn mesh_seed(s: &State, me: &[u8; 32], limit: usize) -> Vec<pl::MeshSeed> {
+    let mut v: Vec<([u8; 32], pl::MeshSeed)> = s
+        .sessions
+        .iter()
+        .filter_map(|(addr, ses)| {
+            if ses.ed_pub == *me || ses.invisible || !mesh_fresh(ses) {
+                return None;
+            }
+            let x_pub = ses.x_pub?;
+            let dist = proto::mesh::x25519_distance(me, &ses.ed_pub);
+            Some((
+                dist,
+                pl::MeshSeed {
+                    ed_pub: ses.ed_pub,
+                    x_pub,
+                    addr: *addr,
+                },
+            ))
+        })
+        .collect();
+    // Порядок детерминирован: одинаковое расстояние — по ключу.
+    v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.ed_pub.cmp(&b.1.ed_pub)));
+    v.truncate(limit);
+    v.into_iter().map(|(_, seed)| seed).collect()
 }
 
 /// GROUP_STATE удалённой (или несуществующей) группы: всё, кроме gid, — нули.
@@ -1649,12 +1996,679 @@ fn deleted_state(gid: u32) -> GroupState {
         deleted: true,
         my_ip: 0,
         members: vec![],
+        mesh: vec![],
     }
 }
 
 fn push_group_state(s: &State, g: &Group, addr: SocketAddr, ses: &Session, out: &mut Outbox) {
     let st = group_state(s, g, &ses.ed_pub);
     push_ctrl(out, addr, ses, ctrl::GROUP_STATE, &pl::enc_group_state(&st));
+}
+
+// ---------- федерация: репликация групп и адресов (T4b1) ----------
+
+/// Снимок своей (авторитетной здесь) группы для публикации пирам.
+fn group_snap(g: &Group) -> Option<federation::GroupSnap> {
+    let mut members: Vec<([u8; 32], u32)> = g.members.iter().map(|(pk, m)| (*pk, m.ip)).collect();
+    // Порядок детерминирован: `publish` сравнивает записи как значения, и
+    // случайный порядок HashMap давал бы ложные «изменения».
+    members.sort_unstable();
+    Some(federation::GroupSnap {
+        uuid: g.fed_uuid?,
+        gid: g.id,
+        name: g.name.clone(),
+        owner: g.owner,
+        private: g.private,
+        key: g.key,
+        epoch: g.epoch,
+        rev: g.rev,
+        members,
+    })
+}
+
+/// Снимки всех своих групп (для синхронизации с только что подключённым
+/// пиром: реплицированные копии не публикуются).
+pub(crate) fn fed_snaps(s: &State) -> Vec<federation::GroupSnap> {
+    s.groups
+        .values()
+        .filter(|g| g.fed_origin.is_none())
+        .filter_map(group_snap)
+        .collect()
+}
+
+/// Заявки на адреса наших identity: адрес каждой identity, известной
+/// локальному пулу (для общего пула федерации).
+pub(crate) fn fed_claims(s: &State, me: &[u8; 32]) -> Vec<proto::federation::FedAddrClaim> {
+    s.leases
+        .iter()
+        .map(|(pk, ip)| proto::federation::FedAddrClaim {
+            pk: *pk,
+            ip,
+            server: *me,
+            ts_ms: 0,
+        })
+        .collect()
+}
+
+/// Опубликовать пирам изменения групп, отмеченные `State::fed_dirty`, и
+/// удаления из `State::fed_deleted`. Вызывается под блокировкой состояния.
+pub(crate) fn fed_publish_dirty(sh: &Shared, s: &mut State, out: &mut Outbox) {
+    if s.fed_dirty.is_empty() && s.fed_deleted.is_empty() {
+        return;
+    }
+    // Сервер без федерации не меняет поведение: отметки просто снимаются.
+    if !federation::enabled(sh) {
+        s.fed_dirty.clear();
+        s.fed_deleted.clear();
+        return;
+    }
+    for gid in std::mem::take(&mut s.fed_dirty) {
+        let snap = {
+            let Some(g) = s.groups.get_mut(&gid) else {
+                continue;
+            };
+            // Копия чужой группы: источник правды не здесь — молчим.
+            if g.fed_origin.is_some() {
+                continue;
+            }
+            if g.fed_uuid.is_none() {
+                g.fed_uuid = Some(new_fed_uuid());
+            }
+            match group_snap(g) {
+                Some(x) => x,
+                None => continue,
+            }
+        };
+        federation::publish_group(sh, &snap, out);
+    }
+    for snap in std::mem::take(&mut s.fed_deleted) {
+        federation::publish_deleted(sh, &snap, out);
+    }
+    // Адреса identity — в общий пул (по одной заявке на адрес).
+    let claims = fed_claims(s, &sh.identity.ed_pub());
+    federation::publish_claims(sh, &claims, out);
+}
+
+/// Применить реплицированную запись группы (от сервера-владельца): создать
+/// локальную копию или обновить состав/ключ.
+pub(crate) fn fed_apply_group(sh: &Shared, rec: &proto::federation::FedGroup, from: &[u8; 32]) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let existing = s
+            .groups
+            .values()
+            .find(|g| g.fed_uuid == Some(rec.uuid))
+            .map(|g| g.id);
+        match existing {
+            // Группа с таким uuid авторитетна здесь: запись пира не может её
+            // заменить (источник правды — владелец на своей стороне).
+            Some(gid) if s.groups[&gid].fed_origin.is_none() => {
+                sh.log(format!(
+                    "federation: запись пира для своей группы {} проигнорирована",
+                    hex(&rec.uuid)
+                ));
+            }
+            Some(gid) => fed_update_group(&mut s, gid, rec, &mut out),
+            None => {
+                let Some(gid) = s.alloc_gid() else {
+                    sh.log("federation: нет свободных gid для реплицированной группы".into());
+                    return;
+                };
+                let mut g = Group::from_fed(gid, rec, *from);
+                // Имена участников, которые уже известны локально.
+                let names: HashMap<[u8; 32], (String, String)> = s
+                    .sessions
+                    .values()
+                    .map(|x| (x.ed_pub, (x.name.clone(), x.status.clone())))
+                    .collect();
+                for (pk, m) in g.members.iter_mut() {
+                    if let Some((name, status)) = names.get(pk) {
+                        m.name = name.clone();
+                        m.status = status.clone();
+                    }
+                }
+                sh.log(format!(
+                    "federation: реплицирована группа {} \"{}\" (gid {gid})",
+                    hex(&rec.uuid),
+                    g.name
+                ));
+                s.groups.insert(gid, g);
+                sh.list_dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    sh.flush(out);
+    sh.dirty.store(true, Ordering::Relaxed);
+    sh.save_soon();
+}
+
+/// Обновить реплицированную группу полной записью владельца.
+fn fed_update_group(s: &mut State, gid: u32, rec: &proto::federation::FedGroup, out: &mut Outbox) {
+    let recipients: Vec<[u8; 32]>;
+    {
+        let Some(g) = s.groups.get_mut(&gid) else {
+            return;
+        };
+        // Устаревшая/повторная запись — ничего не меняет.
+        if rec.rev <= g.rev {
+            return;
+        }
+        g.name = clean(&rec.name, GROUP_NAME_MAX_CHARS);
+        g.owner = rec.owner;
+        g.private = rec.private;
+        g.key = rec.key;
+        g.epoch = rec.epoch.max(1);
+        g.rev = rec.rev;
+        // Состав — ровно как у владельца (источник правды).
+        let want: HashMap<[u8; 32], u32> = rec.members.iter().map(|m| (m.pk, m.ip)).collect();
+        let old: Vec<[u8; 32]> = g.members.keys().copied().collect();
+        for pk in old {
+            if !want.contains_key(&pk) {
+                g.remove_member(&pk);
+            }
+        }
+        for (pk, ip) in &want {
+            if !leases::valid(*ip) {
+                continue;
+            }
+            if let Some(cur) = g.by_ip.get(ip).copied()
+                && cur != *pk
+            {
+                continue;
+            }
+            // Имя/статус уже известного участника сохраняем.
+            let (name, status) = match g.members.get(pk) {
+                Some(m) => (m.name.clone(), m.status.clone()),
+                None => ("…".to_string(), String::new()),
+            };
+            g.insert_member(
+                *pk,
+                Member {
+                    ip: *ip,
+                    name,
+                    status,
+                },
+            );
+        }
+        recipients = g.members.keys().copied().collect();
+    }
+    for pk in recipients {
+        if let Some((addr, ses)) = s.session_of(&pk) {
+            let g = &s.groups[&gid];
+            push_group_state(s, g, addr, ses, out);
+        }
+    }
+}
+
+/// Применить дельту реплицированной группы (вход/выход участника, ключ).
+pub(crate) fn fed_apply_delta(sh: &Shared, d: &proto::federation::FedGroupDelta, _from: &[u8; 32]) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let Some(gid) = s
+            .groups
+            .values()
+            .find(|g| g.fed_uuid == Some(d.uuid))
+            .map(|g| g.id)
+        else {
+            sh.log(format!(
+                "federation: дельта группы {} неизвестна — ждём полную запись",
+                hex(&d.uuid)
+            ));
+            return;
+        };
+        let mut deleted = false;
+        let mut changed = false;
+        let recipients: Vec<[u8; 32]>;
+        {
+            let Some(g) = s.groups.get_mut(&gid) else {
+                return;
+            };
+            if d.rev <= g.rev {
+                return;
+            }
+            for change in &d.changes {
+                match change {
+                    FedChange::MemberAdd { pk, ip } => {
+                        if !leases::valid(*ip) {
+                            continue;
+                        }
+                        match g.members.get(pk).map(|m| m.ip) {
+                            Some(old_ip) if old_ip == *ip => {}
+                            Some(old_ip) => {
+                                g.by_ip.remove(&old_ip);
+                                if let Some(m) = g.members.get_mut(pk) {
+                                    m.ip = *ip;
+                                }
+                                g.by_ip.insert(*ip, *pk);
+                                changed = true;
+                            }
+                            None => {
+                                g.insert_member(
+                                    *pk,
+                                    Member {
+                                        ip: *ip,
+                                        name: "…".into(),
+                                        status: String::new(),
+                                    },
+                                );
+                                changed = true;
+                            }
+                        }
+                    }
+                    FedChange::MemberRemove { pk } => {
+                        changed |= g.remove_member(pk);
+                    }
+                    FedChange::Meta {
+                        name,
+                        owner,
+                        private,
+                        key,
+                        epoch,
+                    } => {
+                        g.name = clean(name, GROUP_NAME_MAX_CHARS);
+                        g.owner = *owner;
+                        g.private = *private;
+                        g.key = *key;
+                        g.epoch = (*epoch).max(1);
+                        changed = true;
+                    }
+                    FedChange::Deleted => deleted = true,
+                }
+            }
+            g.rev = d.rev;
+            recipients = g.members.keys().copied().collect();
+        }
+        if deleted {
+            let frame = pl::enc_group_state(&deleted_state(gid));
+            for pk in recipients {
+                if let Some((addr, ses)) = s.session_of(&pk) {
+                    push_ctrl(&mut out, addr, ses, ctrl::GROUP_STATE, &frame);
+                }
+            }
+            s.groups.remove(&gid);
+            sh.list_dirty.store(true, Ordering::Relaxed);
+        } else if changed {
+            for pk in recipients {
+                if let Some((addr, ses)) = s.session_of(&pk) {
+                    let g = &s.groups[&gid];
+                    push_group_state(&s, g, addr, ses, &mut out);
+                }
+            }
+            sh.list_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+    sh.flush(out);
+    sh.dirty.store(true, Ordering::Relaxed);
+}
+
+/// Владелец удалил реплицированную группу: локальные участники получают
+/// «удалена», копия снимается.
+pub(crate) fn fed_delete_repl(sh: &Shared, uuid: &[u8; 16]) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let Some(gid) = s
+            .groups
+            .values()
+            .find(|g| g.fed_uuid == Some(*uuid))
+            .map(|g| g.id)
+        else {
+            return;
+        };
+        let frame = pl::enc_group_state(&deleted_state(gid));
+        let recipients: Vec<[u8; 32]> = s.groups[&gid].members.keys().copied().collect();
+        for pk in recipients {
+            if let Some((addr, ses)) = s.session_of(&pk) {
+                push_ctrl(&mut out, addr, ses, ctrl::GROUP_STATE, &frame);
+            }
+        }
+        s.groups.remove(&gid);
+        sh.list_dirty.store(true, Ordering::Relaxed);
+        sh.log(format!(
+            "federation: группа {} удалена владельцем",
+            hex(uuid)
+        ));
+    }
+    sh.flush(out);
+    sh.dirty.store(true, Ordering::Relaxed);
+}
+
+/// Перевыдать адрес локальной identity, проигравшей конфликт пула, и
+/// сообщить об этом пирам.
+pub(crate) fn fed_reissue_addr(sh: &Shared, pk: &[u8; 32], lost_ip: u32) {
+    let new_ip = {
+        let mut s = sh.state.write().unwrap();
+        if s.leases.get(pk) != Some(lost_ip) {
+            // Не наша identity (или адрес уже перевыдан) — конфликт решает
+            // сервер-владелец адреса.
+            return;
+        }
+        s.leases.revoke(pk);
+        let Some(ip) = s.ip_for(*pk) else {
+            sh.log(format!(
+                "federation: {} проиграла конфликт адреса, но свободных адресов нет",
+                short(pk)
+            ));
+            return;
+        };
+        // Адрес identity изменился во всех группах; свои группы — пирам.
+        let mut dirty = Vec::new();
+        for g in s.groups.values_mut() {
+            if g.set_member_ip(pk, ip) {
+                g.bump();
+                if g.fed_origin.is_none() {
+                    dirty.push(g.id);
+                }
+            }
+        }
+        for gid in dirty {
+            s.fed_dirty.insert(gid);
+        }
+        ip
+    };
+    sh.log(format!(
+        "federation: {} проиграла конфликт адреса {} → {}",
+        short(pk),
+        ip_str(lost_ip),
+        ip_str(new_ip)
+    ));
+    federation::publish_claim(sh, *pk, new_ip);
+}
+
+/// Зарезервировать/освободить адрес удалённой identity в локальном пуле.
+pub(crate) fn fed_reserve_addr(sh: &Shared, pk: &[u8; 32], ip: u32, on: bool) {
+    let mut s = sh.state.write().unwrap();
+    if s.leases.get(pk).is_some() {
+        // Локальная identity: её адрес — в leases, резерв ни к чему.
+        return;
+    }
+    if on {
+        s.leases.reserve(ip);
+    } else {
+        s.leases.unreserve(ip);
+    }
+}
+
+/// Доставить релейнутый другим сервером кадр локальному получателю.
+///
+/// Проверки: группа реплицирована здесь, отправитель — её участник,
+/// получатель — участник с живой сессией, кадр разбирается и зашифрован
+/// ключом текущей эпохи. Кадр пересобирается под местный gid (у каждого
+/// сервера он свой) и отдаётся в сессию получателя.
+pub(crate) fn fed_deliver_relay(sh: &Shared, from: &[u8; 32], rel: &FedRelay) {
+    let mut reason = 0u8;
+    let mut deliver: Option<(SocketAddr, Vec<u8>)> = None;
+    {
+        let s = sh.state.read().unwrap();
+        match s.groups.values().find(|g| g.fed_uuid == Some(rel.uuid)) {
+            None => reason = proto::federation::nack::NO_GROUP,
+            Some(g) => {
+                let Some(sm) = g.members.get(&rel.sender) else {
+                    return fed_deliver_reply(sh, from, rel, proto::federation::nack::NO_SENDER);
+                };
+                let Some(dm) = g.members.get(&rel.dst) else {
+                    return fed_deliver_reply(sh, from, rel, proto::federation::nack::NO_DST);
+                };
+                let Ok((_typ, h)) = proto::parse_group_header(&rel.frame) else {
+                    return fed_deliver_reply(sh, from, rel, proto::federation::nack::BAD_FRAME);
+                };
+                if h.src != sm.ip || h.dst != dm.ip || h.epoch != g.epoch {
+                    return fed_deliver_reply(sh, from, rel, proto::federation::nack::BAD_FRAME);
+                }
+                let Some((addr, _)) = s.session_of(&rel.dst) else {
+                    return fed_deliver_reply(sh, from, rel, proto::federation::nack::NO_SESSION);
+                };
+                let Ok((typ, _, _, payload)) = proto::open_group(&g.key, &rel.frame) else {
+                    return fed_deliver_reply(sh, from, rel, proto::federation::nack::BAD_FRAME);
+                };
+                let nh = proto::GroupHeader {
+                    gid: g.id,
+                    src: h.src,
+                    dst: h.dst,
+                    epoch: g.epoch,
+                };
+                let counter = federation::relay_counter(sh, &rel.uuid);
+                deliver = Some((addr, proto::seal_group(&g.key, typ, &nh, counter, &payload)));
+            }
+        }
+    }
+    if let Some((addr, frame)) = deliver {
+        metrics::Metrics::inc(&sh.metrics.fed_relayed, 1);
+        sh.send_to(&frame, addr);
+        federation::reply_relay(
+            sh,
+            from,
+            &FedRelayReply {
+                uuid: rel.uuid,
+                dst: rel.dst,
+                ok: true,
+                reason: 0,
+            },
+        );
+    } else {
+        fed_deliver_reply(sh, from, rel, reason.max(1));
+    }
+}
+
+/// Отказ в релее: лог + `NACK` пиру.
+fn fed_deliver_reply(sh: &Shared, from: &[u8; 32], rel: &FedRelay, reason: u8) {
+    sh.log(format!(
+        "federation: релей {} для {} отклонён: {}",
+        hex(&rel.uuid),
+        short(&rel.dst),
+        proto::federation::nack::text(reason)
+    ));
+    federation::reply_relay(
+        sh,
+        from,
+        &FedRelayReply {
+            uuid: rel.uuid,
+            dst: rel.dst,
+            ok: false,
+            reason,
+        },
+    );
+}
+
+/// Владелец принимает заявку пира на вход своего клиента в группу
+/// (`JOIN_FED` на стороне пира): только публичные группы, только
+/// незабаненных, с ротацией ключа и рассылкой нового состояния.
+pub(crate) fn fed_accept_join(
+    sh: &Shared,
+    uuid: &[u8; 16],
+    _from: &[u8; 32],
+    changes: &[FedChange],
+) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let Some(gid) = s
+            .groups
+            .values()
+            .find(|g| g.fed_uuid == Some(*uuid))
+            .map(|g| g.id)
+        else {
+            sh.log(format!(
+                "federation: заявка на вход в неизвестную группу {} — полной записи не было",
+                hex(uuid)
+            ));
+            return;
+        };
+        // Заявки по чужой группе (копии) не принимаются: источник правды не
+        // здесь.
+        if s.groups[&gid].fed_origin.is_some() {
+            return;
+        }
+        let mut accepted = Vec::new();
+        {
+            let Some(g) = s.groups.get_mut(&gid) else {
+                return;
+            };
+            for change in changes {
+                let FedChange::MemberAdd { pk, ip } = change else {
+                    continue;
+                };
+                if !leases::valid(*ip)
+                    || g.private
+                    || g.full()
+                    || g.banned.contains_key(pk)
+                    || g.members.contains_key(pk)
+                {
+                    continue;
+                }
+                g.insert_member(
+                    *pk,
+                    Member {
+                        ip: *ip,
+                        name: "…".into(),
+                        status: String::new(),
+                    },
+                );
+                g.rotate(false);
+                g.bump();
+                accepted.push(*pk);
+            }
+        }
+        if accepted.is_empty() {
+            return;
+        }
+        s.fed_dirty.insert(gid);
+        for pk in accepted {
+            sh.log(format!(
+                "federation: вход {} в {gid} по заявке пира",
+                short(&pk)
+            ));
+        }
+        let recipients: Vec<[u8; 32]> = s.groups[&gid].members.keys().copied().collect();
+        for pk in recipients {
+            if let Some((addr, ses)) = s.session_of(&pk) {
+                let g = &s.groups[&gid];
+                push_group_state(&s, g, addr, ses, &mut out);
+            }
+        }
+        sh.list_dirty.store(true, Ordering::Relaxed);
+        fed_publish_dirty(sh, &mut s, &mut out);
+    }
+    sh.flush(out);
+    sh.dirty.store(true, Ordering::Relaxed);
+    sh.save_soon();
+}
+
+/// `FED_GROUPS` клиенту: доступные федерированные группы (реплицированные
+/// с других серверов). Пусто — кадр не шлётся (старые клиенты его не знают).
+fn push_fed_groups(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox) {
+    let mut items: Vec<pl::FedGroup> = s
+        .groups
+        .values()
+        .filter(|g| g.fed_origin.is_some())
+        .filter_map(|g| {
+            Some(pl::FedGroup {
+                uuid: g.fed_uuid?,
+                gid: g.id,
+                name: g.name.clone(),
+                owner: g.owner,
+                members: g.members.len().min(u16::MAX as usize) as u16,
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    items.sort_by_key(|i| i.gid);
+    push_ctrl(
+        out,
+        addr,
+        ses,
+        ctrl::FED_GROUPS,
+        &pl::enc_fed_groups(&items),
+    );
+}
+
+/// `JOIN_FED`: вход в федерированную группу по uuid → локальный gid и
+/// обычный `GROUP_STATE` (T4b1, серверная часть).
+fn join_fed(
+    sh: &Shared,
+    s: &mut State,
+    src: SocketAddr,
+    me: &[u8; 32],
+    uuid: &[u8; 16],
+    out: &mut Outbox,
+) -> Result<()> {
+    anyhow::ensure!(
+        federation::enabled(sh),
+        "федерация серверов выключена (--federate)"
+    );
+    let gid = s
+        .groups
+        .values()
+        .find(|g| g.fed_uuid == Some(*uuid))
+        .map(|g| g.id)
+        .context("федерированная группа не найдена")?;
+    let (uname, ustatus) = {
+        let ses = &s.sessions[&src];
+        (ses.name.clone(), ses.status.clone())
+    };
+    if !s.groups[&gid].members.contains_key(me) {
+        {
+            let g = &s.groups[&gid];
+            anyhow::ensure!(!g.banned.contains_key(me), "вы забанены в этой группе");
+            anyhow::ensure!(
+                !g.private,
+                "группа приватная: вход только по приглашению владельца"
+            );
+            anyhow::ensure!(!g.full(), "группа заполнена");
+        }
+        let ip = s.ip_for(*me).context("нет свободных адресов на сервере")?;
+        let (own, origin, owner, rev) = {
+            let g = &s.groups[&gid];
+            (g.fed_origin.is_none(), g.fed_origin, g.owner, g.rev)
+        };
+        {
+            let g = s.groups.get_mut(&gid).unwrap();
+            g.insert_member(
+                *me,
+                Member {
+                    ip,
+                    name: uname.clone(),
+                    status: ustatus.clone(),
+                },
+            );
+            if own {
+                // Владелец здесь: вход — как JOIN_GROUP (ротация ключа).
+                g.rotate(false);
+                g.bump();
+            }
+        }
+        if own {
+            s.fed_dirty.insert(gid);
+        } else if origin.is_some() {
+            // Копия: вход подтверждает владелец — заявка ему (он ротирует
+            // ключ и пришлёт дельту).
+            federation::request_join(sh, uuid, &owner, *me, ip, rev, out);
+        }
+        // Адрес вошедшего — в общий пул: пиры должны знать, где он живёт
+        // (иначе релей до него не найдёт сервер).
+        let claim = proto::federation::FedAddrClaim {
+            pk: *me,
+            ip,
+            server: sh.identity.ed_pub(),
+            ts_ms: unix_ms(),
+        };
+        federation::publish_claims(sh, &[claim], out);
+        sh.log(format!(
+            "join_fed: {} → {} \"{}\" as {}",
+            uname,
+            hex(uuid),
+            s.groups[&gid].name,
+            ip_str(ip)
+        ));
+    }
+    push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
+    push_group_list(s, src, &s.sessions[&src], out);
+    sh.list_dirty.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Что изменилось в группе — тело дельты GROUP_UPDATE.
@@ -1696,6 +2710,23 @@ fn push_update(
                 private: g.private,
             },
         };
+        // Mesh-хвост kind 1 (§4.2): ключ и возможности изменившегося
+        // участника. Старые клиенты хвост игнорируют, v4-сервер его не шлёт.
+        let mesh = match change {
+            Change::Member(who) => s
+                .session_of(who)
+                .and_then(|(_, x)| x.x_pub.map(|x_pub| (x_pub, x.caps)))
+                .map(|(x_pub, caps)| {
+                    vec![pl::MeshEntry {
+                        // ip в хвосте UPDATE нет — он в MemberInfo дельты.
+                        ip: 0,
+                        x_pub,
+                        caps,
+                    }]
+                })
+                .unwrap_or_default(),
+            Change::Removed(_) | Change::Meta => Vec::new(),
+        };
         let u = GroupUpdate {
             gid: g.id,
             rev: g.rev,
@@ -1704,6 +2735,7 @@ fn push_update(
             revoke_prev: g.revoke_prev,
             key: g.key,
             delta,
+            mesh,
         };
         push_ctrl(
             out,
@@ -1867,6 +2899,9 @@ fn push_group_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox)
         ctrl::GROUP_LIST,
         &pl::enc_group_list(&items),
     );
+    // T4b1: доступные федерированные группы. Пусто — кадр не шлётся, и
+    // сервер без федерации ведёт себя как раньше.
+    push_fed_groups(s, addr, ses, out);
 }
 
 /// GROUP_LIST всем сессиям — из housekeeping по `list_dirty`, под
@@ -1886,6 +2921,7 @@ fn broadcast_group_list(sh: &Shared) {
                 ctrl::GROUP_LIST,
                 &pl::enc_group_list(&items),
             );
+            push_fed_groups(&s, *a, ses, &mut out);
         }
     }
     sh.flush(out);
@@ -2123,6 +3159,9 @@ fn install_session(
             last_seen: AtomicU64::new(sh.now_ms()),
             relay: Mutex::new(Bucket::new(sh.limits.relay_burst)),
             ctrl: Mutex::new(Bucket::new(sh.limits.ctrl_burst)),
+            x_pub: None,
+            caps: 0,
+            mesh_last_seen: 0,
         },
     );
     s.by_pub.insert(ed, src);
@@ -2182,6 +3221,11 @@ fn is_mutation(typ: u8) -> bool {
             | ctrl::DELETE_GROUP
             | ctrl::CANDIDATES
             | ctrl::PRESENCE
+            // Этап 9: меняют состояние сессии/федерации. MESH_SEED и
+            // FED_GROUPS — сервер → клиент (в is_query их быть не должно).
+            | ctrl::MESH_INFO
+            | ctrl::SERVER_HINT
+            | ctrl::JOIN_FED
     )
 }
 
@@ -2264,6 +3308,9 @@ fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
             if is_urgent(typ) {
                 sh.save_soon();
             }
+            // T4b1: изменения групп владельца — пирам (`PUSH`/`DELTA`), а
+            // адреса новых участников — в общий пул.
+            fed_publish_dirty(sh, &mut s, &mut out);
             if let Some(ses) = s.sessions.get(&src) {
                 report(sh, src, ses, typ, r, &mut out);
             }
@@ -2290,7 +3337,17 @@ fn handle_query(
 ) -> Result<()> {
     let me = &ses.ed_pub;
     match typ {
-        ctrl::CTRL_PING => push_ctrl(out, src, ses, ctrl::CTRL_PONG, &[]),
+        ctrl::CTRL_PING => {
+            // Эхо 8-байтовой метки клиента (RTT до сервера, в т.ч. по TCP):
+            // старый клиент шлёт пустой payload — получает пустой ответ
+            // («RTT неизвестен»), и его измерение сервера не ломается.
+            let pong: Vec<u8> = if payload.len() == 8 {
+                payload.to_vec()
+            } else {
+                Vec::new()
+            };
+            push_ctrl(out, src, ses, ctrl::CTRL_PONG, &pong)
+        }
         ctrl::LIST_GROUPS => push_group_list(s, src, ses, out),
         ctrl::LIST_INVITES => {
             let from = pl::dec_u32(payload)?;
@@ -2414,6 +3471,44 @@ fn handle_mutation(
                 &pl::enc_presence(invisible),
             );
         }
+        ctrl::MESH_INFO => {
+            // Публикация mesh-контакта (§4.1): статический x-ключ и caps.
+            // Хранится в сессии: участнику он нужен, пока тот онлайн.
+            let (x_pub, caps) = pl::dec_mesh_info(payload)?;
+            let checked = {
+                let ses = s.sessions.get_mut(&src).unwrap();
+                let changed = ses.x_pub != Some(x_pub) || ses.caps != caps;
+                ses.x_pub = Some(x_pub);
+                ses.caps = caps;
+                ses.mesh_last_seen = unix_ms();
+                changed
+            };
+            // Изменился видимый состав (mesh-секция GROUP_STATE) — дельта
+            // всем участникам, иначе ключ узнают лишь при следующем изменении.
+            if checked {
+                member_changed(s, &me, out);
+            }
+            // Ответ — семя DHT: ближайшие онлайн-сессии (≤ 16). Шлётся и на
+            // повтор: клиенту нужен список после переподключения.
+            let seeds = mesh_seed(s, &me, pl::MAX_MESH_SEED);
+            push_ctrl(
+                out,
+                src,
+                &s.sessions[&src],
+                ctrl::MESH_SEED,
+                &pl::enc_mesh_seed(&seeds),
+            );
+        }
+        ctrl::SERVER_HINT => {
+            // Кандидаты-серверы: сервер им не доверяет (T4 проверит ключи).
+            let hints = pl::dec_server_hint(payload)?;
+            federation::on_hint(sh, &me, &hints);
+        }
+        ctrl::JOIN_FED => {
+            anyhow::ensure!(payload.len() == 16, "JOIN_FED: uuid 16 байт");
+            let uuid: [u8; 16] = payload.try_into().unwrap();
+            join_fed(sh, s, src, &me, &uuid, out)?;
+        }
         ctrl::CREATE_GROUP => {
             let (name, private) = pl::dec_create_group(payload)?;
             let name = clean(&name, GROUP_NAME_MAX_CHARS);
@@ -2445,6 +3540,9 @@ fn handle_mutation(
                 invites: HashMap::new(),
                 joins: Bucket::full(),
                 left: HashMap::new(),
+                // uuid назначится ниже, если федерация включена.
+                fed_uuid: None,
+                fed_origin: None,
             };
             g.insert_member(
                 me,
@@ -2455,6 +3553,12 @@ fn handle_mutation(
                 },
             );
             s.groups.insert(gid, g);
+            if federation::enabled(sh) {
+                // uuid федерации — на всю жизнь группы (иначе после
+                // рестарта пиры видели бы её как новую).
+                s.groups.get_mut(&gid).unwrap().fed_uuid = Some(new_fed_uuid());
+                s.fed_dirty.insert(gid);
+            }
             sh.log(format!("created group {gid} \"{name}\" by {uname}"));
             push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
             push_group_list(s, src, &s.sessions[&src], out);
@@ -2531,6 +3635,7 @@ fn handle_mutation(
             // до входа); прошлый ключ остаётся в grace.
             g.rotate(false);
             let base = g.bump();
+            s.fed_dirty.insert(gid);
             sh.log(format!(
                 "join: {uname} → {gid} \"{gname}\" as {}",
                 ip_str(ip)
@@ -2563,6 +3668,7 @@ fn handle_mutation(
             });
             match base {
                 Some(base) => {
+                    s.fed_dirty.insert(gid);
                     sh.log(format!("leave: {uname} ← {gid}"));
                     push_update(s, &s.groups[&gid], base, &Change::Removed(me), None, out);
                     // Вышедшему — подтверждение сразу, остальным — рассылкой.
@@ -2716,6 +3822,7 @@ fn handle_mutation(
                 push_invite_list(s, addr, ses, out, invite_window(s, &target, gid));
             }
             if kicked {
+                s.fed_dirty.insert(gid);
                 sh.list_dirty.store(true, Ordering::Relaxed);
             }
         }
@@ -2755,6 +3862,7 @@ fn handle_mutation(
             );
             g.owner = target;
             let base = g.bump();
+            s.fed_dirty.insert(gid);
             sh.log(format!("owner {gid}: {} → {}", short(&me), short(&target)));
             push_update(s, &s.groups[&gid], base, &Change::Meta, None, out);
         }
@@ -2766,6 +3874,7 @@ fn handle_mutation(
             anyhow::ensure!(!name.is_empty(), "пустое имя группы");
             g.name = name.clone();
             let base = g.bump();
+            s.fed_dirty.insert(gid);
             sh.log(format!("renamed {gid} → \"{name}\""));
             push_update(s, &s.groups[&gid], base, &Change::Meta, None, out);
             sh.list_dirty.store(true, Ordering::Relaxed);
@@ -2774,6 +3883,10 @@ fn handle_mutation(
             let gid = pl::dec_gid(payload)?;
             let g = s.groups.get(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "может только владелец");
+            // Пиры узнают об удалении: запись с `deleted` (T4b1).
+            if let Some(snap) = group_snap(g) {
+                s.fed_deleted.push(snap);
+            }
             let removed = s.groups.remove(&gid).unwrap();
             sh.log(format!("deleted group {gid}"));
             let frame = pl::enc_group_state(&deleted_state(gid));
@@ -2824,6 +3937,8 @@ mod tests {
             invites: HashMap::new(),
             joins: Bucket::full(),
             left: HashMap::new(),
+            fed_uuid: None,
+            fed_origin: None,
         }
     }
 
@@ -2836,6 +3951,8 @@ mod tests {
             next_gid: GID_MIN,
             invite_ttl_ms: duration_ms(Limits::default().invite_ttl),
             retired_eph: HashMap::new(),
+            fed_dirty: HashSet::new(),
+            fed_deleted: Vec::new(),
         }
     }
 
@@ -2891,6 +4008,37 @@ mod tests {
         None
     }
 
+    /// Просит у ядра увеличенный буфер приёма UDP: длинное сообщение сервера
+    /// (GROUP_STATE группы на 253 участника — ~215 КБ, ~175 кусков FRAG)
+    /// приходит залпом, дефолтных 64 КБ на Windows не хватает и лишние
+    /// датаграммы ядро выбрасывает — сборка не завершается никогда. Ошибка не
+    /// критична: остаётся дефолт.
+    ///
+    /// Только Windows: на Linux (`net.core.rmem_default`) и macOS дефолт уже
+    /// ≥ 128 КБ, тест там исторически зелёный, а `libc` в этом крейте нет —
+    /// лишнюю зависимость ради одного теста не тянем.
+    #[cfg(unix)]
+    fn set_recv_buffer(_sock: &UdpSocket, _bytes: usize) {}
+
+    /// Windows-вариант: `SO_RCVBUF` через Winsock (`std` сеттера не даёт).
+    #[cfg(windows)]
+    fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{SO_RCVBUF, SOL_SOCKET, setsockopt};
+        // SAFETY: `sock` жив всё время вызова, `len` — корректный `i32`,
+        // размер переданного значения совпадает с `optlen`.
+        unsafe {
+            let len = bytes as i32;
+            let _ = setsockopt(
+                sock.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                (&raw const len).cast(),
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+
     /// «Сырой» клиент поверх протокола — без движка клиента.
     struct Raw {
         sock: UdpSocket,
@@ -2921,6 +4069,7 @@ mod tests {
         /// Полное рукопожатие: HELLO3 → CHALLENGE → HELLO3 с cookie → WELCOME.
         fn connect_with(srv: SocketAddr, name: &str, id: &proto::Identity, flags: u8) -> Raw {
             let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            set_recv_buffer(&sock, 4 << 20);
             sock.set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
             let eph = proto::EphemeralKey::generate();
@@ -4341,6 +5490,9 @@ mod tests {
                         last_seen: AtomicU64::new(u64::MAX / 2),
                         relay: Mutex::new(Bucket::new(1.0)),
                         ctrl: Mutex::new(Bucket::new(1.0)),
+                        x_pub: None,
+                        caps: 0,
+                        mesh_last_seen: 0,
                     },
                 );
                 s.by_pub.insert(pk, addr);
@@ -5010,7 +6162,9 @@ mod tests {
         s.groups.insert(5, g);
         s.next_gid = 6;
         let id = proto::Identity::generate();
-        store.save(&snapshot(&id, &[], &s)).unwrap();
+        store
+            .save(&snapshot(&id, &[], &s, persist::PFederation::default()))
+            .unwrap();
 
         let l = load_state(&store).unwrap();
         let g = &l.groups[&5];
@@ -5330,6 +6484,663 @@ mod tests {
         let p = store.load().unwrap().unwrap();
         assert_eq!(p.user_ips.get(&hex(&x)), Some(&ip(5, 2)));
         assert_eq!(p.user_ips.get(&hex(&y)), Some(&ip(7, 2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- этап 9: mesh-контракт и проба ----------
+
+    #[test]
+    fn ctrl_pong_эхо_метки_и_старый_клиент() {
+        let (server, dir) = test_server("pong-label");
+        let a = Raw::connect(server.addr, "alpha");
+        a.sync();
+        // 8-байтовая метка возвращается как есть — по ней клиент считает RTT.
+        let label = 0x0102_0304_0506_0708u64;
+        a.send(ctrl::CTRL_PING, &label.to_be_bytes());
+        assert_eq!(a.expect(ctrl::CTRL_PONG), label.to_be_bytes());
+        // Пустой payload (старый клиент) — пустой ответ, а не ошибка.
+        a.send(ctrl::CTRL_PING, &[]);
+        assert!(a.expect(ctrl::CTRL_PONG).is_empty());
+        // Метка другой длины не считается меткой: ответ пустой.
+        a.send(ctrl::CTRL_PING, &[1, 2, 3]);
+        assert!(a.expect(ctrl::CTRL_PONG).is_empty());
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_отвечает_без_сессии_и_не_длиннее_запроса() {
+        let (server, dir) = test_server("probe");
+        let srv = server.addr;
+        // Обычный сокет без рукопожатия: проба не должна требовать сессии.
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let req = payloads::ProbeReq {
+            nonce: [9; payloads::PROBE_NONCE_LEN],
+            ts_ms: unix_ms(),
+            want_key: true,
+        };
+        let frame = proto::plain_frame(ctrl::PROBE_REQ, &payloads::enc_probe_req(&req));
+        sock.send_to(&frame, srv).unwrap();
+        let (body, resp) =
+            recv_plain(&sock, ctrl::PROBE_RESP, Duration::from_secs(3)).expect("нет PROBE_RESP");
+        // Ответ не длиннее запроса (24/56 ≤ 64) и с тем же nonce/ts.
+        assert!(resp.len() <= frame.len(), "ответ длиннее запроса");
+        let got = payloads::dec_probe_resp(&body).unwrap();
+        assert_eq!((got.nonce, got.ts_ms), (req.nonce, req.ts_ms));
+        assert!(got.ed_pub.is_some(), "want_key — ключ сервера в ответе");
+        // Просроченный запрос — молчание, не ответ.
+        let stale = payloads::ProbeReq {
+            ts_ms: unix_ms().saturating_sub(probe::PROBE_TS_SKEW_MS + 1),
+            ..req
+        };
+        let frame = proto::plain_frame(ctrl::PROBE_REQ, &payloads::enc_probe_req(&stale));
+        sock.send_to(&frame, srv).unwrap();
+        assert!(
+            recv_plain(&sock, ctrl::PROBE_RESP, Duration::from_millis(500)).is_none(),
+            "ответ на просроченную пробу"
+        );
+        // Битые длины — молчание (и никакой сессии/ошибки).
+        for n in [0usize, 32, 63, 65] {
+            let f = proto::plain_frame(ctrl::PROBE_REQ, &vec![0u8; n]);
+            sock.send_to(&f, srv).unwrap();
+        }
+        assert!(recv_plain(&sock, ctrl::PROBE_RESP, Duration::from_millis(500)).is_none());
+        // И сервер всё ещё работает: обычный клиент подключается.
+        let a = Raw::connect(srv, "alpha");
+        a.sync();
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mesh_info_даёт_seed_и_mesh_секцию_group_state() {
+        let (server, dir) = test_server("mesh-info");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let st = a.create("mesh", false);
+        let gid = st.gid;
+        let b = Raw::connect(srv, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let st_b = b.state();
+        assert_eq!(st_b.members.len(), 2);
+
+        // Оба публикуют mesh-контакт: x-ключ + возможности.
+        let (ax, bx) = ([0xAAu8; 32], [0xBBu8; 32]);
+        let caps_a = proto::mesh::caps::MESH | proto::mesh::caps::RELAY;
+        a.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&ax, caps_a));
+        // A получает семя: B (единственная другая сессия), ed/x/адрес — как
+        // публиковалось, и GROUP_UPDATE с mesh-хвостом.
+        let seed = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.expect(ctrl::MESH_SEED);
+
+        // Семя A: контакт B с тем же x-ключом и его реальным адресом.
+        let seed_all = payloads::dec_mesh_seed(&{
+            a.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&ax, caps_a));
+            a.expect(ctrl::MESH_SEED)
+        })
+        .unwrap();
+        let b_addr = b.sock.local_addr().unwrap();
+        assert!(
+            seed_all
+                .iter()
+                .any(|s| s.ed_pub == b.pk && s.x_pub == bx && s.addr == b_addr),
+            "в семени нет B: {seed_all:?}"
+        );
+        assert!(!seed_all.iter().any(|s| s.ed_pub == a.pk), "себя не выдаём");
+
+        // GROUP_STATE несёт mesh-секцию: обе записи, адреса — из состава.
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        let st = a.state();
+        let ip_a = st.members.iter().find(|m| m.pubkey == a.pk).unwrap().ip;
+        let ip_b = st.members.iter().find(|m| m.pubkey == b.pk).unwrap().ip;
+        assert_eq!(st.mesh.len(), 2, "mesh-секция: {:?}", st.mesh);
+        assert_eq!(
+            st.mesh
+                .iter()
+                .find(|e| e.ip == ip_a)
+                .map(|e| (e.x_pub, e.caps)),
+            Some((ax, caps_a))
+        );
+        assert_eq!(
+            st.mesh.iter().find(|e| e.ip == ip_b).map(|e| e.x_pub),
+            Some(bx)
+        );
+        // Записи упорядочены по ip (сопоставление с участниками — по ip).
+        let mut sorted = st.mesh.clone();
+        sorted.sort_by_key(|e| e.ip);
+        assert_eq!(st.mesh, sorted);
+
+        // GROUP_UPDATE kind 1 несёт mesh-хвост изменившегося участника:
+        // смена caps у B — дельта A получает x-ключ и caps.
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(
+                &bx,
+                proto::mesh::caps::MESH | proto::mesh::caps::ACCEPT_RELAY,
+            ),
+        );
+        let upd = a.update();
+        assert!(matches!(upd.delta, payloads::GroupDelta::Member(_)));
+        assert_eq!(upd.mesh.len(), 1);
+        assert_eq!(upd.mesh[0].x_pub, bx);
+        assert_eq!(
+            upd.mesh[0].caps,
+            proto::mesh::caps::MESH | proto::mesh::caps::ACCEPT_RELAY
+        );
+
+        // Старый клиент (v4) видит то же состояние: хвост он игнорирует, а
+        // участники/ключ на месте — проверяем, что GET_GROUP не сломался.
+        b.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().members.len(), 2);
+        // MESH_SEED — до 16 записей; больше сессий в тесте нет.
+        assert!(seed.len() <= payloads::MAX_MESH_SEED);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mesh_ttl_перестаёт_отдавать_контакт() {
+        let (server, dir) = test_server("mesh-ttl");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let st = a.create("ttl", false);
+        let gid = st.gid;
+        let b = Raw::connect(srv, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        // Оба публикуют mesh-контакт.
+        let (ax, bx) = ([0xAAu8; 32], [0xBBu8; 32]);
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.expect(ctrl::MESH_SEED);
+        a.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&ax, proto::mesh::caps::MESH),
+        );
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(seeds.iter().any(|s| s.ed_pub == b.pk && s.x_pub == bx));
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert!(a.state().mesh.iter().any(|e| e.x_pub == bx));
+        // Состарить публикацию B: MESH_INFO не повторялся дольше TTL.
+        {
+            let mut st = server.shared.state.write().unwrap();
+            let ses = st
+                .sessions
+                .values_mut()
+                .find(|s| s.ed_pub == b.pk)
+                .expect("сессия B жива");
+            ses.mesh_last_seen = unix_ms().saturating_sub(MESH_TTL_MS + 1);
+        }
+        // В семени B больше нет, а в mesh-секции его запись пропала.
+        a.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&ax, proto::mesh::caps::MESH),
+        );
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.ed_pub == b.pk),
+            "просроченный контакт остался в MESH_SEED: {seeds:?}"
+        );
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        let mesh = a.state().mesh;
+        assert!(!mesh.iter().any(|e| e.x_pub == bx), "хвост: {mesh:?}");
+        // Своя (A) публикация свежая — остаётся.
+        assert!(mesh.iter().any(|e| e.x_pub == ax));
+        // Новая публикация B оживляет контакт.
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.expect(ctrl::MESH_SEED);
+        a.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&ax, proto::mesh::caps::MESH),
+        );
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(seeds.iter().any(|s| s.ed_pub == b.pk), "контакт не ожил");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn невидимка_не_выдаётся_в_mesh_seed() {
+        let (server, dir) = test_server("mesh-invisible");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        a.sync();
+        // Невидимка публикует mesh-контакт, но её endpoint — тайна.
+        let inv = Raw::connect_with(
+            srv,
+            "ghost",
+            &proto::Identity::generate(),
+            hs::HELLO_FLAG_INVISIBLE,
+        );
+        inv.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&[0xCC; 32], 1));
+        inv.expect(ctrl::MESH_SEED);
+        a.send(ctrl::MESH_INFO, &payloads::enc_mesh_info(&[0xDD; 32], 1));
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.ed_pub == inv.pk),
+            "адрес невидимки утёк в MESH_SEED"
+        );
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- федерация: репликация и релей (T4b1) ----------
+
+    /// Сервер с включённой федерацией.
+    fn start_fed(dir: &Path) -> Server {
+        Server::start(Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.to_path_buf(),
+            workers: 1,
+            quiet: true,
+            federate: true,
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    fn ovl(c: u8, d: u8) -> u32 {
+        u32::from(Ipv4Addr::new(100, 66, c, d))
+    }
+
+    /// Группа-копия с сервера-владельца в состоянии: локальный gid и uuid
+    /// известны, участники — sender/dst.
+    fn repl_group(
+        s: &mut State,
+        gid: u32,
+        uuid: [u8; 16],
+        key: [u8; 32],
+        owner: [u8; 32],
+        members: &[([u8; 32], u32)],
+    ) {
+        let mut g = empty_group(gid);
+        g.name = "fed".into();
+        g.owner = owner;
+        g.key = key;
+        g.epoch = 1;
+        g.rev = 3;
+        g.fed_uuid = Some(uuid);
+        g.fed_origin = Some([0xAA; 32]);
+        for (pk, ip) in members {
+            g.insert_member(
+                *pk,
+                Member {
+                    ip: *ip,
+                    name: "m".into(),
+                    status: String::new(),
+                },
+            );
+        }
+        s.groups.insert(gid, g);
+    }
+
+    #[test]
+    fn join_fed_вход_в_реплицированную_группу() {
+        let dir = temp_dir("fed-join");
+        let server = start_fed(&dir);
+        let remote_owner = [7u8; 32];
+        let uuid = [0x66u8; 16];
+        let key = [0x3C; 32];
+        fed_apply_group(
+            &server.shared,
+            &proto::federation::FedGroup {
+                uuid,
+                owner: remote_owner,
+                gid: 42,
+                name: "remote".into(),
+                private: false,
+                key,
+                epoch: 4,
+                rev: 7,
+                members: vec![proto::federation::FedMember {
+                    pk: remote_owner,
+                    ip: ovl(9, 9),
+                }],
+                deleted: false,
+            },
+            &[0xAA; 32],
+        );
+        let local_gid = {
+            let s = server.shared.state.read().unwrap();
+            let g = s
+                .groups
+                .values()
+                .find(|g| g.fed_uuid == Some(uuid))
+                .expect("реплицированная группа не появилась");
+            g.id
+        };
+        assert_ne!(local_gid, 42, "локальный gid назначает этот сервер");
+
+        // Клиент видит доступную федерированную группу в FED_GROUPS.
+        let c = Raw::connect(server.addr, "fed-user");
+        c.send(ctrl::LIST_GROUPS, &[]);
+        let (_, payload) = c.until(ctrl::FED_GROUPS);
+        let fed = payloads::dec_fed_groups(&payload).unwrap();
+        let item = fed.iter().find(|g| g.uuid == uuid).expect("нет группы");
+        assert_eq!(item.gid, local_gid);
+        assert_eq!(item.members, 1);
+
+        // JOIN_FED → локальный gid и обычный GROUP_STATE.
+        c.send(ctrl::JOIN_FED, &uuid);
+        let st = c.state();
+        assert_eq!(st.gid, local_gid);
+        assert_eq!(st.owner, remote_owner);
+        assert_eq!(st.key, key, "ключ владельца, локальной ротации нет");
+        assert!(
+            st.members.iter().any(|m| m.pubkey == c.pk && m.ip != 0),
+            "вошедший не в составе: {:?}",
+            st.members
+        );
+        // Группа появилась в списке клиента.
+        c.send(ctrl::LIST_GROUPS, &[]);
+        let list = payloads::dec_group_list(&c.expect(ctrl::GROUP_LIST)).unwrap();
+        assert!(
+            list.iter().any(|g| g.gid == local_gid),
+            "нет в GROUP_LIST: {list:?}"
+        );
+
+        // Приватная копия: вход без приглашения — ошибка.
+        let mut priv_uuid = [0x77u8; 16];
+        let rec = proto::federation::FedGroup {
+            uuid: priv_uuid,
+            owner: remote_owner,
+            gid: 43,
+            name: "secret".into(),
+            private: true,
+            key,
+            epoch: 1,
+            rev: 1,
+            members: vec![],
+            deleted: false,
+        };
+        priv_uuid = rec.uuid;
+        fed_apply_group(&server.shared, &rec, &[0xAA; 32]);
+        let d = Raw::connect(server.addr, "fed-user-2");
+        d.send(ctrl::JOIN_FED, &priv_uuid);
+        let e = d.error();
+        assert!(e.contains("приватная"), "{e}");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn federation_relay_от_клиента_до_получателя_на_другом_сервере() {
+        let dir_a = temp_dir("fed-relay-a");
+        let dir_b = temp_dir("fed-relay-b");
+        let a = start_fed(&dir_a);
+        let b = start_fed(&dir_b);
+        // Знакомство серверов — через подсказку (TOFU), как в T4a.
+        federation::on_hint(
+            &a.shared,
+            &[7; 32],
+            &[payloads::ServerHint {
+                addr: b.addr.to_string(),
+                ed_pub: b.pubkey,
+            }],
+        );
+        wait_until_srv(Duration::from_secs(10), || {
+            federation::has_pin(&a.shared, &b.pubkey) && federation::has_pin(&b.shared, &a.pubkey)
+        });
+
+        // Группа-копия на обоих серверах: sender — клиент A, получатель —
+        // клиент B; локальные gid разные.
+        let uuid = [0x66u8; 16];
+        let key = [0x5A; 32];
+        let sender_id = proto::Identity::generate();
+        let dst_id = proto::Identity::generate();
+        let (s_ip, d_ip) = (ovl(9, 1), ovl(9, 2));
+        let dst = Raw::connect_as(b.addr, "relay-dst", &dst_id);
+        dst.sync();
+        {
+            let mut s = a.shared.state.write().unwrap();
+            repl_group(
+                &mut s,
+                7,
+                uuid,
+                key,
+                [0x01; 32],
+                &[(sender_id.ed_pub(), s_ip), (dst_id.ed_pub(), d_ip)],
+            );
+        }
+        {
+            let mut s = b.shared.state.write().unwrap();
+            repl_group(
+                &mut s,
+                3,
+                uuid,
+                key,
+                [0x01; 32],
+                &[(sender_id.ed_pub(), s_ip), (dst_id.ed_pub(), d_ip)],
+            );
+        }
+        // B заявляет адрес получателя в общем пуле — A узнаёт, где он живёт.
+        federation::publish_claim(&b.shared, dst_id.ed_pub(), d_ip);
+        wait_until_srv(Duration::from_secs(10), || {
+            federation::claim_of(&a.shared, &dst_id.ed_pub()).is_some()
+        });
+
+        // Клиент A шлёт групповой кадр получателю на B.
+        let sender = Raw::connect_as(a.addr, "relay-src", &sender_id);
+        sender.sync();
+        let frame = proto::seal_group(
+            &key,
+            proto::grp::DATA,
+            &proto::GroupHeader {
+                gid: 7,
+                src: s_ip,
+                dst: d_ip,
+                epoch: 1,
+            },
+            1,
+            b"cross-server",
+        );
+        sender.sock.send_to(&frame, a.addr).unwrap();
+
+        // Получатель на B получил кадр, пересобранный под местный gid.
+        let got = dst
+            .group_frame(Duration::from_secs(10))
+            .expect("кадр не дошёл через федеративный релей");
+        let (typ, h, _, payload) = proto::open_group(&key, &got).unwrap();
+        assert_eq!(typ, proto::grp::DATA);
+        assert_eq!(
+            (h.gid, h.src, h.dst, h.epoch),
+            (3, s_ip, d_ip, 1),
+            "локальный gid B должен быть в пересобранном кадре"
+        );
+        assert_eq!(payload, b"cross-server");
+        assert!(
+            a.shared.metrics.fed_relayed.load(Ordering::Relaxed) > 0
+                || b.shared.metrics.fed_relayed.load(Ordering::Relaxed) > 0,
+            "метрика федеративного релея не выросла"
+        );
+        a.stop();
+        b.stop();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn federation_relay_проверки_участников_и_сессии() {
+        let dir = temp_dir("fed-relay-checks");
+        let server = start_fed(&dir);
+        let uuid = [0x99u8; 16];
+        let key = [0x5A; 32];
+        let sender = [0x11u8; 32];
+        let dst_id = proto::Identity::generate();
+        let missing = [0x33u8; 32];
+        let (s_ip, d_ip) = (ovl(9, 1), ovl(9, 2));
+        let dst = Raw::connect_as(server.addr, "relay-dst", &dst_id);
+        dst.sync();
+        {
+            let mut s = server.shared.state.write().unwrap();
+            repl_group(
+                &mut s,
+                5,
+                uuid,
+                key,
+                [0x01; 32],
+                &[
+                    (sender, s_ip),
+                    (dst_id.ed_pub(), d_ip),
+                    (missing, ovl(9, 3)),
+                ],
+            );
+        }
+        let rel = |sender: [u8; 32], dst: [u8; 32], gid: u32, epoch: u32| {
+            let frame = proto::seal_group(
+                &key,
+                proto::grp::DATA,
+                &proto::GroupHeader {
+                    gid,
+                    src: s_ip,
+                    dst: d_ip,
+                    epoch,
+                },
+                7,
+                b"hi",
+            );
+            FedRelay {
+                uuid,
+                sender,
+                dst,
+                frame,
+            }
+        };
+        // Всё в порядке — доставка (и кадр пересобран под gid 5).
+        fed_deliver_relay(
+            &server.shared,
+            &[0xAA; 32],
+            &rel(sender, dst_id.ed_pub(), 5, 1),
+        );
+        let got = dst.group_frame(Duration::from_secs(5)).expect("нет кадра");
+        let (_, h, _, payload) = proto::open_group(&key, &got).unwrap();
+        assert_eq!((h.gid, payload), (5, b"hi".to_vec()));
+
+        // Чужой отправитель (не участник) — отказано, доставки нет.
+        fed_deliver_relay(
+            &server.shared,
+            &[0xAA; 32],
+            &rel([0x22; 32], dst_id.ed_pub(), 5, 1),
+        );
+        assert!(dst.group_frame(Duration::from_millis(300)).is_none());
+        // Получатель не участник — отказано.
+        fed_deliver_relay(&server.shared, &[0xAA; 32], &rel(sender, [0x44; 32], 5, 1));
+        assert!(dst.group_frame(Duration::from_millis(300)).is_none());
+        // У получателя нет сессии — отказано.
+        fed_deliver_relay(&server.shared, &[0xAA; 32], &rel(sender, missing, 5, 1));
+        assert!(dst.group_frame(Duration::from_millis(300)).is_none());
+        // Не та эпоха ключа — отказано.
+        fed_deliver_relay(
+            &server.shared,
+            &[0xAA; 32],
+            &rel(sender, dst_id.ed_pub(), 5, 9),
+        );
+        assert!(dst.group_frame(Duration::from_millis(300)).is_none());
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn федерация_переживает_рестарт() {
+        let dir = temp_dir("fed-restart");
+        let server = start_fed(&dir);
+        // Своя группа: получает uuid федерации при создании.
+        let c = Raw::connect(server.addr, "owner");
+        let st = c.create("fed-own", false);
+        let own_uuid = {
+            let s = server.shared.state.read().unwrap();
+            s.groups[&st.gid].fed_uuid.expect("нет uuid у своей группы")
+        };
+        // Реплицированная копия чужой группы.
+        let remote_owner = [0x77u8; 32];
+        let repl_uuid = [0x88u8; 16];
+        fed_apply_group(
+            &server.shared,
+            &proto::federation::FedGroup {
+                uuid: repl_uuid,
+                owner: remote_owner,
+                gid: 11,
+                name: "copy".into(),
+                private: false,
+                key: [0x42; 32],
+                epoch: 2,
+                rev: 5,
+                members: vec![proto::federation::FedMember {
+                    pk: remote_owner,
+                    ip: ovl(9, 9),
+                }],
+                deleted: false,
+            },
+            &[0xAA; 32],
+        );
+        let repl_gid = {
+            let s = server.shared.state.read().unwrap();
+            s.groups
+                .values()
+                .find(|g| g.fed_uuid == Some(repl_uuid))
+                .unwrap()
+                .id
+        };
+        // Заявка на адрес чужой identity (как после FED_ADDR_PUSH).
+        let claim_pk = [0x55u8; 32];
+        let claim_ip = ovl(9, 4);
+        federation::test_claim(&server.shared, claim_pk, claim_ip, [0xAA; 32]);
+        server.stop();
+
+        // server.json: секция федерации с обеими группами и заявкой адреса.
+        let raw = std::fs::read_to_string(dir.join("server.json")).unwrap();
+        assert!(raw.contains("federation"), "{raw}");
+        assert!(raw.contains(&hex(&own_uuid)), "нет uuid своей группы");
+        assert!(raw.contains(&hex(&repl_uuid)), "нет uuid копии");
+        assert!(raw.contains(&hex(&claim_pk)), "нет заявки адреса");
+
+        // Рестарт: uuid/gid групп и источник правды копии — те же.
+        let again = start_fed(&dir);
+        {
+            let s = again.shared.state.read().unwrap();
+            assert_eq!(
+                s.groups[&st.gid].fed_uuid,
+                Some(own_uuid),
+                "uuid своей группы пересоздан"
+            );
+            assert!(s.groups[&st.gid].fed_origin.is_none());
+            assert_eq!(s.groups[&repl_gid].fed_uuid, Some(repl_uuid));
+            assert_eq!(
+                s.groups[&repl_gid].fed_origin,
+                Some([0xAA; 32]),
+                "копия стала авторитетной после рестарта"
+            );
+            assert_eq!(s.groups[&repl_gid].key, [0x42; 32]);
+        }
+        // Заявка адреса восстановлена в общем пуле (и зарезервирована).
+        assert_eq!(federation::claim_count(&again.shared), 1);
+        assert_eq!(
+            federation::claim_of(&again.shared, &claim_pk),
+            Some(claim_ip),
+            "заявка адреса не пережила рестарт"
+        );
+        assert!(
+            again
+                .shared
+                .state
+                .read()
+                .unwrap()
+                .leases
+                .is_reserved(claim_ip),
+            "адрес чужой identity не зарезервирован после рестарта"
+        );
+        again.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

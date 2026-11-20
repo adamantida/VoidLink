@@ -135,11 +135,59 @@ Server code и pubkey. Старый ключ подписывает новый, 
   (снимаются с состояния при каждом запросе) и счётчики
   `voidlink_relayed_frames_total`, `voidlink_bytes_relayed_total`,
   `voidlink_dropped_frames_total`, `voidlink_hello_total`,
-  `voidlink_challenge_total`, `voidlink_ctrl_frames_total`;
+  `voidlink_challenge_total`, `voidlink_ctrl_frames_total`,
+  `voidlink_probes_total`, `voidlink_fed_peers`, `voidlink_fed_groups`,
+  `voidlink_fed_addr_claims`, `voidlink_fed_relayed_total`,
+  `voidlink_fed_hint_rejected_total`;
 - `GET /healthz` — `200 ok`, если живы все воркеры и housekeeping
   отмечался за последние 10 с, иначе `503 unavailable`.
 
 Эндпоинт без авторизации — наружу (`0.0.0.0`) его не выставлять.
+
+## Проба, mesh и федерация (этап 9)
+
+Сервер уже умеет то, что нужно клиентам этапа 9; федерация — T4.
+
+**Проба доступности (`PROBE_REQ` → `PROBE_RESP`).** Проба ходит открытым
+текстом, без сессии и рукопожатия: её можно задать любому серверу из списка,
+не ломая текущее подключение. Сервер:
+
+* принимает запрос ровно 64 байта, иначе молча отбрасывает;
+* проверяет свежесть `ts_ms` (разброс не больше 120 с) — ответ на старый
+  nonce не нужен;
+* применяет лимит по IP (`allow_ip`) и общий бюджет открытых ответов
+  (`plain`, флаги `--plain-rate` / `--plain-burst`);
+* отвечает 24 байтами (`nonce | ts_ms`) или 56 (плюс `ed_pub`, если клиент
+  просил `want_key`) — **не длиннее запроса**;
+* не создаёт сессию и не занимает адрес; считает `voidlink_probes_total`.
+
+Проба — подсказка о доступности и RTT, не доказательство подлинности
+(см. [SECURITY.md](SECURITY.md), раздел 18.2).
+
+**Mesh-контакты (`MESH_INFO` → `MESH_SEED`).** Клиент публикует статический
+X25519-ключ и `caps`; сервер хранит их в сессии и:
+
+* отвечает `MESH_SEED` — до 16 ближайших онлайн-сессий по XOR ed-ключей;
+  невидимки в семя не попадают;
+* держит публикацию 15 минут без повтора (`MESH_TTL_MS`): клиент шлёт
+  `MESH_INFO` раз в 5 минут, а выключивший mesh перестаёт попадать в семя и
+  в mesh-секцию;
+* при изменении контакта поднимает ревизию группы и рассылает дельту, чтобы
+  остальные увидели `x_pub`/`caps` в mesh-секции `GROUP_STATE`/`GROUP_UPDATE`;
+* в mesh-секцию включает только онлайн-участников, публиковавших
+  `MESH_INFO`; старые клиенты хвост игнорируют.
+
+**Федерация (T4).** Включается флагом `--federate`; `--peer <addr>` задаёт
+явный пин пира (можно повторять), `--fed-pool <addr>` — общий пул адресов.
+Сервер принимает `SERVER_HINT` только как недоверенную подсказку, проверяет
+кандидата подписанным `SRV_HELLO`/`ACK`, закрепляет ключ (TOFU) в
+`server.json → federation.peers`, реплицирует группы (`FED_GROUP_PUSH`/
+`DELTA`), адреса (`FED_ADDR_PUSH`/`REVOKE`) и релеит кадры между серверами
+(`FED_RELAY` + `ACK`/`NACK`). Конфликт адресов решает меньший ed25519.
+Метрики: `voidlink_fed_peers`, `voidlink_fed_groups`,
+`voidlink_fed_addr_claims`, `voidlink_fed_relayed_total`,
+`voidlink_fed_hint_rejected_total`. Встречные `SRV_HELLO` разрешаются
+тай-брейком (меньший ed — инициатор).
 
 ## TCP-фолбэк
 

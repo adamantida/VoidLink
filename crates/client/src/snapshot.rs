@@ -14,6 +14,7 @@ use tunnel_protocol::payloads;
 
 use crate::engine::{GroupSess, Meta, PeerSess, Stats};
 use crate::invites::Invite;
+use crate::path::{PathKind, PathTable};
 use crate::store::Config;
 
 /// Полный снимок.
@@ -27,6 +28,9 @@ pub struct Snapshot {
     pub cfg: CfgView,
     /// Неотвеченные приглашения (см. `invites::PendingInvites::list`).
     pub pending_invites: Vec<Invite>,
+    /// Доступные федерированные группы сервера (`FED_GROUPS`, T4) — по
+    /// возрастанию локального gid. Вход по uuid — `Cmd::JoinFed`.
+    pub fed_groups: Vec<FedGroupSnap>,
 }
 
 /// Участник группы.
@@ -45,10 +49,27 @@ pub struct PeerSnap {
     /// Последний фрейм напрямую (не через релей), мс назад.
     pub last_direct_ms_ago: Option<u64>,
     pub rtt_ms: Option<u64>,
+    /// Выбранный путь доставки (этап 9): прямой / сервер / через пира.
+    /// `None` — пути ещё нет (не было пересчёта).
+    #[serde(default)]
+    pub path: Option<PathSnap>,
+}
+
+/// Путь доставки в снимке: вид, RTT и (для реле) ключ пира.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathSnap {
+    pub kind: PathKind,
+    /// Измеренный RTT выбранного пути (у сервера может быть неизвестен).
+    #[serde(default)]
+    pub rtt_ms: Option<u64>,
 }
 
 impl PeerSnap {
-    pub fn from_sess(p: &PeerSess, now: Instant) -> Self {
+    pub fn from_sess(p: &PeerSess, paths: &PathTable, now: Instant) -> Self {
+        let path = paths.current(p.ip).map(|kind| PathSnap {
+            kind,
+            rtt_ms: paths.current_rtt(p.ip).map(u64::from),
+        });
         Self {
             pubkey: p.pubkey,
             name: p.name.clone(),
@@ -60,6 +81,7 @@ impl PeerSnap {
             last_rx_ms_ago: ms_ago(p.last_rx, now),
             last_direct_ms_ago: p.last_direct.map(|t| ms_ago(t, now)),
             rtt_ms: p.rtt_ms,
+            path,
         }
     }
 }
@@ -74,16 +96,20 @@ pub struct GroupSnap {
     pub my_ip: u32,
     /// Сколько секунд мы в группе.
     pub joined_s_ago: u64,
+    /// Группа пришла с другого сервера (`FED_GROUPS`, T4): в UI — метка
+    /// «федерация». `false` — своя группа или сервер без федерации.
+    #[serde(default)]
+    pub federated: bool,
     /// Участники по возрастанию IP.
     pub members: Vec<PeerSnap>,
 }
 
 impl GroupSnap {
-    pub fn from_sess(gid: u32, g: &GroupSess, now: Instant) -> Self {
+    pub fn from_sess(gid: u32, g: &GroupSess, paths: &PathTable, now: Instant) -> Self {
         let mut members: Vec<PeerSnap> = g
             .members
             .values()
-            .map(|p| PeerSnap::from_sess(p, now))
+            .map(|p| PeerSnap::from_sess(p, paths, now))
             .collect();
         members.sort_by_key(|p| p.ip);
         Self {
@@ -93,15 +119,20 @@ impl GroupSnap {
             private: g.private,
             my_ip: g.my_ip,
             joined_s_ago: now.saturating_duration_since(g.since).as_secs(),
+            federated: g.fed_uuid.is_some(),
             members,
         }
     }
 
     /// Все группы движка, по возрастанию gid.
-    pub fn from_groups(groups: &HashMap<u32, GroupSess>, now: Instant) -> Vec<Self> {
+    pub fn from_groups(
+        groups: &HashMap<u32, GroupSess>,
+        paths: &PathTable,
+        now: Instant,
+    ) -> Vec<Self> {
         let mut v: Vec<Self> = groups
             .iter()
-            .map(|(gid, g)| Self::from_sess(*gid, g, now))
+            .map(|(gid, g)| Self::from_sess(*gid, g, paths, now))
             .collect();
         v.sort_by_key(|g| g.gid);
         v
@@ -117,6 +148,37 @@ pub struct GroupSummarySnap {
     pub mine: bool,
     pub online: u32,
     pub total: u32,
+}
+
+/// Доступная федерированная группа (`FED_GROUPS`, T4). `uuid` — имя группы в
+/// федерации (вход по нему), `gid` — локальный номер на этом сервере.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FedGroupSnap {
+    /// uuid группы в федерации (16 байт).
+    pub uuid: [u8; 16],
+    pub gid: u32,
+    pub name: String,
+    pub owner: [u8; 32],
+    pub members: u16,
+    /// uuid коротким hex — для подсказок/лога UI.
+    pub uuid_short: String,
+}
+
+impl FedGroupSnap {
+    pub fn from_info(g: &crate::engine::FedGroupInfo) -> Self {
+        Self {
+            uuid: g.uuid,
+            gid: g.gid,
+            name: g.name.clone(),
+            owner: g.owner,
+            members: g.members,
+            uuid_short: g.uuid_short(),
+        }
+    }
+
+    pub fn from_infos(list: &[crate::engine::FedGroupInfo]) -> Vec<Self> {
+        list.iter().map(Self::from_info).collect()
+    }
 }
 
 impl From<&payloads::GroupSummary> for GroupSummarySnap {
@@ -146,6 +208,30 @@ pub struct MetaSnap {
     pub tx_hist: Vec<u64>,
     /// Сколько секунд работает движок.
     pub uptime_s: u64,
+    /// RTT до сервера по CTRL_PONG с меткой (`None` — ещё не измерен или
+    /// старый сервер без метки).
+    #[serde(default)]
+    pub server_rtt_ms: Option<u32>,
+    /// Mesh включён клиентом (`Config.mesh.enabled`).
+    #[serde(default)]
+    pub mesh_enabled: bool,
+    /// Сколько байт этот клиент отрелеил через mesh (T3).
+    #[serde(default)]
+    pub relay_bytes: u64,
+    /// Живых mesh-сессий (пир ↔ пир, T3).
+    #[serde(default)]
+    pub mesh_sessions: u32,
+    /// Движка нет: TUI работает офлайн (демон без движка, демона нет).
+    /// Правки конфига при этом сохраняются, сетевые команды — отказ.
+    #[serde(default)]
+    pub offline: bool,
+    /// Почему движка нет: причина для шапки/лога (`{"engine": null, "error"}`).
+    #[serde(default)]
+    pub offline_reason: Option<String>,
+    /// Сколько правок TUI ждёт применения на демоне (очередь
+    /// `ui-pending.json` офлайн-режима).
+    #[serde(default)]
+    pub pending_edits: u32,
 }
 
 impl MetaSnap {
@@ -158,6 +244,11 @@ impl MetaSnap {
             rx_hist: m.rx_hist.iter().copied().collect(),
             tx_hist: m.tx_hist.iter().copied().collect(),
             uptime_s: now.saturating_duration_since(m.started).as_secs(),
+            server_rtt_ms: m.server_rtt_ms,
+            mesh_enabled: m.mesh_enabled,
+            relay_bytes: m.relay_bytes,
+            mesh_sessions: m.mesh_sessions,
+            ..MetaSnap::default()
         }
     }
 }
@@ -212,6 +303,18 @@ pub struct CfgView {
     /// Невидимка (`Cmd::SetInvisible`).
     #[serde(default)]
     pub invisible: bool,
+    /// Mesh включён (этап 9).
+    #[serde(default)]
+    pub mesh_enabled: bool,
+    /// Релей через пиров разрешён.
+    #[serde(default)]
+    pub relay_enabled: bool,
+    /// Лимит отдачи реле, кбит/с.
+    #[serde(default)]
+    pub relay_budget_kbps: u32,
+    /// Ручные закрепления путей (`"<ip>" → "direct"|"server"|"relay:<hex>"`).
+    #[serde(default)]
+    pub pinned_paths: std::collections::BTreeMap<String, String>,
 }
 
 impl CfgView {
@@ -238,6 +341,10 @@ impl CfgView {
                 .collect(),
             autojoin: c.autojoin.clone(),
             invisible: c.invisible,
+            mesh_enabled: c.mesh.enabled,
+            relay_enabled: c.mesh.relay_enabled,
+            relay_budget_kbps: c.mesh.relay_budget_kbps,
+            pinned_paths: c.pinned_paths.clone(),
         }
     }
 
@@ -267,6 +374,13 @@ impl CfgView {
                 .collect(),
             autojoin: self.autojoin.clone(),
             invisible: self.invisible,
+            mesh: crate::store::MeshConfig {
+                enabled: self.mesh_enabled,
+                relay_enabled: self.relay_enabled,
+                relay_budget_kbps: self.relay_budget_kbps,
+                ..Default::default()
+            },
+            pinned_paths: self.pinned_paths.clone(),
             ..Config::default()
         }
     }
@@ -291,6 +405,7 @@ mod tests {
                 private: true,
                 my_ip: 0x0A00_0002,
                 joined_s_ago: 42,
+                federated: false,
                 members: vec![PeerSnap {
                     pubkey: [1; 32],
                     name: "bravo".into(),
@@ -302,6 +417,10 @@ mod tests {
                     last_rx_ms_ago: 120,
                     last_direct_ms_ago: None,
                     rtt_ms: Some(33),
+                    path: Some(PathSnap {
+                        kind: PathKind::Direct,
+                        rtt_ms: Some(33),
+                    }),
                 }],
             }],
             meta: MetaSnap {
@@ -319,6 +438,11 @@ mod tests {
                 rx_hist: vec![1, 2, 3],
                 tx_hist: vec![4, 5],
                 uptime_s: 3600,
+                server_rtt_ms: Some(48),
+                mesh_enabled: true,
+                relay_bytes: 1024,
+                mesh_sessions: 2,
+                ..MetaSnap::default()
             },
             stats: StatsSnap {
                 rx_bytes: 10,
@@ -340,6 +464,13 @@ mod tests {
                 }],
                 autojoin: vec![7],
                 invisible: true,
+                mesh_enabled: true,
+                relay_enabled: false,
+                relay_budget_kbps: 4096,
+                pinned_paths: std::collections::BTreeMap::from([(
+                    "100.66.0.2".to_string(),
+                    "server".to_string(),
+                )]),
             },
             pending_invites: vec![Invite {
                 gid: 11,
@@ -348,6 +479,14 @@ mod tests {
                 from_name: "charlie".into(),
                 received_ms_ago: 1500,
                 expires_in_s: Some(604_800),
+            }],
+            fed_groups: vec![FedGroupSnap {
+                uuid: [7; 16],
+                gid: 12,
+                name: "чужой сервер".into(),
+                owner: [4; 32],
+                members: 3,
+                uuid_short: "07070707".into(),
             }],
         }
     }
@@ -410,8 +549,11 @@ mod tests {
             last_rx: base + Duration::from_millis(9_750),
             last_direct: Some(base),
             rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
         };
-        let p = PeerSnap::from_sess(&peer, now);
+        let paths = PathTable::empty();
+        let p = PeerSnap::from_sess(&peer, &paths, now);
         assert_eq!(p.last_rx_ms_ago, 250);
         assert_eq!(p.last_direct_ms_ago, Some(10_000));
         assert_eq!(p.endpoint.as_deref(), Some("1.2.3.4:5"));

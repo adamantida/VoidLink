@@ -21,9 +21,11 @@ use ratatui::widgets::{
 
 use tunnel_protocol as proto;
 
+use crate::path::PathKind;
 use crate::tui::app::{
     App, ConfirmPopup, Focus, FriendCardPopup, InputPopup, InvitePopup, ListPickPopup, MsgKind,
-    PeerPickPopup, Popup, SETTING_ROWS, SettingsPopup, TOOLBAR,
+    PathPinPopup, PeerCardPopup, PeerPickPopup, PeerView, Popup, SETTING_ROWS, SettingsPopup,
+    TOOLBAR,
 };
 use crate::tui::badges::{self, BadgeState, ConnState};
 use crate::tui::clock;
@@ -223,12 +225,11 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         return;
     }
 
-    let (pill_text, pill_style) = if app.daemon_down {
-        (" ○ демон недоступен ", th.pill(th.c.danger))
-    } else if app.connected {
-        (" ● подключено ", th.pill(th.c.success))
-    } else {
-        (" ○ реконнект ", th.pill(th.c.danger))
+    let (pill_text, pill_style) = match app.conn {
+        ConnState::Online => (" ● в сети ", th.pill(th.c.success)),
+        ConnState::Reconnecting => (" ○ сервер недоступен ", th.pill(th.c.danger)),
+        ConnState::DaemonDown => (" ⚠ демон недоступен ", th.pill(th.c.danger)),
+        ConnState::NoServer => (" ○ нет сервера ", th.pill(th.c.warn)),
     };
     let pill_w = Span::raw(pill_text).width() as u16;
     let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(pill_w + 1)]).split(body);
@@ -269,9 +270,23 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 
 /// Кнопки-клавиши под шапкой: клик по ним = нажатие клавиши.
 fn draw_toolbar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    // «p» в таблице участников — выбор пути, в остальных местах — профиль:
+    // подпись на кнопке должна говорить правду.
+    let p_label = if app.focus == Focus::Peers && app.sel_peer.is_some() {
+        "p путь"
+    } else {
+        "p профиль"
+    };
     let items: Vec<(&str, Btn, KeyEvent)> = TOOLBAR
         .iter()
-        .map(|(label, code, mods)| (*label, Btn::Normal, KeyEvent::new(*code, *mods)))
+        .map(|(label, code, mods)| {
+            let label = if *code == KeyCode::Char('p') {
+                p_label
+            } else {
+                *label
+            };
+            (label, Btn::Normal, KeyEvent::new(*code, *mods))
+        })
         .collect();
     let row = Rect {
         x: area.x + 1,
@@ -384,12 +399,18 @@ fn draw_groups(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let items: Vec<ListItem> = list
         .iter()
         .map(|g| {
+            // Доступная федерированная группа (`FED_GROUPS`, T4): метка и
+            // отдельный значок, вход — по uuid (JOIN_FED).
+            let fed = app.fed_group(g.gid).is_some();
             let (mark, mark_style) = if g.mine {
                 ("●", th.ok)
             } else {
                 ("○", th.dim)
             };
             let mut spans = vec![Span::styled(format!("{mark} "), mark_style)];
+            if fed {
+                spans.push(Span::styled("⇄ ", th.accent));
+            }
             spans.push(Span::styled(
                 g.name.clone(),
                 if g.mine { th.base } else { th.dim },
@@ -397,7 +418,9 @@ fn draw_groups(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             if g.private {
                 spans.push(Span::styled(" [priv]", th.warn));
             }
-            if g.mine {
+            if fed {
+                spans.push(Span::styled("  [федерация]", th.accent));
+            } else if g.mine {
                 spans.push(Span::styled(format!("  {}/{}", g.online, g.total), th.dim));
             } else if g.private {
                 spans.push(Span::styled("  (по приглашению)", th.dim));
@@ -512,20 +535,35 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         body
     };
 
-    let header = Row::new(vec![
+    // Колонка «путь» (этап 9). На узком терминале её нет вовсе — таблица
+    // остаётся читаемой; на среднем — короткие метки без RTT и хопов.
+    let path_w: u16 = if table_area.width >= 92 {
+        // «⇄ через <6 hex> 33 мс (2 хопа)» — 29 клеток.
+        32
+    } else if table_area.width >= 76 {
+        24
+    } else if table_area.width >= 64 {
+        16
+    } else {
+        0
+    };
+    let mut head = vec![
         Cell::from("имя"),
         Cell::from("IP"),
         Cell::from("связь"),
         Cell::from("RTT"),
-        Cell::from("статус"),
-    ])
-    .style(th.header().fg(th.c.text_muted).add_modifier(Modifier::BOLD));
+    ];
+    if path_w > 0 {
+        head.push(Cell::from("путь"));
+    }
+    head.push(Cell::from("статус"));
+    let header = Row::new(head).style(th.header().fg(th.c.text_muted).add_modifier(Modifier::BOLD));
 
     let mut rows: Vec<Row> = Vec::new();
 
     // Строка «я».
     if let Some(g) = g {
-        rows.push(Row::new(vec![
+        let mut cells = vec![
             Cell::from(Span::styled(
                 format!("{} (я)", app.my_name),
                 Style::default()
@@ -538,8 +576,13 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             )),
             Cell::from(Span::styled("—", th.dim)),
             Cell::from(Span::styled("—", th.dim)),
-            Cell::from(Span::styled(app.my_status.clone(), th.dim)),
-        ]));
+        ];
+        if path_w > 0 {
+            // До себя пути нет: путь — маршрут доставки до участника.
+            cells.push(Cell::from(Span::styled("—", th.dim)));
+        }
+        cells.push(Cell::from(Span::styled(app.my_status.clone(), th.dim)));
+        rows.push(Row::new(cells));
     }
 
     let peers = app.visible_peers();
@@ -561,16 +604,18 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             Some(_) => th.error,
             None => th.dim,
         };
-        rows.push(
-            Row::new(vec![
-                Cell::from(p.name.clone()),
-                Cell::from(proto::ip_str(p.ip)),
-                Cell::from(Span::styled(link.0, link.1)),
-                Cell::from(Span::styled(rtt, rtt_style)),
-                Cell::from(Span::styled(p.status.clone(), th.dim)),
-            ])
-            .style(if p.online { th.base } else { th.offline }),
-        );
+        let mut cells = vec![
+            Cell::from(p.name.clone()),
+            Cell::from(proto::ip_str(p.ip)),
+            Cell::from(Span::styled(link.0, link.1)),
+            Cell::from(Span::styled(rtt, rtt_style)),
+        ];
+        if path_w > 0 {
+            let (text, style) = path_cell(app, th, p, path_w < 30);
+            cells.push(Cell::from(Span::styled(text, style)));
+        }
+        cells.push(Cell::from(Span::styled(p.status.clone(), th.dim)));
+        rows.push(Row::new(cells).style(if p.online { th.base } else { th.offline }));
     }
 
     if rows.len() <= 1 {
@@ -580,13 +625,16 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         ))]));
     }
 
-    let widths = [
+    let mut widths = vec![
         Constraint::Min(10),
         Constraint::Length(14),
         Constraint::Length(9),
         Constraint::Length(7),
-        Constraint::Fill(1),
     ];
+    if path_w > 0 {
+        widths.push(Constraint::Length(path_w));
+    }
+    widths.push(Constraint::Fill(1));
     let total = rows.len();
     let table = Table::new(rows, widths)
         .header(header)
@@ -641,6 +689,59 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             .unfilled_style(th.gauge_unfilled());
         f.render_widget(lg, row);
     }
+}
+
+// ---------------------------------------------------------------- путь
+
+/// Хопов у L2-реле всегда два: мы → реле → участник. Движок пока не считает
+/// длину маршрута в хопах, для промежуточного реле она постоянна.
+const RELAY_HOPS: u32 = 2;
+
+/// Текст метки пути (этап 9): `◆ прямой 12 мс`, `◇ сервер 48 мс`,
+/// `⇄ через <реле> 33 мс (2 хопа)`; `—` — пути ещё нет.
+/// `short` — узкая колонка: без RTT и хопов, чтобы метка влезла.
+fn path_text(app: &App, p: &PeerView, short: bool) -> String {
+    let Some(snap) = &p.path else {
+        return "—".to_string();
+    };
+    match &snap.kind {
+        PathKind::Direct => match (short, snap.rtt_ms) {
+            (false, Some(ms)) => format!("◆ прямой {ms} мс"),
+            _ => "◆ прямой".to_string(),
+        },
+        PathKind::Server => match (short, snap.rtt_ms) {
+            (false, Some(ms)) => format!("◇ сервер {ms} мс"),
+            _ => "◇ сервер".to_string(),
+        },
+        PathKind::PeerRelay { via } => {
+            let relay = app.peer_name_or_short(via);
+            if short {
+                format!("⇄ {relay}")
+            } else {
+                let rtt = match snap.rtt_ms {
+                    Some(ms) => format!(" {ms} мс"),
+                    None => String::new(),
+                };
+                format!("⇄ через {relay}{rtt} ({RELAY_HOPS} хопа)")
+            }
+        }
+    }
+}
+
+/// Колонка «путь» таблицы участников: текст и стиль под вид пути.
+fn path_cell(app: &App, th: &Theme, p: &PeerView, short: bool) -> (String, Style) {
+    let style = if !p.online {
+        // Офлайн: путь мог остаться с прошлого пересчёта — приглушаем.
+        th.offline
+    } else {
+        match p.path.as_ref().map(|s| &s.kind) {
+            Some(PathKind::Direct) => th.direct,
+            Some(PathKind::Server) => th.accent,
+            Some(PathKind::PeerRelay { .. }) => th.relay,
+            None => th.dim,
+        }
+    };
+    (path_text(app, p, short), style)
 }
 
 // ---------------------------------------------------------------- лог
@@ -851,6 +952,16 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         ),
         Span::styled(" групп", th.dim),
     ];
+    // Mesh (этап 9): релей и живые сессии. Нулевой релей показываем как
+    // «реле 0» — счётчик не исчезает и не прыгает при первом байте.
+    if app.mesh_enabled {
+        spans.push(Span::styled("  реле ", th.dim));
+        spans.push(Span::styled(relay_bytes_text(app.relay_bytes), th.relay));
+        if app.mesh_sessions > 0 {
+            spans.push(Span::styled("  mesh ", th.dim));
+            spans.push(Span::styled(sessions_text(app.mesh_sessions), th.base));
+        }
+    }
     if app.filtering || !app.filter.is_empty() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -871,15 +982,12 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     // транспорт, прямые/релейные пиры.
     let state = BadgeState {
         pending_invites: app.pending_invites(),
-        conn: if app.connected {
-            ConnState::Online
-        } else {
-            ConnState::Reconnecting
-        },
+        conn: app.conn,
         invisible: app.invisible,
         transport: app.transport,
         direct,
         relay,
+        pending_edits: app.pending_edits,
     };
     let badges_area = Rect {
         x: rest.x + left_w + 1,
@@ -1071,6 +1179,17 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
             let rect = centered(area, 68, h);
             open_popup(f, app, rect);
             draw_friend_card(f, app, th, c, rect);
+        }
+        Popup::PeerCard(c) => {
+            // 5 строк identicon + 9 строк данных + кнопки + рамка.
+            let rect = centered(area, 62, 18);
+            open_popup(f, app, rect);
+            draw_peer_card(f, app, th, c, rect);
+        }
+        Popup::PathPin(p) => {
+            let rect = centered(area, 52, 12);
+            open_popup(f, app, rect);
+            draw_path_pin(f, app, th, p, rect);
         }
         Popup::ListPick(p) => {
             let h = (p.items.len() as u16 + 4).clamp(8, 20);
@@ -1343,6 +1462,215 @@ fn draw_friend_card(f: &mut Frame, app: &App, th: &Theme, c: &FriendCardPopup, a
     );
 }
 
+/// Строка закрепления пути из конфига: «сервер» / «прямой» /
+/// «через <реле>» или «авто» (закрепления нет).
+fn pin_text(app: &App, ip: u32) -> String {
+    let Some(raw) = app.pinned_paths.get(&crate::path::ip_key(ip)) else {
+        return "авто".to_string();
+    };
+    match PathKind::parse_config(raw) {
+        Some(PathKind::Direct) => "прямой".to_string(),
+        Some(PathKind::Server) => "сервер".to_string(),
+        Some(PathKind::PeerRelay { via }) => format!("через {}", app.peer_name_or_short(&via)),
+        // Испорченная строка конфига равносильна «авто» (см. parse_config).
+        None => "авто".to_string(),
+    }
+}
+
+/// Карточка участника (Enter в таблице участников): путь доставки,
+/// закрепление, для L2 — имя реле (этап 9).
+fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area: Rect) {
+    let peer = app.peers.iter().find(|p| p.pubkey == c.pubkey);
+    let mut lines = identicon_lines(&c.pubkey);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("имя: ", th.dim),
+        Span::styled(
+            app.peer_name_or_short(&c.pubkey),
+            th.base.add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(p) = peer {
+        lines.push(Line::from(vec![
+            Span::styled("IP: ", th.dim),
+            Span::styled(proto::ip_str(p.ip), th.accent),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("статус: ", th.dim),
+            Span::styled(p.status.clone(), th.base),
+            Span::styled(
+                if p.online {
+                    "  (в сети)"
+                } else {
+                    "  (офлайн)"
+                },
+                if p.online { th.ok } else { th.offline },
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("связь: ", th.dim),
+            Span::styled(
+                if p.direct {
+                    "прямой канал"
+                } else {
+                    "через релей"
+                },
+                th.base,
+            ),
+            Span::styled(
+                match p.rtt_ms {
+                    Some(ms) => format!("  {ms} мс"),
+                    None => String::new(),
+                },
+                th.dim,
+            ),
+        ]));
+        // Путь доставки — главное в карточке (этап 9).
+        let (text, style) = path_cell(app, th, p, false);
+        lines.push(Line::from(vec![
+            Span::styled("путь: ", th.dim),
+            Span::styled(text, style),
+        ]));
+        // Закрепление: из конфига в снимке (переживает рестарт движка).
+        lines.push(Line::from(vec![
+            Span::styled("закреплено: ", th.dim),
+            Span::styled(
+                pin_text(app, p.ip),
+                if app.pinned_paths.contains_key(&crate::path::ip_key(p.ip)) {
+                    th.ok
+                } else {
+                    th.dim
+                },
+            ),
+        ]));
+        if let Some(PathKind::PeerRelay { via }) = p.path.as_ref().map(|s| s.kind) {
+            lines.push(Line::from(vec![
+                Span::styled("реле: ", th.dim),
+                Span::styled(app.peer_name_or_short(&via), th.relay),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "участник больше не в группе",
+            th.dim,
+        )));
+    }
+    lines.push(Line::from(""));
+    let buttons_at = lines.len() as u16;
+
+    let block = popup_block(
+        th,
+        popup_title(
+            th,
+            "◆",
+            &format!("Участник: {}", app.peer_name_or_short(&c.pubkey)),
+        ),
+        th.focused_border,
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    draw_buttons(
+        f,
+        th,
+        &app.hits.popup_buttons,
+        inner_row(area, buttons_at),
+        &[
+            ("Путь (p)", Btn::Primary, key(KeyCode::Char('p'))),
+            ("Закрыть (Esc)", Btn::Normal, key(KeyCode::Esc)),
+        ],
+        2,
+        false,
+    );
+}
+
+/// Окно выбора пути до участника (этап 9): `0 авто`, `1 прямой`,
+/// `2 сервер`, `3 реле`. Текущее закрепление помечено «●», недоступное
+/// (нет известного реле) — «—».
+fn draw_path_pin(f: &mut Frame, app: &App, th: &Theme, p: &PathPinPopup, area: Rect) {
+    let key_ip = crate::path::ip_key(p.ip);
+    let current = app
+        .pinned_paths
+        .get(&key_ip)
+        .and_then(|raw| PathKind::parse_config(raw));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("до: ", th.dim),
+            Span::styled(
+                format!("{} · {}", p.name, proto::ip_str(p.ip)),
+                th.base.add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        // Что движок выбрал сам — чтобы решение было осознанным.
+        match app.peers.iter().find(|x| x.pubkey == p.pubkey) {
+            Some(peer) => {
+                let (text, style) = path_cell(app, th, peer, false);
+                Line::from(vec![
+                    Span::styled("сейчас: ", th.dim),
+                    Span::styled(text, style),
+                ])
+            }
+            None => Line::from(Span::styled("сейчас: —", th.dim)),
+        },
+        Line::from(""),
+    ];
+    let opt = |k: char, text: String, on: bool, enabled: bool| {
+        let (mark, style) = if !enabled {
+            ("—", th.dim)
+        } else if on {
+            ("●", th.ok)
+        } else {
+            ("○", th.base)
+        };
+        Line::from(vec![
+            Span::styled(
+                format!(" {k} "),
+                if enabled {
+                    th.accent.add_modifier(Modifier::BOLD)
+                } else {
+                    th.dim
+                },
+            ),
+            Span::styled(format!("{mark} "), style),
+            Span::styled(text, if on && enabled { th.ok } else { style }),
+        ])
+    };
+    lines.push(opt(
+        '0',
+        "авто (выбирает движок)".into(),
+        current.is_none(),
+        true,
+    ));
+    lines.push(opt(
+        '1',
+        "прямой".into(),
+        matches!(current, Some(PathKind::Direct)),
+        true,
+    ));
+    lines.push(opt(
+        '2',
+        "сервер".into(),
+        matches!(current, Some(PathKind::Server)),
+        true,
+    ));
+    let relay_label = match p.relay {
+        Some(via) => format!("реле: {}", app.peer_name_or_short(&via)),
+        None => "реле: нет".into(),
+    };
+    let relay_on = matches!(current, Some(PathKind::PeerRelay { .. }));
+    lines.push(opt('3', relay_label, relay_on, p.relay.is_some()));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "0–3 — закрепить · Esc — закрыть",
+        th.dim,
+    )));
+
+    let block = popup_block(
+        th,
+        popup_title(th, "⇄", &format!("Путь до {}", p.name)),
+        th.focused_border,
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_list_pick(f: &mut Frame, th: &Theme, p: &ListPickPopup, area: Rect) -> usize {
     let block = popup_block(th, popup_title(th, "≡", &p.title), th.focused_border).title_bottom(
         Line::from(Span::styled(
@@ -1579,7 +1907,7 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
             "смена фокуса (группы → друзья → участники → лог)",
         ),
         kv("↑ ↓", "перемещение по списку"),
-        kv("Enter", "войти в группу / карточка друга"),
+        kv("Enter", "войти в группу / карточка друга или участника"),
         kv("/", "поиск по спискам (Esc — сбросить, Enter — принять)"),
         kv("s", "сменить сортировку (имя / онлайн / RTT)"),
         kv("r", "обновить список групп"),
@@ -1589,6 +1917,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("F6", "переименовать группу"),
         kv("F8", "удалить группу (только владелец)"),
         kv("j", "войти в публичную группу"),
+        kv(
+            "⇄ · :joinfed",
+            "федеративная группа: метка «федерация», вход по uuid/gid",
+        ),
         kv("x", "покинуть группу"),
         kv("i", "пригласить друга в группу"),
         kv("k / b", "исключить / забанить участника"),
@@ -1608,6 +1940,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("r (в друзьях)", "переименовать друга (:alias друг имя)"),
         kv("c", "скопировать IP / pubkey / friend code"),
         kv("p", "карточка профиля"),
+        kv(
+            "p (участники)",
+            "путь до участника: 0 авто · 1 прямой · 2 сервер · 3 реле",
+        ),
         kv("F3", "настройки (имя, сервер, автовход, тема, невидимка)"),
         kv(
             "F4 · :servers",
@@ -1643,6 +1979,26 @@ fn kb(v: u64) -> String {
     }
 }
 
+/// Байты релея: ноль — коротко «0», иначе как обычные байты.
+fn relay_bytes_text(v: u64) -> String {
+    if v == 0 { "0".to_string() } else { kb(v) }
+}
+
+/// «1 сессия» / «2 сессии» / «5 сессий».
+fn sessions_text(n: u32) -> String {
+    let tail = n % 100;
+    let word = if (11..=14).contains(&tail) {
+        "сессий"
+    } else {
+        match n % 10 {
+            1 => "сессия",
+            2..=4 => "сессии",
+            _ => "сессий",
+        }
+    };
+    format!("{n} {word}")
+}
+
 /// Время в формате ч:м:с (аптайм).
 fn uptime(t: std::time::Instant) -> String {
     let secs = t.elapsed().as_secs();
@@ -1668,6 +2024,7 @@ fn ago(t: std::time::Instant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::PathSnap;
     use crate::store::Config;
     use crate::tui::app::{App, FriendView, GroupView, PeerView};
     use ratatui::Terminal;
@@ -1678,6 +2035,7 @@ mod tests {
         app.my_name = "alpha".into();
         app.my_status = "в сети".into();
         app.connected = true;
+        app.conn = ConnState::Online;
         app.server_addr = "127.0.0.1:5599".into();
         app.groups = vec![
             GroupView {
@@ -1697,6 +2055,10 @@ mod tests {
                     direct: true,
                     rtt_ms: Some(7),
                     status: "ok".into(),
+                    path: Some(PathSnap {
+                        kind: PathKind::Direct,
+                        rtt_ms: Some(7),
+                    }),
                 }],
             },
             GroupView {
@@ -1719,6 +2081,10 @@ mod tests {
             direct: true,
             rtt_ms: Some(7),
             status: "ok".into(),
+            path: Some(PathSnap {
+                kind: PathKind::Direct,
+                rtt_ms: Some(7),
+            }),
         }];
         app.friends = vec![FriendView {
             alias: "bravo".into(),
@@ -1754,7 +2120,92 @@ mod tests {
         assert!(text.contains("direct"), "нет метки direct");
         assert!(text.contains("7 мс"), "нет RTT");
         assert!(text.contains("100.66.1.2"), "нет своего IP");
-        assert!(text.contains("подключено"), "нет статуса соединения");
+        assert!(text.contains("● в сети"), "нет статуса соединения");
+    }
+
+    #[test]
+    fn колонка_путь_и_карточка_участника() {
+        // Демо-снимок: у bravo выбран прямой путь — колонка «путь» на месте.
+        let mut app = demo_app();
+        app.toasts.clear();
+        let text = render(&app, 140, 40);
+        assert!(
+            text.contains("◆ прямой 7 мс"),
+            "нет колонки «путь»:\n{text}"
+        );
+
+        // Все виды пути (без пути, прямой, сервер, реле) на широком экране.
+        let mut busy = busy_app();
+        busy.toasts.clear();
+        let text = render(&busy, 140, 40);
+        assert!(
+            text.contains("◇ сервер 48 мс"),
+            "нет метки сервера:\n{text}"
+        );
+        assert!(text.contains("⇄ через"), "нет метки реле:\n{text}");
+        assert!(text.contains("(2 хопа)"), "нет числа хопов:\n{text}");
+        // Узкий терминал колонку не рисует вовсе — и не паникует.
+        let _ = render(&busy, 60, 24);
+
+        // Статус-бар: релей и число mesh-сессий при включённом mesh.
+        let mut mesh = demo_app();
+        mesh.toasts.clear();
+        mesh.mesh_enabled = true;
+        mesh.relay_bytes = 12_595;
+        mesh.mesh_sessions = 2;
+        let text = render(&mesh, 140, 40);
+        assert!(text.contains("реле 12.3 КБ"), "нет счётчика релея:\n{text}");
+        assert!(
+            text.contains("mesh 2 сессии"),
+            "нет счётчика mesh-сессий:\n{text}"
+        );
+        // Ноль релея показывается как «реле 0» — счётчик не скачет.
+        mesh.relay_bytes = 0;
+        mesh.mesh_sessions = 0;
+        let text = render(&mesh, 140, 40);
+        assert!(text.contains("реле 0"), "нет нулевого релея:\n{text}");
+        assert!(!text.contains("mesh 0"), "нулевые сессии не показываем");
+
+        // Карточка участника: путь и закрепление.
+        let mut app = demo_app();
+        app.toasts.clear();
+        app.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        let text = render(&app, 140, 40);
+        assert!(text.contains("Участник: bravo"), "нет карточки:\n{text}");
+        assert!(
+            text.contains("закреплено: авто"),
+            "нет строки закрепления:\n{text}"
+        );
+
+        // Окно выбора пути: варианты, отметка текущего и имя реле.
+        app.stack.clear();
+        app.stack.push(Popup::PathPin(PathPinPopup {
+            pubkey: [2; 32],
+            name: "bravo".into(),
+            ip: 0x6442_0103,
+            relay: Some([3; 32]),
+        }));
+        let text = render(&app, 140, 40);
+        assert!(text.contains("Путь до bravo"), "нет окна пути:\n{text}");
+        assert!(text.contains("0 ● авто"), "«авто» не отмечено:\n{text}");
+        assert!(
+            text.contains("3 ○ реле: 030303"),
+            "нет варианта реле:\n{text}"
+        );
+        // Нет реле — вариант «3» показан недоступным.
+        app.stack.clear();
+        app.stack.push(Popup::PathPin(PathPinPopup {
+            pubkey: [2; 32],
+            name: "bravo".into(),
+            ip: 0x6442_0103,
+            relay: None,
+        }));
+        let text = render(&app, 140, 40);
+        assert!(
+            text.contains("3 — реле: нет"),
+            "нет недоступного реле:\n{text}"
+        );
     }
 
     #[test]
@@ -2129,6 +2580,31 @@ mod tests {
                 true,
             ),
             (
+                "карточка участника",
+                Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }),
+                true,
+            ),
+            (
+                "выбор пути",
+                Popup::PathPin(PathPinPopup {
+                    pubkey: [2; 32],
+                    name: "bravo".into(),
+                    ip: 0x6442_0103,
+                    relay: Some([3; 32]),
+                }),
+                false,
+            ),
+            (
+                "выбор пути без реле",
+                Popup::PathPin(PathPinPopup {
+                    pubkey: [2; 32],
+                    name: "bravo".into(),
+                    ip: 0x6442_0103,
+                    relay: None,
+                }),
+                false,
+            ),
+            (
                 "список",
                 Popup::ListPick(ListPickPopup {
                     title: "Автовход".into(),
@@ -2197,6 +2673,23 @@ mod tests {
                     Some(i as u64 * 7)
                 },
                 status: "ok".into(),
+                // Все виды пути: без пути, прямой, сервер и через реле
+                // (ключ реле в списке участников отсутствует — имя по hex).
+                path: match i % 4 {
+                    0 => None,
+                    1 => Some(PathSnap {
+                        kind: PathKind::Direct,
+                        rtt_ms: Some(i as u64 * 7),
+                    }),
+                    2 => Some(PathSnap {
+                        kind: PathKind::Server,
+                        rtt_ms: Some(48),
+                    }),
+                    _ => Some(PathSnap {
+                        kind: PathKind::PeerRelay { via: [200 + i; 32] },
+                        rtt_ms: Some(33),
+                    }),
+                },
             })
             .collect();
         app.groups[0].peers = peers.clone();
@@ -2583,7 +3076,7 @@ mod tests {
         });
         let s = frame(&app, 200, 40);
         let last: String = s[39].iter().collect();
-        assert!(last.contains("В сети"), "{last}");
+        assert!(last.contains("● в сети"), "{last}");
         assert!(last.contains("✦ 1"), "{last}");
         assert!(last.contains("невидимка"), "{last}");
         assert!(last.contains("UDP"), "{last}");
@@ -2594,17 +3087,40 @@ mod tests {
         // Клик по бейджу приглашений — клавиша «o».
         let (x, y) = find(&s, "✦ 1", 0);
         assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Char('o'))));
-        // Без связи — «Переподключение», без приглашений бейджа нет.
+        // Без связи — «сервер недоступен», без приглашений бейджа нет.
         app.connected = false;
+        app.conn = ConnState::Reconnecting;
         app.later_invites.clear();
         let s = frame(&app, 200, 40);
         let last: String = s[39].iter().collect();
         assert!(
-            last.contains("Переподключение") && !last.contains('✦'),
+            last.contains("○ сервер недоступен") && !last.contains('✦'),
             "{last}"
         );
         // Узко — не паникует.
         let _ = frame(&app, 40, 20);
+    }
+
+    #[test]
+    fn пилюли_офлайна_и_ожидающих_правок() {
+        // Демон недоступен + отложенные правки (офлайн-очередь).
+        let mut app = demo_app();
+        app.conn = ConnState::DaemonDown;
+        app.pending_edits = 2;
+        let s = frame(&app, 200, 40);
+        let header: String = s[1].iter().collect();
+        assert!(header.contains("⚠ демон недоступен"), "{header}");
+        let last: String = s[39].iter().collect();
+        assert!(last.contains("ожидает применения (2)"), "{last}");
+        // Без серверов — «нет сервера», правок нет — нет бейджа.
+        app.conn = ConnState::NoServer;
+        app.pending_edits = 0;
+        app.servers.clear();
+        let s = frame(&app, 200, 40);
+        let header: String = s[1].iter().collect();
+        assert!(header.contains("○ нет сервера"), "{header}");
+        let last: String = s[39].iter().collect();
+        assert!(!last.contains("ожидает применения"), "{last}");
     }
 
     #[test]

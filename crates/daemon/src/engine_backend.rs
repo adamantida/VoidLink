@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tunnel_client::api::{EngineApi, LocalEngine, Me};
 use tunnel_client::engine::{self, Cmd, Engine, Event};
+use tunnel_client::offline::apply_cfg_cmd;
 use tunnel_client::snapshot::{CfgView, Snapshot};
 use tunnel_client::store::{self, Config};
 use tunnel_protocol as proto;
@@ -449,6 +450,23 @@ impl Inner {
             Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
             Cmd::DelServer { idx } => format!("сервер №{idx} удалён"),
             Cmd::SetPrimaryServer { idx } => format!("сервер по умолчанию: №{idx}"),
+            Cmd::SwitchServer { addr, label, .. } => {
+                // Сервер должен быть в конфиге; адрес разбираем без `unwrap`:
+                // строка могла быть поправлена руками.
+                let known = lock(&this.cfg)
+                    .servers
+                    .iter()
+                    .any(|s| s.addr.parse::<SocketAddr>().ok() == Some(*addr));
+                if !known {
+                    return Err(format!("сервер {addr} не найден в конфиге"));
+                }
+                // `activate_server` (и сохранение) — в `apply_cfg_cmd` (общий с TUI).
+                if label.is_empty() {
+                    format!("переключение на сервер {addr}")
+                } else {
+                    format!("переключение на сервер {addr} ({label})")
+                }
+            }
             Cmd::Reconnect => {
                 Inner::retry_now(this);
                 return Ok(());
@@ -456,10 +474,15 @@ impl Inner {
             Cmd::Quit => return Err("демон не завершается по команде фронтенда".into()),
             _ => return Err(reason.to_string()),
         };
-        let start = matches!(cmd, Cmd::AddServer { .. } | Cmd::SetPrimaryServer { .. });
+        // Смена сервера — тоже повод запустить движок сразу: без него новые
+        // группы/автовход нового сервера не подхватятся до следующей попытки.
+        let start = matches!(
+            cmd,
+            Cmd::AddServer { .. } | Cmd::SetPrimaryServer { .. } | Cmd::SwitchServer { .. }
+        );
         let saved = {
             let mut c = lock(&this.cfg);
-            apply_offline(&mut c, cmd);
+            apply_cfg_cmd(&mut c, cmd);
             c.clone()
         };
         (this.save)(&saved);
@@ -479,89 +502,22 @@ impl Inner {
     }
 }
 
-/// Правка конфига командой без движка (проверена `check_cfg_cmd`) — то же,
-/// что делает движок (`cfg_cmd`/локальные команды `do_cmd`).
-fn apply_offline(c: &mut Config, cmd: Cmd) {
-    match cmd {
-        Cmd::SetName(n) => c.name = n,
-        Cmd::SetStatus(t) => c.status = t,
-        Cmd::SetInvisible(on) => c.invisible = on,
-        Cmd::ToggleAutojoin(gid) => {
-            if let Some(i) = c.autojoin.iter().position(|g| *g == gid) {
-                c.autojoin.remove(i);
-            } else {
-                c.autojoin.push(gid);
-            }
-        }
-        Cmd::AddFriend { pubkey, alias } => {
-            let hex = proto::hex_of(&pubkey);
-            match c.friends.iter_mut().find(|f| f.pubkey == hex) {
-                Some(f) => f.alias = alias,
-                None => c.friends.push(store::StoredFriend { pubkey: hex, alias }),
-            }
-        }
-        Cmd::DelFriend(pubkey) => {
-            let hex = proto::hex_of(&pubkey);
-            c.friends.retain(|f| f.pubkey != hex);
-        }
-        Cmd::SetAlias { pubkey, alias } => {
-            let hex = proto::hex_of(&pubkey);
-            if let Some(f) = c.friends.iter_mut().find(|f| f.pubkey == hex) {
-                f.alias = alias;
-            }
-        }
-        Cmd::AddServer {
-            addr,
-            pubkey,
-            label,
-        } => {
-            let hex = proto::hex_of(&pubkey);
-            let sa: Option<SocketAddr> = addr.parse().ok();
-            match c
-                .servers
-                .iter_mut()
-                .find(|s| s.addr.parse::<SocketAddr>().ok() == sa)
-            {
-                Some(s) => {
-                    s.pubkey = hex;
-                    s.label = label;
-                }
-                None => c.servers.push(store::StoredServer {
-                    addr: sa.map(|a| a.to_string()).unwrap_or(addr),
-                    pubkey: hex,
-                    label,
-                }),
-            }
-        }
-        Cmd::DelServer { idx } => {
-            if idx < c.servers.len() {
-                c.servers.remove(idx);
-            }
-        }
-        Cmd::SetPrimaryServer { idx } if idx < c.servers.len() => {
-            let s = c.servers.remove(idx);
-            // Первый в списке и активный — его возьмёт запуск движка.
-            // `activate_server`: автовход прежнего сервера уходит в
-            // `autojoin_by_server`, восстанавливается список нового (gid у
-            // каждого сервера свои) — как при `SwitchServer` движка.
-            if let Ok(a) = s.addr.parse::<SocketAddr>() {
-                c.activate_server(a);
-            }
-            c.servers.insert(0, s);
-        }
-        _ => {}
-    }
-}
-
 impl Backend for DaemonEngine {
     fn snapshot(&self) -> Value {
         if let Some(b) = self.live() {
             return b.snapshot();
         }
-        let snap = Snapshot {
+        let mut snap = Snapshot {
             cfg: CfgView::from_cfg(&lock(&self.inner.cfg)),
             ..Snapshot::default()
         };
+        // Движка нет: TUI должен знать причину (офлайн-режим с причиной),
+        // иначе «нет связи» не отличить от «нет сервера».
+        snap.meta.offline = true;
+        snap.meta.offline_reason = Some(match &*lock(&self.inner.state) {
+            State::Waiting { reason, .. } => reason.clone(),
+            State::Live(_) => String::new(),
+        });
         serde_json::to_value(snap).unwrap_or(Value::Null)
     }
 
@@ -707,12 +663,139 @@ impl Backend for DaemonBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn server(addr: &str) -> store::StoredServer {
         store::StoredServer {
             addr: addr.into(),
             pubkey: "00".repeat(32),
             label: String::new(),
+        }
+    }
+
+    /// Каталог данных с конфигом и identity (как после первого запуска).
+    fn data_dir(tag: &str, cfg: &Config) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vl-eb-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        store::Store::new(&dir).save(cfg).unwrap();
+        dir
+    }
+
+    /// `SwitchServer` в состоянии Waiting: правка конфига применяется сразу
+    /// (автовход переезжает, `client.json` сохраняется), движок будится
+    /// немедленно (`retry_now`), причина `Failed` видна фронтенду.
+    #[test]
+    fn switch_server_в_waiting_переключает_и_будит_движок() {
+        let mut cfg = Config {
+            name: "alpha".into(),
+            servers: vec![server("10.0.0.1:7000"), server("10.0.0.2:7000")],
+            active_server: "10.0.0.1:7000".into(),
+            autojoin: vec![3],
+            ..Config::default()
+        };
+        store::ensure_identity(&mut cfg);
+        let dir = data_dir("switch", &cfg);
+        let starts = Arc::new(AtomicU32::new(0));
+        let s = starts.clone();
+        let start: StartFn = Arc::new(move |_a: EngineStart| {
+            s.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("TUN недоступен")
+        });
+        let log: crate::log::LogFn = Arc::new(|_, _| {});
+        let e = DaemonEngine::open(&dir, log, start, None).unwrap();
+        assert!(e.has_server());
+        // Синхронный запуск падает: Waiting с видимой причиной.
+        assert!(e.start_now().is_err());
+        assert!(!e.is_live());
+        let snap = e.snapshot();
+        assert_eq!(snap["meta"]["offline"], Value::Bool(true));
+        assert!(
+            snap["meta"]["offline_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("TUN недоступен")),
+            "причина в снимке: {snap}"
+        );
+        let before = starts.load(Ordering::SeqCst);
+        assert_eq!(before, 1);
+
+        // SwitchServer без движка: сразу применить и разбудить движок.
+        let cmd = serde_json::to_value(Cmd::SwitchServer {
+            addr: "10.0.0.2:7000".parse().unwrap(),
+            pubkey: [0; 32],
+            label: "новый".into(),
+        })
+        .unwrap();
+        e.send(cmd).unwrap();
+        let evs = e.poll_events();
+        assert!(
+            evs.iter().any(|ev| {
+                ev["Notice"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("переключение на сервер"))
+            }),
+            "Notice о переключении: {evs:?}"
+        );
+        // Конфиг сохранён: активный сервер новый, автовход прежнего — в
+        // `autojoin_by_server`.
+        let saved: Config =
+            serde_json::from_slice(&std::fs::read(dir.join("client.json")).unwrap()).unwrap();
+        assert_eq!(saved.active_server, "10.0.0.2:7000");
+        assert_eq!(
+            saved.autojoin_by_server.get("10.0.0.1:7000"),
+            Some(&vec![3])
+        );
+        // `retry_now` поднял поток запуска: попытка была не одна.
+        let t0 = std::time::Instant::now();
+        while starts.load(Ordering::SeqCst) == before {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "движок не будили"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Причина следующего отказа снова видна (Error в событиях).
+        let t0 = std::time::Instant::now();
+        let mut why = String::new();
+        while why.is_empty() && t0.elapsed() < std::time::Duration::from_secs(5) {
+            for ev in e.poll_events() {
+                if let Some(err) = ev["Error"].as_str() {
+                    why = err.to_string();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(why.contains("TUN недоступен"), "{why}");
+
+        // Reconnect в Waiting — тоже немедленная попытка, а не отказ.
+        let before = starts.load(Ordering::SeqCst);
+        e.send(serde_json::to_value(Cmd::Reconnect).unwrap())
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        while starts.load(Ordering::SeqCst) == before {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "Reconnect не разбудил движок"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Битый каталог данных демона: снимок `{"engine": null, "error": …}` —
+    /// фронтенд покажет причину (TUI уйдёт в офлайн), команды — отказ.
+    #[test]
+    fn failed_демон_отдаёт_причину() {
+        let b = DaemonBackend::Failed("нет прав на каталог".into());
+        let v = b.snapshot();
+        assert_eq!(v["engine"], Value::Null);
+        assert_eq!(v["error"], "нет прав на каталог");
+        assert!(b.engine().is_none());
+        match b.send(serde_json::to_value(Cmd::RefreshList).unwrap()) {
+            Err(e) => assert_eq!(e, "нет прав на каталог"),
+            Ok(()) => panic!("команда без движка должна отклоняться"),
         }
     }
 
@@ -727,7 +810,7 @@ mod tests {
             autojoin: vec![3, 5],
             ..Config::default()
         };
-        apply_offline(&mut c, Cmd::SetPrimaryServer { idx: 1 });
+        apply_cfg_cmd(&mut c, Cmd::SetPrimaryServer { idx: 1 });
         assert_eq!(c.servers[0].addr, "10.0.0.2:7000");
         assert_eq!(c.active_server, "10.0.0.2:7000");
         assert!(
@@ -736,12 +819,12 @@ mod tests {
         );
         assert_eq!(c.autojoin_by_server.get("10.0.0.1:7000"), Some(&vec![3, 5]));
         c.autojoin.push(9);
-        apply_offline(&mut c, Cmd::SetPrimaryServer { idx: 1 });
+        apply_cfg_cmd(&mut c, Cmd::SetPrimaryServer { idx: 1 });
         assert_eq!(c.active_server, "10.0.0.1:7000");
         assert_eq!(c.autojoin, vec![3, 5]);
         assert_eq!(c.autojoin_by_server.get("10.0.0.2:7000"), Some(&vec![9]));
         // Тот же сервер — ничего не меняется.
-        apply_offline(&mut c, Cmd::SetPrimaryServer { idx: 0 });
+        apply_cfg_cmd(&mut c, Cmd::SetPrimaryServer { idx: 0 });
         assert_eq!(c.autojoin, vec![3, 5]);
     }
 

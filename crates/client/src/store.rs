@@ -74,6 +74,65 @@ pub struct Config {
     /// важнее). Применяется после перезапуска.
     #[serde(default)]
     pub dll: String,
+    /// Mesh-оверлей (этап 9): включён ли, релеит ли этот клиент и сколько
+    /// трафика отдаёт, сохранённые DHT-контакты.
+    #[serde(default)]
+    pub mesh: MeshConfig,
+    /// Ручное закрепление пути: `"<ip оверлея>" → "direct" | "server" |
+    /// "relay:<hex ed25519>"` (§3.6). Сильнее автоматического выбора.
+    #[serde(default)]
+    pub pinned_paths: BTreeMap<String, String>,
+}
+
+/// Настройки mesh-оверлея (`client.json` → `mesh`). Все поля с `serde(default)`:
+/// старый конфиг без секции читается как значения по умолчанию.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshConfig {
+    /// Участвовать в mesh (публиковать MESH_INFO, принимать пиров).
+    pub enabled: bool,
+    /// Релеить чужой трафик (L2). По умолчанию включено (§3.4).
+    pub relay_enabled: bool,
+    /// Лимит отдачи реле, кбит/с (16384 ≈ 2 МБ/с).
+    pub relay_budget_kbps: u32,
+    /// Сохранённые DHT-контакты (переживают рестарт при мёртвом сервере).
+    pub contacts: Vec<StoredContact>,
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            relay_enabled: true,
+            relay_budget_kbps: DEFAULT_RELAY_KBPS,
+            contacts: Vec::new(),
+        }
+    }
+}
+
+/// Лимит реле по умолчанию: 2 МБ/с (§3.4).
+pub const DEFAULT_RELAY_KBPS: u32 = 16_384;
+
+/// Сохранённый контакт mesh/DHT (`mesh.contacts`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredContact {
+    /// hex ed25519 — идентификатор узла DHT.
+    pub ed: String,
+    /// hex x25519 — статический ключ контакта.
+    #[serde(default)]
+    pub x: String,
+    /// `ip:port` — последний известный endpoint.
+    #[serde(default)]
+    pub addr: String,
+    /// Последний RTT до контакта, мс.
+    #[serde(default)]
+    pub rtt_ms: u32,
+    /// Когда контакт последний раз отвечал, unix секунды.
+    #[serde(default)]
+    pub seen_s: u64,
+    /// Возможности mesh (`mesh::caps::*`); бит `MESH` подразумевается.
+    #[serde(default)]
+    pub caps: u8,
 }
 
 /// Выбор транспорта до сервера.
@@ -108,6 +167,8 @@ impl Default for Config {
             transport: TransportMode::Auto,
             adapter: String::new(),
             dll: String::new(),
+            mesh: MeshConfig::default(),
+            pinned_paths: BTreeMap::new(),
         }
     }
 }
@@ -270,6 +331,32 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"name":"a","autojoin":[3]}"#).unwrap();
         assert!(cfg.lan_discovery && !cfg.invisible);
         assert_eq!(cfg.mtu(), DEFAULT_MTU);
+        // Этап 9: старый client.json без секции mesh и пинов читается.
+        assert_eq!(cfg.mesh, MeshConfig::default());
+        assert!(
+            cfg.mesh.enabled && cfg.mesh.relay_enabled,
+            "mesh включается по умолчанию"
+        );
+        assert_eq!(cfg.mesh.relay_budget_kbps, DEFAULT_RELAY_KBPS);
+        assert!(cfg.mesh.contacts.is_empty());
+        assert!(cfg.pinned_paths.is_empty());
+        // Новые поля пишутся и читаются обратно.
+        let mut cfg = Config::default();
+        cfg.pinned_paths
+            .insert("100.66.0.2".into(), "relay:0011".into());
+        cfg.mesh.contacts.push(StoredContact {
+            ed: "aa".into(),
+            x: "bb".into(),
+            addr: "1.2.3.4:5".into(),
+            rtt_ms: 42,
+            seen_s: 7,
+            caps: 0,
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mesh, cfg.mesh);
+        assert_eq!(back.pinned_paths, cfg.pinned_paths);
+        assert_eq!(back.pinned_paths["100.66.0.2"], "relay:0011");
         let d = Config::default();
         assert!(d.lan_discovery);
         assert_eq!(d.mtu, DEFAULT_MTU);

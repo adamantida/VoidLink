@@ -13,6 +13,7 @@
 
 - [Unreleased](#unreleased)
   - [Несовместимо: протокол v4](#несовместимо-протокол-v4)
+  - [Этап 9: mesh, DHT, федерация и выбор пути](#этап-9-mesh-dht-федерация-и-выбор-пути)
   - [Несовместимо: протокол v3](#несовместимо-протокол-v3)
   - [Добавлено](#добавлено)
   - [Изменено](#изменено)
@@ -59,6 +60,63 @@
   группы (253 участника) и диапазон `gid` (1–254) не менялись; `gid` в адрес
   больше не входит. Имена `<member>.vl` и `<member>.<group>.vl` указывают на
   один адрес участника.
+
+### Этап 9: mesh, DHT, федерация и выбор пути
+
+Расширения поверх v4 **без смены версии**: старые клиенты и серверы с ними
+совместимы (неизвестные кадры молча отбрасываются, mesh-хвост `'MSH1'`
+игнорируется). Ниже — итог по частям (T1–T5, T8).
+
+**Добавлено (контракт T1, ✅)**
+
+- Протокол: mesh-кодеки (`crates/protocol/src/mesh.rs`) —
+  `MESH_HELLO`/`MESH_HELLO_ACK` (153 байта, подпись ed25519 с доменом
+  `voidlink-mesh-v1`, разброс времени 120 с), `MESH_FORWARD` (hops/visited,
+  ≤ 3 хопов, ≤ 8 `visited`, `inner` — целый групповой кадр), ключи mesh-сессии
+  по направлениям, `caps` (`MESH`/`RELAY`/`ACCEPT_RELAY`), XOR-расстояние и
+  корзины DHT.
+- Новые ctrl-кадры: `MESH_INFO` (0x17), `SERVER_HINT` (0x18), `JOIN_FED`
+  (0x19), `PROBE_REQ` (0x92), `PROBE_RESP` (0x93), `MESH_SEED` (0x94),
+  `FED_GROUPS` (0x95); диапазоны mesh `0x30..=0x3F` и федерации
+  `0x40..=0x4F`. `PROTOCOL_VERSION` остаётся `4`; в `is_plaintext` из новых
+  кадров входят только `PROBE_REQ`/`PROBE_RESP`.
+- Mesh-секция `'MSH1'` в `GROUP_STATE` (`ip | x_pub | caps`) и в
+  `GROUP_UPDATE` kind 1 (`x_pub | caps`); старый декодер хвост игнорирует.
+- Проба сервера: запрос ровно 64 байта (`nonce | ts | want_key | pad`),
+  ответ 24/56 байт и **не длиннее запроса**, без сессии, разброс `ts_ms`
+  120 с, метрика `voidlink_probes_total`.
+- Сервер: `MESH_INFO` → `MESH_SEED` (до 16 ближайших онлайн-сессий, невидимки
+  исключены), mesh-хвост в `GROUP_STATE`/`GROUP_UPDATE`, `CTRL_PONG`
+  возвращает 8-байтовую метку, `PROBE_REQ` обрабатывается до HELLO, mesh- и
+  федеративные кадры отбрасываются безопасно.
+- Клиент: таблица путей (`path.rs`) — стоимость `direct / server+5 /
+  peer +15+10*load`, гистерезис 20 %, свежесть 12/30 с, ручные закрепления,
+  события `PathChanged`/`PathLost`; RTT до сервера по метке (в т.ч. TCP);
+  `Cmd::PinPath/UnpinPath/SetRelayEnabled/SetMeshEnabled/ProbeServer`,
+  `Event::ProbeResult/RelayStats`; `client.json` → `mesh` и `pinned_paths`
+  (старый конфиг читается).
+- Безопасность: mesh-якорь — состав группы, проба — подсказка, TOFU для
+  федерации; лимиты описаны в [SECURITY.md](SECURITY.md), §18.
+
+**Реализовано (T2–T5, T8; ✅)**
+
+- T2 — проба сервера с клиента (`PROBE_REQ/RESP`, RTT, сверка ключа,
+  автопроба на экране серверов), офлайн-TUI (`ResilientEngine`,
+  `ui-pending.json`, пилюли режима), правки конфига без движка.
+- T3 — mesh-сессии и RPC (`MESH_HELLO/ACK`, AEAD, окно повторов), DHT
+  (32×8, `MESH_FIND_NODE`, персистенция), релей L2 (`MESH_FORWARD` с
+  TTL/visited и бюджетом `relay_budget_kbps`), колонка «путь» и закрепление
+  в TUI.
+- T4 — федерация серверов: `SRV_HELLO/ACK` с TOFU-пиннингом в `server.json`,
+  репликация групп/адресов (`FED_GROUP_PUSH/DELTA`, `FED_ADDR_PUSH/REVOKE`),
+  `FED_RELAY` + `ACK/NACK`, `FED_GROUPS`, `JOIN_FED` → `GROUP_STATE` с
+  локальным gid, клиентская часть (`:joinfed`, метка `[федерация]`),
+  метрики `voidlink_fed_*`, флаги `--federate/--peer/--fed-pool`.
+  T4c — тай-брейк встречных `SRV_HELLO` (меньший ed — инициатор).
+- T5/T8 — документация синхронизирована; федеративные кодеки и
+  mesh/probe-декодеры покрыты фаззингом; 565 тестов на Windows (+unix-only).
+- Приёмка: [STAGE9_VERIFICATION.md](STAGE9_VERIFICATION.md) — код PASS,
+  e2e 1–7 зелёные; остаточные риски — реальный NAT и unix-only прогоны в CI.
 
 ### Несовместимо: протокол v3
 
@@ -228,6 +286,8 @@
 
 ### Тесты и CI
 
+- `cargo test --workspace` — **565** тестов (этап 9: mesh-кодеки,
+  проба, mesh-секция, таблица путей, `CTRL_PONG`, серверные хуки).
 - e2e-тесты клиента на localhost: прямой канал, доставка пакета, кик,
   рестарт сервера с переподключением, посторонний релей, мусорные фреймы.
 - Тесты протокола: разбор фреймов (включая fuzz-тесты), обрезка длинных
@@ -331,7 +391,7 @@
 
 - [README.md](../README.md) — обзор и быстрый старт.
 - [PLAN.md](PLAN.md) — план развития по этапам.
-- [PROTOCOL.md](PROTOCOL.md) — спецификация протокола v3.
+- [PROTOCOL.md](PROTOCOL.md) — спецификация протокола v4+ (этап 9).
 - [SERVER.md](SERVER.md) — сервер, флаги, эксплуатация.
 - [INSTALL.md](INSTALL.md) — установка клиента и сервера.
 - [TESTING.md](TESTING.md) — тесты и NAT-лаборатория.

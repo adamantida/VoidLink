@@ -27,7 +27,7 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 wintun.workspace = true
-windows-sys = { version = "0.61", features = ["Win32_System_Time", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Time", "Win32_Foundation", "Win32_Networking_WinSock"] }
 
 [target.'cfg(unix)'.dependencies]
 # TUN на Linux/macOS (tun_linux.rs, tun_macos.rs), часы (tui/clock.rs).

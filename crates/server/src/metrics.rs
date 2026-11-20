@@ -65,6 +65,20 @@ pub struct Metrics {
     pub challenge_total: AtomicU64,
     pub ctrl_frames: AtomicU64,
     pub bytes_relayed: AtomicU64,
+    /// Пробы доступности (`PROBE_REQ`, этап 9).
+    pub probes_total: AtomicU64,
+    /// Закреплённые (TOFU) серверы-пиры федерации (этап 9, T4a).
+    pub fed_peers: AtomicU64,
+    /// Отклонённые подсказки/рукопожатия федерации: чужой ключ/адрес/срок
+    /// (этап 9, T4a).
+    pub fed_hint_rejected: AtomicU64,
+    /// Реплицированные (чужие) группы, известные серверу (этап 9, T4b1).
+    pub fed_groups: AtomicU64,
+    /// Заявки на адреса в общем пуле федерации (этап 9, T4b1).
+    pub fed_addr_claims: AtomicU64,
+    /// Кадры, доставленные получателю через федеративный релей
+    /// (`FED_RELAY`, этап 9, T4b1).
+    pub fed_relayed: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +126,7 @@ impl Metrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 10] {
+    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 16] {
         use Kind::*;
         [
             (
@@ -169,6 +183,42 @@ impl Metrics {
                 "Байты релея",
                 Counter,
                 &self.bytes_relayed,
+            ),
+            (
+                "voidlink_probes_total",
+                "Пробы доступности (PROBE_REQ)",
+                Counter,
+                &self.probes_total,
+            ),
+            (
+                "voidlink_fed_peers",
+                "Закреплённые серверы-пиры федерации",
+                Gauge,
+                &self.fed_peers,
+            ),
+            (
+                "voidlink_fed_hint_rejected_total",
+                "Отклонённые подсказки/рукопожатия федерации",
+                Counter,
+                &self.fed_hint_rejected,
+            ),
+            (
+                "voidlink_fed_groups",
+                "Реплицированные группы федерации",
+                Gauge,
+                &self.fed_groups,
+            ),
+            (
+                "voidlink_fed_addr_claims",
+                "Заявки на адреса в общем пуле федерации",
+                Gauge,
+                &self.fed_addr_claims,
+            ),
+            (
+                "voidlink_fed_relayed_total",
+                "Кадры, доставленные через федеративный релей",
+                Counter,
+                &self.fed_relayed,
             ),
         ]
     }
@@ -422,13 +472,14 @@ mod tests {
             let (k, v) = line.split_once(' ').unwrap();
             values.insert(k.to_string(), v.parse::<u64>().unwrap());
         }
-        assert_eq!(types, 10);
-        assert_eq!(values.len(), 10);
+        assert_eq!(types, 16);
+        assert_eq!(values.len(), 16);
         assert_eq!(values["voidlink_sessions"], 3);
         assert_eq!(values["voidlink_relayed_frames_total"], 2);
         assert_eq!(values["voidlink_bytes_relayed_total"], 150);
         assert_eq!(values["voidlink_hello_total"], 7);
         assert_eq!(values["voidlink_dropped_frames_total"], 0);
+        assert_eq!(values["voidlink_probes_total"], 0);
         s.stop();
     }
 

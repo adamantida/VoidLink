@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
+use std::net::SocketAddr;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -26,9 +27,29 @@ use ratatui::widgets::{
 use tunnel_protocol as proto;
 
 use super::theme::Theme;
+use crate::probe::KeyMatch;
+
+/// `ip:port` или `host:port` → адрес (первый из разрешённых). Результаты
+/// пробы ищут строку по resolved-адресу, а не по строке из конфига.
+pub(crate) fn resolve_addr(addr: &str) -> Option<SocketAddr> {
+    if let Ok(a) = addr.parse() {
+        return Some(a);
+    }
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs().ok()?.next()
+}
 
 /// Максимальная длина однострочного поля ввода.
 const MAX_INPUT: usize = 120;
+
+/// Итог пробы сервера (PROBE_REQ/RESP) для колонок «доступен», «RTT», «ключ».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeLine {
+    pub available: bool,
+    pub rtt_ms: Option<u32>,
+    /// Совпал ли ключ сервера с закреплённым (✓/✗/—).
+    pub key_match: KeyMatch,
+}
 
 /// Сервер в списке.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +57,12 @@ pub struct ServerEntry {
     pub label: String,
     pub addr: String,
     pub pubkey: [u8; 32],
+    /// Последний измеренный пинг (мс, CTRL_PING).
+    pub ping_ms: Option<u32>,
+    /// Последняя проба; `None` — ещё не проверяли.
+    pub probe: Option<ProbeLine>,
+    /// Проба идёт прямо сейчас («проверяется…»).
+    pub probing: bool,
 }
 
 /// Форма добавления сервера. `focus`: 0 — адрес, 1 — код, 2 — подпись.
@@ -79,6 +106,8 @@ pub enum ServersAction {
     },
     /// Удалить сервер (никогда не текущий).
     Delete(usize),
+    /// Проверить доступность сервера (PROBE_REQ, §3.7).
+    Probe(usize),
     /// Новое имя адаптера и путь к dll (пусто — по умолчанию).
     SetAdapter { name: String, dll: String },
     /// Закрыть экран.
@@ -144,6 +173,50 @@ impl ServersView {
         let last = self.servers.len().saturating_sub(1);
         self.current = current.min(last);
         self.sel = self.sel.min(last);
+    }
+
+    /// Обновляет пинг для сервера по resolved-адресу.
+    pub fn update_ping(&mut self, addr: SocketAddr, ping_ms: Option<u32>) {
+        for s in &mut self.servers {
+            if resolve_addr(&s.addr) == Some(addr) {
+                s.ping_ms = ping_ms;
+                break;
+            }
+        }
+    }
+
+    /// Результат пробы: строка ищется по resolved-адресу (hostname после
+    /// resolve), а не по строке адреса.
+    pub fn update_probe(&mut self, addr: SocketAddr, line: ProbeLine) {
+        for s in &mut self.servers {
+            if resolve_addr(&s.addr) == Some(addr) {
+                s.probe = Some(line);
+                s.probing = false;
+            }
+        }
+    }
+
+    /// Отметить, что проба сервера идёт («проверяется…»).
+    pub fn set_probing(&mut self, addr: SocketAddr) {
+        for s in &mut self.servers {
+            if resolve_addr(&s.addr) == Some(addr) {
+                s.probing = true;
+            }
+        }
+    }
+
+    /// Идёт ли уже проба этого адреса (по resolved-адресу).
+    pub fn is_probing(&self, addr: SocketAddr) -> bool {
+        self.servers
+            .iter()
+            .any(|s| s.probing && resolve_addr(&s.addr) == Some(addr))
+    }
+
+    /// Адрес выбранного сервера (для явной пробы `p`).
+    pub fn selected_addr(&self) -> Option<SocketAddr> {
+        self.servers
+            .get(self.sel)
+            .and_then(|s| resolve_addr(&s.addr))
     }
 
     // ------------------------------------------------------------ клавиши
@@ -233,6 +306,10 @@ impl ServersView {
                     focus: 0,
                     error: None,
                 });
+            }
+            KeyCode::Char('p') if self.sel < n => {
+                self.notice = None;
+                return Some(ServersAction::Probe(self.sel));
             }
             _ => {}
         }
@@ -467,6 +544,30 @@ impl ServersView {
                         Span::styled(" ", th.dim)
                     };
                     let key = proto::hex_of(&s.pubkey);
+                    // Проба: доступен / RTT / ключ (✓ совпал, ✗ чужой, — нет
+                    // сверки). Пока идёт — «проверяется…».
+                    let (avail, avail_style) = if s.probing {
+                        ("проверяется…", th.warn)
+                    } else {
+                        match s.probe {
+                            Some(p) if p.available => ("✓", th.ok),
+                            Some(_) => ("✗", th.error),
+                            None => ("—", th.dim),
+                        }
+                    };
+                    let rtt_src = s.probe.and_then(|p| p.rtt_ms).or(s.ping_ms);
+                    let rtt = rtt_src.map_or("—".to_string(), |v| format!("{v} мс"));
+                    let rtt_style = match rtt_src {
+                        Some(v) if v < 50 => th.ok,
+                        Some(v) if v < 150 => th.warn,
+                        Some(_) => th.error,
+                        None => th.dim,
+                    };
+                    let (key_mark, key_style) = match s.probe.map(|p| p.key_match) {
+                        Some(KeyMatch::Match) => ("✓", th.ok),
+                        Some(KeyMatch::Mismatch) => ("✗", th.error),
+                        Some(KeyMatch::Unknown) | None => ("—", th.dim),
+                    };
                     Row::new(vec![
                         Cell::from(mark),
                         Cell::from(Span::styled(
@@ -478,6 +579,9 @@ impl ServersView {
                             if cur { th.ok } else { th.base },
                         )),
                         Cell::from(Span::styled(s.addr.clone(), th.base)),
+                        Cell::from(Span::styled(avail, avail_style)),
+                        Cell::from(Span::styled(rtt, rtt_style)),
+                        Cell::from(Span::styled(key_mark, key_style)),
                         Cell::from(Span::styled(format!("{}…", &key[..12]), th.dim)),
                     ])
                 })
@@ -489,9 +593,23 @@ impl ServersView {
                     Constraint::Fill(1),
                     Constraint::Fill(2),
                     Constraint::Length(13),
+                    Constraint::Length(7),
+                    Constraint::Length(5),
+                    Constraint::Length(13),
                 ],
             )
-            .header(Row::new(vec!["", "имя", "адрес", "ключ"]).style(th.dim))
+            .header(
+                Row::new(vec![
+                    "",
+                    "имя",
+                    "адрес",
+                    "доступен",
+                    "RTT",
+                    "ключ",
+                    "pubkey",
+                ])
+                .style(th.dim),
+            )
             .row_highlight_style(th.selected)
             .highlight_symbol("▌");
             let mut state = TableState::default();
@@ -523,15 +641,27 @@ impl ServersView {
         } else {
             self.dll_path.as_str()
         };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("адаптер ", th.dim),
-                Span::styled(self.adapter_name.clone(), th.base),
-                Span::styled(" · dll ", th.dim),
-                Span::styled(dll.to_string(), th.base),
-            ])),
-            info_area,
-        );
+        let mut info = vec![
+            Span::styled("адаптер ", th.dim),
+            Span::styled(self.adapter_name.clone(), th.base),
+            Span::styled(" · dll ", th.dim),
+            Span::styled(dll.to_string(), th.base),
+        ];
+        // Проба выбранного сервера: «проверяется…» или итог.
+        if let Some(s) = self.servers.get(self.sel) {
+            if s.probing {
+                info.push(Span::styled(" · проверяется…", th.warn));
+            } else if let Some(p) = s.probe {
+                let (text, style) = match (p.available, p.key_match) {
+                    (false, _) => (" · недоступен", th.error),
+                    (true, KeyMatch::Match) => (" · ключ ✓", th.ok),
+                    (true, KeyMatch::Mismatch) => (" · чужой ключ ✗", th.error),
+                    (true, KeyMatch::Unknown) => (" · доступен", th.ok),
+                };
+                info.push(Span::styled(text, style));
+            }
+        }
+        f.render_widget(Paragraph::new(Line::from(info)), info_area);
         if let Some(n) = &self.notice {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(format!("! {n}"), th.warn))),
@@ -823,6 +953,9 @@ mod tests {
                 },
                 addr: format!("10.0.0.{}:5555", i + 1),
                 pubkey: [i as u8; 32],
+                ping_ms: None,
+                probe: None,
+                probing: false,
             })
             .collect();
         ServersView::new(servers, 0, "TunnelVPN", "")
@@ -847,6 +980,40 @@ mod tests {
         for c in s.chars() {
             assert_eq!(v.handle_key(k(KeyCode::Char(c))), None);
         }
+    }
+
+    #[test]
+    fn колонки_пробы_доступен_rtt_ключ() {
+        let mut v = view(2);
+        v.update_probe(
+            "10.0.0.1:5555".parse().unwrap(),
+            ProbeLine {
+                available: true,
+                rtt_ms: Some(7),
+                key_match: KeyMatch::Match,
+            },
+        );
+        v.set_probing("10.0.0.2:5555".parse().unwrap());
+        let text = render(&v, ThemeKind::Dark, 100, 24);
+        assert!(text.contains("доступен"), "{text}");
+        assert!(text.contains("RTT"), "{text}");
+        assert!(text.contains("ключ"), "{text}");
+        assert!(text.contains("7 мс"), "{text}");
+        assert!(text.contains("проверяется…"), "{text}");
+        assert!(text.contains('✓'), "ключ совпал: {text}");
+        // Чужой ключ — ✗ у ключа, недоступный — ✗ в «доступен».
+        v.update_probe(
+            "10.0.0.1:5555".parse().unwrap(),
+            ProbeLine {
+                available: true,
+                rtt_ms: Some(9),
+                key_match: KeyMatch::Mismatch,
+            },
+        );
+        let text = render(&v, ThemeKind::Dark, 100, 24);
+        assert!(text.contains('✗'), "{text}");
+        assert!(!v.is_probing("10.0.0.1:5555".parse().unwrap()));
+        assert!(v.is_probing("10.0.0.2:5555".parse().unwrap()));
     }
 
     fn find(text: &str, needle: &str) -> (u16, u16) {
@@ -1028,6 +1195,9 @@ mod tests {
             label: String::new(),
             addr: "vpn.example.org:5555".into(),
             pubkey: id.ed_pub(),
+            ping_ms: None,
+            probe: None,
+            probing: false,
         });
         v.mode = Mode::Add(AddForm {
             addr: "other.example.org:1".into(),
