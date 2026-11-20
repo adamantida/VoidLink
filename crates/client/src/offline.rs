@@ -117,8 +117,11 @@ struct Shared {
     save: Arc<dyn Fn(&Config) + Send + Sync>,
     me: Me,
     stop: AtomicBool,
-    /// Живой демон, если нашли.
+    /// Демон, если он есть (даже без движка: в состоянии «нет сервера» или
+    /// после неудачного запуска он сам применяет правки конфига).
     remote: Mutex<Option<Arc<IpcEngine>>>,
+    /// В демоне живой движок (`remote` без движка — всё ещё офлайн).
+    live: AtomicBool,
     /// Очередь на применение демоном.
     pending: Mutex<VecDeque<Cmd>>,
     /// События офлайн-режима (Notice/Error/Disconnected) + пробы.
@@ -134,6 +137,10 @@ struct Shared {
 impl Shared {
     fn remote(&self) -> Option<Arc<IpcEngine>> {
         lock(&self.remote).clone()
+    }
+
+    fn live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
     }
 
     fn push(&self, ev: Event) {
@@ -167,6 +174,14 @@ impl Shared {
         (self.save)(cfg);
     }
 
+    /// Проба сервера: свой сокет/поток, движок не нужен.
+    fn probe_local(&self, addr: SocketAddr) -> Result<()> {
+        let pinned = pinned_key(&self.cfg, addr);
+        self.probes
+            .start_probe(addr, pinned, now_ms())
+            .map_err(|e| anyhow!("проба {addr}: {e:#}"))
+    }
+
     /// Снимок офлайн-состояния (TUI рисует его как обычный).
     fn snapshot(&self) -> Arc<Snapshot> {
         if let Some(r) = self.remote() {
@@ -174,6 +189,12 @@ impl Shared {
             let n = self.pending_len() as u32;
             if n > 0 {
                 s.meta.pending_edits = n;
+            }
+            if !self.live() {
+                s.meta.offline = true;
+                if s.meta.offline_reason.is_none() {
+                    s.meta.offline_reason = lock(&self.reason).clone();
+                }
             }
             return Arc::new(s);
         }
@@ -217,6 +238,7 @@ impl Shared {
     /// Отвалиться от демона: очередь остаётся, дальше — офлайн.
     fn drop_remote(&self, why: &str) {
         let was = lock(&self.remote).take();
+        self.live.store(false, Ordering::SeqCst);
         if was.is_none() {
             return;
         }
@@ -246,21 +268,32 @@ impl Shared {
         self.persist_pending();
     }
 
-    /// Принять живой демон: история — в лог, очередь — по порядку.
+    /// Принять демона (с движком или без): история — в лог, очередь — по
+    /// порядку. Демон в состоянии «нет сервера» сам применяет правки конфига
+    /// и поднимает движок по `AddServer`.
     fn adopt(&self, eng: IpcEngine) {
+        let snap = (*eng.snapshot()).clone();
+        let live = !snap.meta.offline;
+        let reason = snap.meta.offline_reason.clone();
         let history = eng.take_history();
         // Демон мог прочитать наш client.json уже с правками (TUI правила
         // файл офлайн): тогда очередь применять не надо — она бы задвоилась.
         let same = {
             let local = self.cfg();
-            let remote = (*eng.snapshot()).clone();
-            CfgView::from_cfg(&local) == remote.cfg
+            CfgView::from_cfg(&local) == snap.cfg
         };
         let eng = Arc::new(eng);
         *lock(&self.remote) = Some(eng.clone());
-        self.set_reason(None);
+        self.live.store(live, Ordering::SeqCst);
+        self.set_reason(if live { None } else { reason.clone() });
         for ev in history {
             self.push(ev);
+        }
+        if !live {
+            self.push(Event::Notice(match &reason {
+                Some(r) => format!("демон доступен, движок не запущен: {r}"),
+                None => "демон доступен, движок не запущен".into(),
+            }));
         }
         if same {
             if !lock(&self.pending).is_empty() {
@@ -269,17 +302,17 @@ impl Shared {
                 self.push(Event::Notice(
                     "демон поднялся с нашим конфигом — отложенные правки уже применены".into(),
                 ));
-            } else {
+            } else if live {
                 self.push(Event::Notice("демон доступен".into()));
             }
             return;
         }
         let n = self.pending_len();
-        self.push(Event::Notice(if n > 0 {
-            format!("демон доступен — применяем отложенные правки ({n})")
-        } else {
-            "демон доступен".into()
-        }));
+        if n > 0 && live {
+            self.push(Event::Notice(format!(
+                "демон доступен — применяем отложенные правки ({n})"
+            )));
+        }
         self.flush(&eng);
     }
 
@@ -328,28 +361,34 @@ impl Shared {
         Ok(())
     }
 
-    /// Команда от TUI. Есть демон — ему; нет — конфиг/проба локально,
-    /// сетевое — отказ.
+    /// Команда от TUI. Есть демон — ему (живой движок — всё, без движка —
+    /// правки конфига: он сам их применит и поднимет движок); нет — конфиг и
+    /// проба локально, сетевое — отказ.
     fn send(&self, cmd: Cmd) -> Result<()> {
         if matches!(cmd, Cmd::Quit) {
             return Ok(());
         }
+        // Проба не требует движка: свой сокет работает всегда (и когда демон
+        // есть, но его движок не поднялся).
+        if let Cmd::ProbeServer { addr } = cmd {
+            return self.probe_local(addr);
+        }
         if let Some(eng) = self.remote() {
-            match eng.send(cmd.clone()) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    // Демон пропал между кадрами: команду — в офлайн-путь.
-                    self.drop_remote(&e.to_string());
+            let live = self.live();
+            if live || is_cfg_cmd(&cmd) || matches!(cmd, Cmd::Reconnect) {
+                match eng.send(cmd.clone()) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        // Демон пропал между кадрами: команду — в офлайн-путь.
+                        self.drop_remote(&e.to_string());
+                    }
                 }
+            } else {
+                return Err(anyhow!("{NO_ENGINE} (движок демона не запущен)"));
             }
         }
         match cmd {
-            Cmd::ProbeServer { addr } => {
-                let pinned = pinned_key(&self.cfg, addr);
-                self.probes
-                    .start_probe(addr, pinned, now_ms())
-                    .map_err(|e| anyhow!("проба {addr}: {e:#}"))
-            }
+            Cmd::ProbeServer { addr } => self.probe_local(addr),
             Cmd::Reconnect => {
                 self.retry_now.store(true, Ordering::SeqCst);
                 Ok(())
@@ -514,6 +553,7 @@ impl ResilientEngine {
             },
             stop: AtomicBool::new(false),
             remote: Mutex::new(None),
+            live: AtomicBool::new(false),
             pending: Mutex::new(pending),
             events: Mutex::new(VecDeque::new()),
             reason: Mutex::new(reason),
@@ -536,6 +576,11 @@ impl ResilientEngine {
         self.sh.remote().is_some()
     }
 
+    /// В демоне живой движок (иначе — офлайн, даже если демон найден).
+    pub fn is_live(&self) -> bool {
+        self.sh.live()
+    }
+
     /// Причина офлайна (для шапки/тестов).
     pub fn reason(&self) -> Option<String> {
         lock(&self.sh.reason).clone()
@@ -556,6 +601,18 @@ impl ResilientEngine {
             std::thread::sleep(Duration::from_millis(10));
         }
         self.is_remote()
+    }
+
+    /// Дождаться живого движка в демоне (тесты/e2e).
+    pub fn wait_live(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.is_live() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.is_live()
     }
 
     /// Дождаться, пока очередь опустеет (тесты/e2e).
@@ -593,7 +650,7 @@ impl EngineApi for ResilientEngine {
     }
 
     fn mode(&self) -> EngineMode {
-        if self.is_remote() {
+        if self.is_live() {
             EngineMode::Remote
         } else {
             EngineMode::Offline
@@ -601,6 +658,8 @@ impl EngineApi for ResilientEngine {
     }
 
     fn unavailable(&self) -> bool {
+        // Демон без движка доступен: он принимает правки конфига — это не
+        // «демон недоступен», а «сервер недоступен» (пилюля в TUI).
         !self.is_remote()
     }
 
@@ -655,28 +714,42 @@ fn worker(sh: Arc<Shared>) {
             return;
         }
         // Демон пропал (TUI всё ещё рисует) — обратно в офлайн.
-        if let Some(r) = sh.remote()
-            && r.unavailable()
-        {
-            sh.drop_remote(DAEMON_DOWN);
+        if let Some(r) = sh.remote() {
+            if r.unavailable() {
+                sh.drop_remote(DAEMON_DOWN);
+            } else {
+                // Демон мог поднять движок (или потерять его) — режим и
+                // причина обновляются из его снимка.
+                let s = r.snapshot();
+                let live = !s.meta.offline;
+                let was = sh.live.swap(live, Ordering::SeqCst);
+                let reason = if live {
+                    None
+                } else {
+                    s.meta.offline_reason.clone()
+                };
+                if was != live {
+                    if live {
+                        sh.set_reason(None);
+                        sh.push(Event::Notice("движок демона запущен".into()));
+                    } else {
+                        sh.set_reason(reason.clone());
+                        sh.push(Event::Notice(match &reason {
+                            Some(r) => format!("движок демона остановлен: {r}"),
+                            None => "движок демона остановлен".into(),
+                        }));
+                    }
+                } else if !live {
+                    sh.notice_reason(reason, false);
+                }
+            }
         }
         // Демона нет — пробуем (и по `Cmd::Reconnect` — сразу).
         let forced = sh.retry_now.swap(false, Ordering::SeqCst);
         if sh.remote().is_none() {
             match IpcEngine::connect(&ep, Some(sh.dir.clone())) {
                 Ok(eng) => {
-                    let snap = eng.snapshot();
-                    if snap.meta.offline {
-                        // Демон есть, движка в нём нет: остаёмся офлайн,
-                        // причину показываем (и обновляем, если изменилась).
-                        let why = snap
-                            .meta
-                            .offline_reason
-                            .clone()
-                            .unwrap_or_else(|| "демон без движка".to_string());
-                        sh.notice_reason(Some(why), false);
-                        drop(eng);
-                    } else if eng.me().my_pub != sh.me.my_pub {
+                    if eng.me().my_pub != sh.me.my_pub {
                         sh.push(Event::Error(
                             "демон работает с другой identity — перезапустите TUI".into(),
                         ));
@@ -686,9 +759,9 @@ fn worker(sh: Arc<Shared>) {
                     }
                 }
                 Err(e) => {
-                    // Демона нет — штатный офлайн; причина не тостится каждый
-                    // такт (только при смене).
-                    sh.notice_reason(Some(format!("демон недоступен ({e})")), false);
+                    // Демона нет — штатный офлайн; причина меняется редко
+                    // («демон не запущен»), тост — один раз.
+                    sh.notice_reason(Some(format!("демон недоступен ({e})")), true);
                 }
             }
         }

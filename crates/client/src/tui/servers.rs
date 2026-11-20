@@ -965,6 +965,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn колонки_пробы_доступен_rtt_ключ() {
+        let mut v = view(2);
+        v.update_probe(
+            "10.0.0.1:5555".parse().unwrap(),
+            ProbeLine {
+                available: true,
+                rtt_ms: Some(7),
+                key_match: KeyMatch::Match,
+            },
+        );
+        v.set_probing("10.0.0.2:5555".parse().unwrap());
+        let text = render(&v, ThemeKind::Dark, 100, 24);
+        assert!(text.contains("доступен"), "{text}");
+        assert!(text.contains("RTT"), "{text}");
+        assert!(text.contains("ключ"), "{text}");
+        assert!(text.contains("7 мс"), "{text}");
+        assert!(text.contains("проверяется…"), "{text}");
+        assert!(text.contains('✓'), "ключ совпал: {text}");
+        // Чужой ключ — ✗ у ключа, недоступный — ✗ в «доступен».
+        v.update_probe(
+            "10.0.0.1:5555".parse().unwrap(),
+            ProbeLine {
+                available: true,
+                rtt_ms: Some(9),
+                key_match: KeyMatch::Mismatch,
+            },
+        );
+        let text = render(&v, ThemeKind::Dark, 100, 24);
+        assert!(text.contains('✗'), "{text}");
+        assert!(!v.is_probing("10.0.0.1:5555".parse().unwrap()));
+        assert!(v.is_probing("10.0.0.2:5555".parse().unwrap()));
+    }
+
     fn find(text: &str, needle: &str) -> (u16, u16) {
         for (y, line) in text.lines().enumerate() {
             if let Some(b) = line.find(needle) {

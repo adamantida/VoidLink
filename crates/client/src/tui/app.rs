@@ -3328,6 +3328,7 @@ pub fn rename_friend_in(cfg: &mut Config, pk: &[u8; 32], name: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn app() -> App {
         let cfg = Config {
@@ -4411,5 +4412,198 @@ mod tests {
         // Клик по бейджу = «o»: снова открывает отложенные.
         a.reopen_invites();
         assert!(shown_gid(&a).is_some());
+    }
+
+    // ---------- проба серверов (этап 9, §3.7) ----------
+
+    /// Движок-заглушка: события кладём руками, команды TUI — в `sent`.
+    struct FakeEngine {
+        snap: Mutex<Snapshot>,
+        events: Mutex<VecDeque<Event>>,
+        sent: Mutex<Vec<Cmd>>,
+        me: crate::api::Me,
+    }
+
+    impl FakeEngine {
+        fn new(snap: Snapshot) -> Self {
+            FakeEngine {
+                snap: Mutex::new(snap),
+                events: Mutex::new(VecDeque::new()),
+                sent: Mutex::new(Vec::new()),
+                me: crate::api::Me {
+                    my_pub: [7; 32],
+                    my_code: "TUN-TEST".into(),
+                },
+            }
+        }
+
+        fn push(&self, ev: Event) {
+            self.events.lock().unwrap().push_back(ev);
+        }
+
+        fn sent(&self) -> Vec<Cmd> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl EngineApi for FakeEngine {
+        fn snapshot(&self) -> Arc<Snapshot> {
+            Arc::new(self.snap.lock().unwrap().clone())
+        }
+        fn poll_events(&self) -> Vec<Event> {
+            self.events.lock().unwrap().drain(..).collect()
+        }
+        fn send(&self, cmd: Cmd) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(cmd);
+            Ok(())
+        }
+        fn me(&self) -> &crate::api::Me {
+            &self.me
+        }
+        fn mode(&self) -> EngineMode {
+            EngineMode::Remote
+        }
+        fn save_theme(&self, _theme: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn save_adapter(&self, _name: &str, _dll: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn probe_snapshot() -> Snapshot {
+        let cfg = Config {
+            name: "alpha".into(),
+            servers: vec![
+                StoredServer {
+                    addr: "127.0.0.1:5599".into(),
+                    pubkey: proto::hex_of(&[1; 32]),
+                    label: "дом".into(),
+                },
+                StoredServer {
+                    addr: "127.0.0.1:5600".into(),
+                    pubkey: proto::hex_of(&[2; 32]),
+                    label: String::new(),
+                },
+            ],
+            ..Config::default()
+        };
+        Snapshot {
+            cfg: crate::snapshot::CfgView::from_cfg(&cfg),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn экран_серверов_автопроба_и_чужие_ключи() {
+        let eng = FakeEngine::new(probe_snapshot());
+        let mut a = app();
+        a.sync(&eng);
+        a.open_servers();
+        // Открытие экрана ставит автопробу: первый сервер проверяется сразу.
+        a.sync(&eng);
+        match eng.sent().as_slice() {
+            [Cmd::ProbeServer { addr }] => assert_eq!(addr.to_string(), "127.0.0.1:5599"),
+            other => panic!("ждали ProbeServer, пришло {other:?}"),
+        }
+        let Some(Popup::Servers(v)) = a.stack.last() else {
+            panic!("экран серверов открыт")
+        };
+        assert!(v.servers[0].probing, "первый сервер «проверяется…»");
+        assert!(!v.servers[1].probing);
+
+        // Ответ с чужим ключом: колонки обновились, пользователь предупреждён
+        // («отвечает чужим ключом», не «подменён»).
+        let addr: std::net::SocketAddr = "127.0.0.1:5599".parse().unwrap();
+        eng.push(Event::ProbeResult {
+            addr,
+            success: true,
+            rtt_ms: Some(12),
+            key_match: Some(false),
+        });
+        a.sync(&eng);
+        let Some(Popup::Servers(v)) = a.stack.last() else {
+            panic!("экран серверов открыт")
+        };
+        let line = v.servers[0].probe.expect("проба первого сервера");
+        assert!(line.available);
+        assert_eq!(line.rtt_ms, Some(12));
+        assert_eq!(line.key_match, KeyMatch::Mismatch);
+        assert!(!v.servers[0].probing);
+        assert!(a.toasts.iter().any(|t| t.text.contains("чужим ключом")));
+        assert!(
+            a.log.iter().any(|l| l.text.contains("чужим ключом")),
+            "предупреждение и в логе"
+        );
+
+        // `p` — повтор выбранного: команда ушла, снова «проверяется…».
+        a.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            &eng,
+        );
+        assert!(matches!(
+            eng.sent().last(),
+            Some(Cmd::ProbeServer { addr: a }) if *a == addr
+        ));
+        let Some(Popup::Servers(v)) = a.stack.last() else {
+            panic!("экран серверов открыт")
+        };
+        assert!(v.servers[0].probing);
+    }
+
+    #[test]
+    fn проба_недоступного_сервера_крестик_без_тоста() {
+        let eng = FakeEngine::new(probe_snapshot());
+        let mut a = app();
+        a.sync(&eng);
+        a.open_servers();
+        let addr: std::net::SocketAddr = "127.0.0.1:5599".parse().unwrap();
+        eng.push(Event::ProbeResult {
+            addr,
+            success: false,
+            rtt_ms: None,
+            key_match: None,
+        });
+        a.sync(&eng);
+        let Some(Popup::Servers(v)) = a.stack.last() else {
+            panic!("экран серверов открыт")
+        };
+        assert_eq!(v.servers[0].probe.map(|p| p.available), Some(false));
+        // Автопроба не тостит «недоступен» (иначе тост на каждый сервер).
+        assert!(!a.toasts.iter().any(|t| t.text.contains("недоступен")));
+        assert!(a.log.iter().any(|l| l.text.contains("недоступен")));
+    }
+
+    #[test]
+    fn результат_пробы_ищется_по_resolved_адресу() {
+        // Строка сервера — hostname, результат — resolved-адрес: колонки
+        // обновляются не по совпадению строки.
+        let mut cfg = Config::default();
+        cfg.servers.push(StoredServer {
+            addr: "localhost:5601".into(),
+            pubkey: proto::hex_of(&[3; 32]),
+            label: String::new(),
+        });
+        let snap = Snapshot {
+            cfg: crate::snapshot::CfgView::from_cfg(&cfg),
+            ..Snapshot::default()
+        };
+        let eng = FakeEngine::new(snap);
+        let mut a = app();
+        a.sync(&eng);
+        a.open_servers();
+        let resolved = resolve_addr("localhost:5601").expect("localhost разрешается");
+        eng.push(Event::ProbeResult {
+            addr: resolved,
+            success: true,
+            rtt_ms: Some(3),
+            key_match: Some(true),
+        });
+        a.sync(&eng);
+        let Some(Popup::Servers(v)) = a.stack.last() else {
+            panic!("экран серверов открыт")
+        };
+        assert_eq!(v.servers[0].probe.map(|p| p.rtt_ms), Some(Some(3)));
+        assert_eq!(v.servers[0].probe.map(|p| p.key_match), Some(KeyMatch::Match));
     }
 }
