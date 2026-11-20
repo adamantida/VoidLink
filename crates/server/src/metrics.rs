@@ -447,8 +447,8 @@ mod tests {
             let (k, v) = line.split_once(' ').unwrap();
             values.insert(k.to_string(), v.parse::<u64>().unwrap());
         }
-        assert_eq!(types, 11);
-        assert_eq!(values.len(), 11);
+        assert_eq!(types, 13);
+        assert_eq!(values.len(), 13);
         assert_eq!(values["voidlink_sessions"], 3);
         assert_eq!(values["voidlink_relayed_frames_total"], 2);
         assert_eq!(values["voidlink_bytes_relayed_total"], 150);
