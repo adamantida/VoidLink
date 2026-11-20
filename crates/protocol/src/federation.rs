@@ -22,7 +22,9 @@
 use anyhow::{Result, ensure};
 
 use crate::handshake::EphemeralKey;
-use crate::{Identity, Reader, SymKey, derive_key, put_bool, put_pub, put_str, put_u16, put_u32, put_u64};
+use crate::{
+    Identity, Reader, SymKey, derive_key, put_bool, put_pub, put_str, put_u16, put_u32, put_u64,
+};
 
 // ---------- типы кадров ----------
 
@@ -353,7 +355,8 @@ pub struct FedGroup {
 impl FedGroup {
     /// Тело кадра (без типа/AEAD — его добавляет серверный слой).
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(FED_GROUP_MIN_LEN + self.name.len() + self.members.len() * 36);
+        let mut v =
+            Vec::with_capacity(FED_GROUP_MIN_LEN + self.name.len() + self.members.len() * 36);
         v.extend_from_slice(&self.uuid);
         put_pub(&mut v, &self.owner);
         put_u32(&mut v, self.gid);
@@ -426,9 +429,10 @@ pub enum FedChange {
     MemberAdd { pk: [u8; 32], ip: u32 },
     /// kind 2: участник удалён.
     MemberRemove { pk: [u8; 32] },
-    /// kind 3: имя/приватность/ключ/эпоха (вход и выход меняют ключ).
+    /// kind 3: имя/владелец/приватность/ключ/эпоха (вход и выход меняют ключ).
     Meta {
         name: String,
+        owner: [u8; 32],
         private: bool,
         key: [u8; 32],
         epoch: u32,
@@ -457,19 +461,23 @@ impl FedChange {
     }
 }
 
-/// Дельта записи: `uuid(16) | owner(32) | rev(4) | base_rev(4) | kind(1) |
-/// данные`. `rev` — ревизия после изменения, `base_rev` — до.
+/// Дельта записи: `uuid(16) | owner(32) | rev(4) | base_rev(4) | n(1) |
+/// n × change`. `rev` — ревизия после изменений, `base_rev` — до; `n = 0`
+/// запрещено. Несколько изменений в одном кадре: вход участника — это и
+/// `MemberAdd`, и `Meta` (ротация ключа).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FedGroupDelta {
     pub uuid: [u8; 16],
     pub owner: [u8; 32],
     pub rev: u32,
     pub base_rev: u32,
-    pub change: FedChange,
+    pub changes: Vec<FedChange>,
 }
 
 /// Минимальная длина тела дельты.
 pub const FED_DELTA_MIN_LEN: usize = 16 + 32 + 4 + 4 + 1;
+/// Больше изменений в одной дельте не шлём (не влезет/проще полная запись).
+pub const FED_MAX_CHANGES: usize = 16;
 
 impl FedGroupDelta {
     pub fn encode(&self) -> Vec<u8> {
@@ -478,25 +486,31 @@ impl FedGroupDelta {
         put_pub(&mut v, &self.owner);
         put_u32(&mut v, self.rev);
         put_u32(&mut v, self.base_rev);
-        v.push(self.change.kind());
-        match &self.change {
-            FedChange::MemberAdd { pk, ip } => {
-                put_pub(&mut v, pk);
-                put_u32(&mut v, *ip);
+        let n = self.changes.len().min(FED_MAX_CHANGES);
+        v.push(n as u8);
+        for change in &self.changes[..n] {
+            v.push(change.kind());
+            match change {
+                FedChange::MemberAdd { pk, ip } => {
+                    put_pub(&mut v, pk);
+                    put_u32(&mut v, *ip);
+                }
+                FedChange::MemberRemove { pk } => put_pub(&mut v, pk),
+                FedChange::Meta {
+                    name,
+                    owner,
+                    private,
+                    key,
+                    epoch,
+                } => {
+                    put_str(&mut v, name);
+                    put_pub(&mut v, owner);
+                    put_bool(&mut v, *private);
+                    v.extend_from_slice(key);
+                    put_u32(&mut v, *epoch);
+                }
+                FedChange::Deleted => {}
             }
-            FedChange::MemberRemove { pk } => put_pub(&mut v, pk),
-            FedChange::Meta {
-                name,
-                private,
-                key,
-                epoch,
-            } => {
-                put_str(&mut v, name);
-                put_bool(&mut v, *private);
-                v.extend_from_slice(key);
-                put_u32(&mut v, *epoch);
-            }
-            FedChange::Deleted => {}
         }
         v
     }
@@ -507,29 +521,38 @@ impl FedGroupDelta {
         let owner = r.pub_key()?;
         let rev = r.u32()?;
         let base_rev = r.u32()?;
-        let kind = r.u8()?;
-        let change = match kind {
-            FED_CHANGE_MEMBER_ADD => FedChange::MemberAdd {
-                pk: r.pub_key()?,
-                ip: r.u32()?,
-            },
-            FED_CHANGE_MEMBER_REMOVE => FedChange::MemberRemove { pk: r.pub_key()? },
-            FED_CHANGE_META => FedChange::Meta {
-                name: r.str()?,
-                private: r.boolean()?,
-                key: r.array()?,
-                epoch: r.u32()?,
-            },
-            FED_CHANGE_DELETED => FedChange::Deleted,
-            other => anyhow::bail!("fed delta: неизвестный kind {other}"),
-        };
+        let n = r.u8()? as usize;
+        ensure!(
+            (1..=FED_MAX_CHANGES).contains(&n),
+            "fed delta: изменений {n}"
+        );
+        let mut changes = Vec::with_capacity(r.capacity_for(n, 1));
+        for _ in 0..n {
+            let kind = r.u8()?;
+            changes.push(match kind {
+                FED_CHANGE_MEMBER_ADD => FedChange::MemberAdd {
+                    pk: r.pub_key()?,
+                    ip: r.u32()?,
+                },
+                FED_CHANGE_MEMBER_REMOVE => FedChange::MemberRemove { pk: r.pub_key()? },
+                FED_CHANGE_META => FedChange::Meta {
+                    name: r.str()?,
+                    owner: r.pub_key()?,
+                    private: r.boolean()?,
+                    key: r.array()?,
+                    epoch: r.u32()?,
+                },
+                FED_CHANGE_DELETED => FedChange::Deleted,
+                other => anyhow::bail!("fed delta: неизвестный kind {other}"),
+            });
+        }
         r.finish()?;
         Ok(Self {
             uuid,
             owner,
             rev,
             base_rev,
-            change,
+            changes,
         })
     }
 }
@@ -600,7 +623,10 @@ pub const FED_RELAY_MIN_LEN: usize = 16 + 32 + 32 + 2;
 
 impl FedRelay {
     pub fn encode(&self) -> Vec<u8> {
-        assert!(self.frame.len() <= FED_RELAY_MAX_FRAME, "relay frame too long");
+        assert!(
+            self.frame.len() <= FED_RELAY_MAX_FRAME,
+            "relay frame too long"
+        );
         let mut v = Vec::with_capacity(FED_RELAY_MIN_LEN + self.frame.len());
         v.extend_from_slice(&self.uuid);
         put_pub(&mut v, &self.sender);
@@ -891,7 +917,10 @@ mod tests {
             epoch: 2,
             rev: 9,
             members: vec![
-                FedMember { pk: [6; 32], ip: 0x6442_0101 },
+                FedMember {
+                    pk: [6; 32],
+                    ip: 0x6442_0101,
+                },
                 FedMember {
                     pk: [7; 32],
                     ip: 0x6442_0102,
@@ -928,7 +957,7 @@ mod tests {
         bad[flags_at] |= 0x80;
         assert!(FedGroup::decode(&bad).is_err());
         // Счётчик участников больше лимита — отказ.
-        assert!(FED_GROUP_MAX_MEMBERS >= 254);
+        const { assert!(FED_GROUP_MAX_MEMBERS >= 254) };
     }
 
     #[test]
@@ -938,16 +967,17 @@ mod tests {
             owner: [2; 32],
             rev: 5,
             base_rev: 4,
-            change: FedChange::MemberAdd {
+            changes: vec![FedChange::MemberAdd {
                 pk: [3; 32],
                 ip: 0x6442_0103,
-            },
+            }],
         };
         assert_eq!(FedGroupDelta::decode(&base.encode()).unwrap(), base);
         for change in [
             FedChange::MemberRemove { pk: [4; 32] },
             FedChange::Meta {
                 name: "новое имя".into(),
+                owner: [7; 32],
                 private: false,
                 key: [9; 32],
                 epoch: 8,
@@ -955,16 +985,41 @@ mod tests {
             FedChange::Deleted,
         ] {
             let d = FedGroupDelta {
-                change,
+                changes: vec![change],
                 rev: base.rev + 1,
                 base_rev: base.rev,
                 ..base.clone()
             };
             assert_eq!(FedGroupDelta::decode(&d.encode()).unwrap(), d);
         }
-        // kind 0/неизвестный — отказ.
+        // Несколько изменений в одном кадре (вход = MemberAdd + Meta).
+        let d = FedGroupDelta {
+            changes: vec![
+                FedChange::MemberAdd {
+                    pk: [5; 32],
+                    ip: 0x6442_0104,
+                },
+                FedChange::Meta {
+                    name: "x".into(),
+                    owner: [2; 32],
+                    private: true,
+                    key: [6; 32],
+                    epoch: 3,
+                },
+            ],
+            rev: 6,
+            base_rev: 5,
+            ..base.clone()
+        };
+        assert_eq!(FedGroupDelta::decode(&d.encode()).unwrap(), d);
+        // Ноль изменений и неизвестный kind — отказ.
         let mut bad = base.encode();
-        let kind_at = 16 + 32 + 4 + 4;
+        let n_at = 16 + 32 + 4 + 4;
+        bad[n_at] = 0;
+        assert!(FedGroupDelta::decode(&bad).is_err());
+        let mut bad = base.encode();
+        bad[n_at] = 1;
+        let kind_at = n_at + 1;
         bad[kind_at] = 0;
         assert!(FedGroupDelta::decode(&bad).is_err());
         // Обрезка — ошибка, не паника.

@@ -31,7 +31,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
-use proto::federation::{self, FedKeys, SrvHello};
+use proto::federation::{
+    self, FedAddrClaim, FedChange, FedGroup, FedGroupDelta, FedKeys, FedMember, FedRelay,
+    FedRelayReply, SrvHello, nack,
+};
 use proto::handshake::EphemeralKey;
 use proto::payloads::ServerHint;
 use proto::replay::ReplayWindow;
@@ -65,6 +68,120 @@ enum Action {
     Pinned(String),
     /// Обычное событие в лог.
     Info(String),
+    /// Применить реплицированную запись группы к состоянию сервера
+    /// (создать/обновить локальную копию с локальным gid). `from` — сервер,
+    /// от которого пришла запись (источник правды для этого uuid).
+    ReplGroup { rec: FedGroup, from: [u8; 32] },
+    /// Применить дельту к реплицированной группе `uuid` от `from`.
+    ReplDelta {
+        delta: FedGroupDelta,
+        from: [u8; 32],
+    },
+    /// Удалить локальную копию реплицированной группы (владелец удалил).
+    ReplDelete([u8; 16]),
+    /// Заявка адреса в общем пуле: если локальная identity проиграла
+    /// конфликт — перевыдать ей адрес и уведомить пиров.
+    AddrLost { pk: [u8; 32], ip: u32 },
+    /// Зарезервировать адрес удалённой identity в локальном пуле (занят
+    /// чужим участником федерации).
+    AddrReserve { pk: [u8; 32], ip: u32, on: bool },
+    /// Доставить релейнутый кадр локальному клиенту и ответить пиру.
+    Relay { from: [u8; 32], rel: FedRelay },
+    /// Пир просит добавить своего клиента в нашу группу (`JOIN_FED` на его
+    /// стороне): владелец решает, принимать ли.
+    JoinRequest {
+        uuid: [u8; 16],
+        from: [u8; 32],
+        changes: Vec<FedChange>,
+    },
+    /// Пир установил сессию: нужна полная синхронизация (собирается в
+    /// housekeeping — под блокировкой состояния её брать нельзя).
+    SessionUp,
+}
+
+/// Заявка на адрес в общем пуле федерации.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Claim {
+    pub ip: u32,
+    /// ed25519-ключ сервера, выдавшего адрес (меньший побеждает в конфликте).
+    pub server: [u8; 32],
+    /// unix мс последнего подтверждения.
+    pub ts_ms: u64,
+}
+
+/// Снимок локальной (нашей, авторитетной) группы для публикации пирам.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GroupSnap {
+    pub uuid: [u8; 16],
+    /// Наш локальный gid (у пиров он свой).
+    pub gid: u32,
+    pub name: String,
+    pub owner: [u8; 32],
+    pub private: bool,
+    pub key: [u8; 32],
+    pub epoch: u32,
+    pub rev: u32,
+    /// Забаненные не реплицируются: записи хватит участникам.
+    pub members: Vec<([u8; 32], u32)>,
+}
+
+impl GroupSnap {
+    /// Полная запись для `FED_GROUP_PUSH`.
+    fn record(&self) -> FedGroup {
+        FedGroup {
+            uuid: self.uuid,
+            owner: self.owner,
+            gid: self.gid,
+            name: self.name.clone(),
+            private: self.private,
+            key: self.key,
+            epoch: self.epoch,
+            rev: self.rev,
+            members: self
+                .members
+                .iter()
+                .map(|(pk, ip)| FedMember { pk: *pk, ip: *ip })
+                .collect(),
+            deleted: false,
+        }
+    }
+
+    /// Изменения относительно прошлой публикации. `None` — дельта не
+    /// выражается (ревизия откатилась, изменений слишком много): шлём полную
+    /// запись.
+    fn changes(&self, old: &FedGroup) -> Option<Vec<FedChange>> {
+        let mut out = Vec::new();
+        if self.name != old.name
+            || self.private != old.private
+            || self.owner != old.owner
+            || self.key != old.key
+            || self.epoch != old.epoch
+        {
+            out.push(FedChange::Meta {
+                name: self.name.clone(),
+                owner: self.owner,
+                private: self.private,
+                key: self.key,
+                epoch: self.epoch,
+            });
+        }
+        let old_members: BTreeMap<[u8; 32], u32> =
+            old.members.iter().map(|m| (m.pk, m.ip)).collect();
+        for (pk, ip) in &self.members {
+            if old_members.get(pk) != Some(ip) {
+                out.push(FedChange::MemberAdd { pk: *pk, ip: *ip });
+            }
+        }
+        for pk in old_members.keys() {
+            if !self.members.iter().any(|(k, _)| k == pk) {
+                out.push(FedChange::MemberRemove { pk: *pk });
+            }
+        }
+        if out.len() > federation::FED_MAX_CHANGES {
+            return None;
+        }
+        Some(out)
+    }
 }
 
 /// Закреплённый (TOFU) пир: `server.json → federation.peers[]`.
@@ -111,11 +228,13 @@ struct Target {
     addr: SocketAddr,
 }
 
-/// Таблица федерации: пиры, попытки рукопожатия, сессии.
+/// Таблица федерации: пиры, попытки рукопожатия, сессии, репликация.
 pub(crate) struct Fed {
     /// Федерация включается флагом `--federate`: без него кадры 0x40..=0x4F
     /// не разбираются вовсе (старый сервер их молча роняет).
     enabled: bool,
+    /// Наш ed25519-ключ: разрешает конфликт адресов (меньший id побеждает).
+    id: [u8; 32],
     /// ed → закреплённый пир.
     pins: BTreeMap<[u8; 32], Pin>,
     /// адрес → ed: адрес пира закреплён за ключом.
@@ -126,20 +245,55 @@ pub(crate) struct Fed {
     sessions: HashMap<[u8; 32], Session>,
     sess_addrs: HashMap<SocketAddr, [u8; 32]>,
     pending: HashMap<SocketAddr, Pending>,
-    /// Задел T4b: пул адресов федерации (`--fed-pool`), без репликации.
-    #[allow(dead_code)]
+    /// `--fed-pool`: серверы, участвующие в общем пуле адресов. Пусто —
+    /// в пуле участвуют все пиры.
     pool: Vec<SocketAddr>,
+    /// uuid → сервер-источник правды для реплицированной группы (запись
+    /// группы на этом сервере — копия). Наши группы сюда не входят.
+    origin: BTreeMap<[u8; 16], [u8; 32]>,
+    /// identity → заявка на адрес в общем пуле.
+    claims: BTreeMap<[u8; 32], Claim>,
+    /// uuid → последняя опубликованная нами полная запись (для дельт).
+    mine: BTreeMap<[u8; 16], FedGroup>,
+    /// Адреса, уже разосланные пирам: повторно не шлём, пока не изменились.
+    announced: HashMap<[u8; 32], u32>,
+    /// Пиры, которым уже отправлена полная синхронизация (группы + адреса)
+    /// в текущей сессии: повторяется при переустановке сессии.
+    synced: HashSet<[u8; 32]>,
+    /// uuid → счётчик ре-шифрования релейных кадров (nonce под местный gid).
+    relay_seq: HashMap<[u8; 16], u64>,
+    /// Пир установил сессию: housekeeping сделает полную синхронизацию
+    /// (под блокировкой состояния её собирать нельзя — `on_hint` держит её).
+    sync_pending: bool,
 }
 
 impl Fed {
+    /// Конструктор для тестов: без своего id и без восстановленного
+    /// состояния федерации.
+    #[cfg(test)]
     pub(crate) fn new(
         enabled: bool,
         pins: Vec<Pin>,
         peers: &[SocketAddr],
         pool: &[SocketAddr],
     ) -> Self {
+        Self::new_with(enabled, [0u8; 32], pins, peers, pool, &[], &[])
+    }
+
+    /// Полный конструктор: `id` — наш ed-ключ, `groups`/`claims` — то, что
+    /// пережило рестарт (`server.json → federation.groups/addr_claims`).
+    pub(crate) fn new_with(
+        enabled: bool,
+        id: [u8; 32],
+        pins: Vec<Pin>,
+        peers: &[SocketAddr],
+        pool: &[SocketAddr],
+        groups: &[persist::PFedGroup],
+        claims: &[persist::PAddrClaim],
+    ) -> Self {
         let mut f = Self {
             enabled,
+            id,
             pins: BTreeMap::new(),
             addrs: HashMap::new(),
             targets: peers.iter().map(|a| Target { addr: *a }).collect(),
@@ -147,9 +301,41 @@ impl Fed {
             sess_addrs: HashMap::new(),
             pending: HashMap::new(),
             pool: pool.to_vec(),
+            origin: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            mine: BTreeMap::new(),
+            announced: HashMap::new(),
+            synced: HashSet::new(),
+            relay_seq: HashMap::new(),
+            sync_pending: false,
         };
         for p in pins.into_iter().take(MAX_PEERS) {
             f.insert_pin(p);
+        }
+        for g in groups {
+            let (Ok(uuid), Ok(origin)) = (crate::unhex16(&g.uuid), crate::unhex(&g.origin)) else {
+                continue;
+            };
+            // Записи своей группы в `origin` нет: она авторитетна здесь.
+            if origin != id {
+                f.origin.insert(uuid, origin);
+            }
+        }
+        for c in claims {
+            let (Ok(pk), Ok(server)) = (crate::unhex(&c.pk), crate::unhex(&c.server)) else {
+                continue;
+            };
+            if server == id {
+                continue; // свои адреса — в leases, не в чужом пуле
+            }
+            f.claims.insert(
+                pk,
+                Claim {
+                    ip: c.ip,
+                    server,
+                    ts_ms: c.ts_ms,
+                },
+            );
         }
         f
     }
@@ -366,6 +552,7 @@ impl Fed {
             reply: Some((hello.sig, ack_frame.clone())),
         });
         out.push(Action::Send(src, ack_frame));
+        out.push(Action::SessionUp);
         Ok(out)
     }
 
@@ -468,6 +655,7 @@ impl Fed {
             last_rx_ms: now_ms,
             reply: None,
         });
+        out.push(Action::SessionUp);
         Ok(out)
     }
 
@@ -477,6 +665,8 @@ impl Fed {
         {
             self.sess_addrs.remove(&old.addr);
         }
+        // Новая сессия (в т.ч. переустановленная) — синхронизация заново.
+        self.synced.remove(&s.peer);
         self.sess_addrs.insert(s.addr, s.peer);
         self.sessions.insert(s.peer, s);
     }
@@ -559,11 +749,474 @@ impl Fed {
                 out.push(a);
             }
         }
+        // `--fed-pool`: серверы общего пула адресов — тоже кандидаты в пиры
+        // (ключ закрепляется TOFU, как у `--peer`).
+        for a in self.pool.clone() {
+            if !seen.insert(a) || !crate::usable_candidate(&a) {
+                continue;
+            }
+            if let Some(x) = self.begin(me, a, None, None, now_unix, now_ms) {
+                out.push(x);
+            }
+        }
         out
+    }
+
+    // ---------- репликация групп и адресов (T4b) ----------
+
+    /// Зашифровать тело кадра для каждого пира (кроме `skip`) и положить в
+    /// очередь отправки.
+    fn broadcast(
+        &mut self,
+        typ: u8,
+        body: &[u8],
+        out: &mut crate::Outbox,
+        skip: Option<&[u8; 32]>,
+    ) {
+        let peers: Vec<([u8; 32], SocketAddr)> = self
+            .sess_addrs
+            .iter()
+            .map(|(a, ed)| (*ed, *a))
+            .filter(|(ed, _)| skip != Some(ed))
+            .collect();
+        for (ed, _) in peers {
+            if let Some(sess) = self.sessions.get_mut(&ed) {
+                let addr = sess.addr;
+                let frame = seal(sess, typ, body);
+                out.push((addr, frame));
+            }
+        }
+    }
+
+    /// Зашифровать кадр одному пиру и положить в очередь отправки.
+    fn send_to_peer(&mut self, peer: &[u8; 32], typ: u8, body: &[u8], out: &mut crate::Outbox) {
+        if let Some(sess) = self.sessions.get_mut(peer) {
+            let addr = sess.addr;
+            let frame = seal(sess, typ, body);
+            out.push((addr, frame));
+        }
+    }
+
+    /// Опубликовать изменение группы владельца: полная запись (`PUSH`) или
+    /// дельта (`DELTA`) относительно прошлой публикации. Ничего не изменилось
+    /// — кадров нет.
+    fn publish(&mut self, snap: &GroupSnap, out: &mut crate::Outbox) {
+        if !self.enabled {
+            return;
+        }
+        let rec = snap.record();
+        let (typ, body) = match self.mine.get(&snap.uuid) {
+            // Ещё не публиковали (или сервер перезапустился) — полная запись.
+            None => (federation::FED_GROUP_PUSH, rec.encode()),
+            Some(old) if *old == rec => return,
+            Some(old) if old.rev < rec.rev => match snap.changes(old) {
+                Some(changes) if !changes.is_empty() => {
+                    let d = FedGroupDelta {
+                        uuid: snap.uuid,
+                        owner: snap.owner,
+                        rev: rec.rev,
+                        base_rev: old.rev,
+                        changes,
+                    };
+                    (federation::FED_GROUP_DELTA, d.encode())
+                }
+                // Ревизия выросла, а видимых изменений нет (статус/адреса
+                // сессий не реплицируются) — дельту не шлём.
+                Some(_) => {
+                    self.mine.insert(snap.uuid, rec);
+                    return;
+                }
+                None => (federation::FED_GROUP_PUSH, rec.encode()),
+            },
+            // Ревизия откатилась/прыгнула — только полная запись.
+            Some(_) => (federation::FED_GROUP_PUSH, rec.encode()),
+        };
+        self.mine.insert(snap.uuid, rec);
+        self.broadcast(typ, &body, out, None);
+    }
+
+    /// Опубликовать удаление группы владельца.
+    fn publish_deleted(&mut self, snap: &GroupSnap, out: &mut crate::Outbox) {
+        if !self.enabled {
+            return;
+        }
+        let mut rec = self
+            .mine
+            .get(&snap.uuid)
+            .cloned()
+            .unwrap_or_else(|| snap.record());
+        rec.deleted = true;
+        rec.rev = snap.rev.wrapping_add(1);
+        rec.members.clear();
+        self.mine.remove(&snap.uuid);
+        self.broadcast(federation::FED_GROUP_PUSH, &rec.encode(), out, None);
+    }
+
+    /// Полная синхронизация с пирами, которым в этой сессии ещё ничего не
+    /// отправляли: все наши группы и заявки на адреса.
+    fn sync(&mut self, snaps: &[GroupSnap], claims: &[FedAddrClaim], out: &mut crate::Outbox) {
+        if !self.enabled {
+            return;
+        }
+        let unsynced: Vec<[u8; 32]> = self
+            .sess_addrs
+            .values()
+            .filter(|ed| !self.synced.contains(*ed))
+            .copied()
+            .collect();
+        if unsynced.is_empty() {
+            return;
+        }
+        let mut bodies: Vec<(u8, Vec<u8>)> = Vec::with_capacity(snaps.len() + claims.len());
+        for snap in snaps {
+            let rec = snap.record();
+            bodies.push((federation::FED_GROUP_PUSH, rec.encode()));
+            self.mine.insert(snap.uuid, rec);
+        }
+        for c in claims {
+            bodies.push((federation::FED_ADDR_PUSH, c.encode()));
+            self.announced.insert(c.pk, c.ip);
+        }
+        for ed in unsynced {
+            if let Some(sess) = self.sessions.get_mut(&ed) {
+                let addr = sess.addr;
+                for (typ, body) in &bodies {
+                    let frame = seal(sess, *typ, body);
+                    out.push((addr, frame));
+                }
+                self.synced.insert(ed);
+            }
+        }
+    }
+
+    /// Есть ли пиры, которым не отправляли полную синхронизацию (чтобы не
+    /// собирать снимки групп зря каждый проход).
+    fn has_unsynced(&self) -> bool {
+        self.sess_addrs.values().any(|ed| !self.synced.contains(ed))
+    }
+
+    /// Разослать заявки на адреса, которых пиры ещё не видели (общий пул).
+    fn publish_claims(&mut self, claims: &[FedAddrClaim], out: &mut crate::Outbox) {
+        for c in claims {
+            if self.announced.get(&c.pk) == Some(&c.ip) {
+                continue;
+            }
+            self.announced.insert(c.pk, c.ip);
+            let body = c.encode();
+            self.broadcast(federation::FED_ADDR_PUSH, &body, out, None);
+        }
+    }
+
+    /// Обернуть групповой кадр для сервера, на котором живёт получатель
+    /// (`FED_RELAY`). `true` — кадр ушёл (получатель заявлен другим сервером
+    /// и сессия с ним есть).
+    ///
+    /// Вызывается из `relay_group` под блокировкой состояния (порядок
+    /// `state → fed`).
+    fn wrap_relay(
+        &mut self,
+        uuid: &[u8; 16],
+        sender: &[u8; 32],
+        dst: &[u8; 32],
+        frame: &[u8],
+        out: &mut crate::Outbox,
+    ) -> bool {
+        if !self.enabled || frame.len() > federation::FED_RELAY_MAX_FRAME {
+            return false;
+        }
+        let Some(claim) = self.claims.get(dst).copied() else {
+            return false;
+        };
+        // Адрес заявлен нами — получатель должен быть здесь; иначе кадр
+        // отбрасывается (заявка устарела).
+        if claim.server == self.id || !self.sessions.contains_key(&claim.server) {
+            return false;
+        }
+        let rel = FedRelay {
+            uuid: *uuid,
+            sender: *sender,
+            dst: *dst,
+            frame: frame.to_vec(),
+        };
+        let body = rel.encode();
+        let peer = claim.server;
+        self.send_to_peer(&peer, federation::FED_RELAY, &body, out);
+        true
+    }
+
+    /// Входящая полная запись группы. Принимается только от закреплённого
+    /// сервера, и только от того, кто уже владеет этим uuid (первый PUSH и
+    /// фиксирует источник правды — конфликтующих записей не бывает).
+    fn on_group_push(&mut self, from: [u8; 32], body: &[u8]) -> Result<Vec<Action>> {
+        let rec = FedGroup::decode(body)?;
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.pins.contains_key(&from) {
+            anyhow::bail!("FED_GROUP_PUSH от незакреплённого сервера");
+        }
+        if self.mine.contains_key(&rec.uuid) {
+            return Ok(vec![Action::Reject(format!(
+                "FED_GROUP_PUSH: uuid {} — наша группа, источник правды здесь",
+                crate::hex(&rec.uuid)
+            ))]);
+        }
+        match self.origin.get(&rec.uuid) {
+            Some(origin) if *origin != from => {
+                return Ok(vec![Action::Reject(format!(
+                    "FED_GROUP_PUSH: uuid {} уже реплицирован от {}",
+                    crate::hex(&rec.uuid),
+                    crate::short(origin)
+                ))]);
+            }
+            Some(_) => {}
+            None => {
+                if self.origin.len() >= MAX_FED_GROUPS {
+                    return Ok(vec![Action::Reject(
+                        "FED_GROUP_PUSH: таблица реплицированных групп заполнена".into(),
+                    )]);
+                }
+                self.origin.insert(rec.uuid, from);
+            }
+        }
+        if rec.deleted {
+            return Ok(vec![Action::ReplDelete(rec.uuid)]);
+        }
+        Ok(vec![Action::ReplGroup { rec, from }])
+    }
+
+    /// Входящая дельта. Дельта по нашей собственной группе — заявка на вход
+    /// (её принимает владелец), по реплицированной — изменение от источника.
+    fn on_group_delta(&mut self, from: [u8; 32], body: &[u8]) -> Result<Vec<Action>> {
+        let delta = FedGroupDelta::decode(body)?;
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.pins.contains_key(&from) {
+            anyhow::bail!("FED_GROUP_DELTA от незакреплённого сервера");
+        }
+        if self.mine.contains_key(&delta.uuid) {
+            return Ok(vec![Action::JoinRequest {
+                uuid: delta.uuid,
+                from,
+                changes: delta.changes,
+            }]);
+        }
+        match self.origin.get(&delta.uuid) {
+            Some(origin) if *origin == from => Ok(vec![Action::ReplDelta { delta, from }]),
+            Some(origin) => Ok(vec![Action::Reject(format!(
+                "FED_GROUP_DELTA: uuid {} реплицирован от {}",
+                crate::hex(&delta.uuid),
+                crate::short(origin)
+            ))]),
+            // Полной записи ещё не было: дельта по группе, которую здесь
+            // считают своей, — заявка на вход (её решает владелец), по
+            // остальным — событие в лог.
+            None => Ok(vec![Action::JoinRequest {
+                uuid: delta.uuid,
+                from,
+                changes: delta.changes,
+            }]),
+        }
+    }
+
+    /// Входящая заявка адреса (`FED_ADDR_PUSH`/`FED_ADDR_REVOKE`).
+    ///
+    /// Конфликт одной identity (разные адреса) и одного адреса (разные
+    /// identity) решает меньший server id: он и остаётся. Проигравший
+    /// перевыдаёт адрес (`Action::AddrLost`) и уведомляет пиров.
+    fn on_addr(
+        &mut self,
+        from: [u8; 32],
+        typ: u8,
+        body: &[u8],
+        local: &[([u8; 32], u32)],
+        now_unix: u64,
+        out: &mut crate::Outbox,
+    ) -> Result<Vec<Action>> {
+        let c = FedAddrClaim::decode(body)?;
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.pins.contains_key(&from) {
+            anyhow::bail!("FED_ADDR от незакреплённого сервера");
+        }
+        if c.server != from {
+            anyhow::bail!("FED_ADDR: заявка от имени чужого сервера");
+        }
+        if !crate::leases::valid(c.ip) {
+            return Ok(vec![Action::Reject(format!(
+                "FED_ADDR: адрес {} вне пула",
+                crate::ip_str(c.ip)
+            ))]);
+        }
+        if typ == federation::FED_ADDR_REVOKE {
+            // Отзыв принимается только у той же заявки (pk/ip/сервер).
+            let ours = self
+                .claims
+                .get(&c.pk)
+                .is_some_and(|cur| cur.ip == c.ip && cur.server == c.server);
+            if ours {
+                self.claims.remove(&c.pk);
+                return Ok(vec![Action::AddrReserve {
+                    pk: c.pk,
+                    ip: c.ip,
+                    on: false,
+                }]);
+            }
+            return Ok(Vec::new());
+        }
+        let local_ip = |pk: &[u8; 32]| local.iter().find(|(k, _)| k == pk).map(|(_, ip)| *ip);
+        let local_owner = |ip: u32| local.iter().find(|(_, x)| *x == ip).map(|(k, _)| *k);
+        let mut acts = Vec::new();
+        // Наша identity с этим адресом уже владеет им — подтверждение.
+        if local_ip(&c.pk) == Some(c.ip) {
+            return Ok(acts);
+        }
+        // Конфликт с адресом нашей identity: меньший server id побеждает.
+        let contested = local_ip(&c.pk).filter(|ip| *ip != c.ip);
+        let (loser_pk, loser_ip) = match (contested, local_owner(c.ip)) {
+            (Some(ip), _) => (Some(c.pk), ip),
+            (None, Some(owner)) if owner != c.pk => (Some(owner), c.ip),
+            _ => (None, 0),
+        };
+        if let Some(pk) = loser_pk {
+            if self.id < c.server {
+                // Мы победили: свою заявку повторяем пиру, чужую не принимаем.
+                let mine = FedAddrClaim {
+                    pk,
+                    ip: loser_ip,
+                    server: self.id,
+                    ts_ms: now_unix,
+                };
+                let body = mine.encode();
+                if let Some(sess) = self.sessions.get_mut(&from) {
+                    let addr = sess.addr;
+                    let frame = seal(sess, federation::FED_ADDR_PUSH, &body);
+                    out.push((addr, frame));
+                }
+                return Ok(acts);
+            }
+            acts.push(Action::AddrLost { pk, ip: loser_ip });
+        }
+        // Адрес занят другой заявкой в пуле — побеждает меньший server id.
+        let holder = self
+            .claims
+            .iter()
+            .find(|(pk, cur)| cur.ip == c.ip && **pk != c.pk)
+            .map(|(pk, cur)| (*pk, *cur));
+        if let Some((other, cur)) = holder {
+            if c.server < cur.server {
+                self.claims.remove(&other);
+                acts.push(Action::AddrReserve {
+                    pk: other,
+                    ip: c.ip,
+                    on: false,
+                });
+            } else {
+                // Проиграли: пир узнает нашу заявку из общего обмена.
+                return Ok(acts);
+            }
+        }
+        match self.claims.get(&c.pk).copied() {
+            Some(cur) if cur.ip == c.ip => {
+                if c.server <= cur.server {
+                    self.claims.insert(
+                        c.pk,
+                        Claim {
+                            ip: c.ip,
+                            server: c.server,
+                            ts_ms: c.ts_ms,
+                        },
+                    );
+                }
+            }
+            // Сервер-владелец адреса перевыдал его (равный id) или выиграл
+            // конфликт (меньший) — принимаем новый адрес.
+            Some(cur) if c.server <= cur.server => {
+                self.claims.insert(
+                    c.pk,
+                    Claim {
+                        ip: c.ip,
+                        server: c.server,
+                        ts_ms: c.ts_ms,
+                    },
+                );
+                acts.push(Action::AddrReserve {
+                    pk: c.pk,
+                    ip: cur.ip,
+                    on: false,
+                });
+            }
+            Some(_) => return Ok(acts),
+            None => {
+                self.claims.insert(
+                    c.pk,
+                    Claim {
+                        ip: c.ip,
+                        server: c.server,
+                        ts_ms: c.ts_ms,
+                    },
+                );
+                acts.push(Action::AddrReserve {
+                    pk: c.pk,
+                    ip: c.ip,
+                    on: true,
+                });
+            }
+        }
+        // Дальше заявка расходится по остальным пирам (общий пул).
+        self.broadcast(federation::FED_ADDR_PUSH, &c.encode(), out, Some(&from));
+        Ok(acts)
+    }
+
+    /// Входящий `FED_RELAY` — дальше его проверяет локальный слой (ему нужны
+    /// группы и сессии получателя).
+    fn on_relay(&mut self, from: [u8; 32], body: &[u8]) -> Result<Vec<Action>> {
+        let rel = FedRelay::decode(body)?;
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.pins.contains_key(&from) {
+            anyhow::bail!("FED_RELAY от незакреплённого сервера");
+        }
+        Ok(vec![Action::Relay { from, rel }])
+    }
+
+    /// Входящий ответ на релей: отказ — повод для лога, доставка уже учтена
+    /// метрикой на доставившем сервере.
+    fn on_reply(&mut self, from: [u8; 32], typ: u8, body: &[u8]) -> Result<Vec<Action>> {
+        let reply = FedRelayReply::decode(body)?;
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.pins.contains_key(&from) {
+            anyhow::bail!("FED_RELAY ответ от незакреплённого сервера");
+        }
+        Ok(if reply.ok || typ == federation::FED_RELAY_ACK {
+            Vec::new()
+        } else {
+            vec![Action::Info(format!(
+                "релей для {} отклонён {}: {}",
+                crate::short(&reply.dst),
+                crate::short(&from),
+                nack::text(reply.reason)
+            ))]
+        })
     }
 }
 
+/// Сколько реплицированных групп сервер держит максимум (иначе таблица
+/// растёт без границ на чужом потоке).
+pub(crate) const MAX_FED_GROUPS: usize = 512;
+
 /// Применить собранные действия: отправка, метрики, лог, сохранение.
+///
+/// Действия с состоянием (`Repl*`, `Addr*`, `Relay`) приходят только из
+/// [`on_session_frame`]/[`tick`], где блокировка состояния не удерживается:
+/// `apply` берёт её сам. `on_hint` вызывает `apply` под записью состояния, но
+/// его действия инертны (отправка/лог/пин) — так порядок блокировок
+/// `state → fed` не нарушается.
 fn apply(sh: &Shared, actions: Vec<Action>) {
     for a in actions {
         match a {
@@ -578,16 +1231,45 @@ fn apply(sh: &Shared, actions: Vec<Action>) {
                 sh.save_soon();
             }
             Action::Info(msg) => sh.log(format!("federation: {msg}")),
+            Action::ReplGroup { rec, from } => crate::fed_apply_group(sh, &rec, &from),
+            Action::ReplDelta { delta, from } => crate::fed_apply_delta(sh, &delta, &from),
+            Action::ReplDelete(uuid) => crate::fed_delete_repl(sh, &uuid),
+            Action::AddrLost { pk, ip } => crate::fed_reissue_addr(sh, &pk, ip),
+            Action::AddrReserve { pk, ip, on } => crate::fed_reserve_addr(sh, &pk, ip, on),
+            Action::Relay { from, rel } => crate::fed_deliver_relay(sh, &from, &rel),
+            Action::JoinRequest {
+                uuid,
+                from,
+                changes,
+            } => crate::fed_accept_join(sh, &uuid, &from, &changes),
+            Action::SessionUp => {
+                // Полная синхронизация — в housekeeping (там нет блокировок
+                // состояния, которые держит путь подсказки).
+                sh.fed.lock().unwrap().sync_pending = true;
+            }
         }
     }
 }
 
 /// Входящий федеративный кадр (0x40..=0x4F). `true` — обработан.
 pub(crate) fn on_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) -> bool {
-    if typ != federation::SRV_HELLO && typ != federation::SRV_HELLO_ACK {
-        // 0x42..=0x4F — кадры сессии (T4b); сейчас молча роняются.
-        return false;
+    match typ {
+        federation::SRV_HELLO | federation::SRV_HELLO_ACK => on_handshake_frame(sh, src, typ, body),
+        federation::FED_GROUP_PUSH
+        | federation::FED_GROUP_DELTA
+        | federation::FED_ADDR_PUSH
+        | federation::FED_ADDR_REVOKE
+        | federation::FED_RELAY
+        | federation::FED_RELAY_ACK
+        | federation::FED_RELAY_NACK => on_session_frame(sh, src, typ, body),
+        // 0x49..=0x4F зарезервированы — молча роняем, без RESET чужому
+        // серверу.
+        _ => false,
     }
+}
+
+/// Рукопожатие федерации: открытым текстом, бюджет открытых ответов.
+fn on_handshake_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) -> bool {
     if !sh.fed.lock().unwrap().enabled {
         return false;
     }
@@ -615,6 +1297,63 @@ pub(crate) fn on_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) -> bo
     true
 }
 
+/// Кадр федеративной сессии (`0x42..=0x4F`): AEAD под ключами сессии.
+fn on_session_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) -> bool {
+    let now_ms = sh.now_ms();
+    let now_unix = crate::unix_ms();
+    // Снимок локальных адресов нужен заявкам (конфликт адресов), но брать
+    // блокировку состояния под блокировкой федерации нельзя.
+    let local: Vec<([u8; 32], u32)> = if typ == federation::FED_ADDR_PUSH {
+        let s = sh.state.read().unwrap();
+        s.leases.iter().map(|(k, ip)| (*k, ip)).collect()
+    } else {
+        Vec::new()
+    };
+    let mut out = crate::Outbox::new();
+    let actions = {
+        let mut fed = sh.fed.lock().unwrap();
+        if !fed.enabled {
+            return false;
+        }
+        let Some(peer) = fed.sess_addrs.get(&src).copied() else {
+            return false;
+        };
+        let Some(pt) = ({
+            let Some(sess) = fed.sessions.get_mut(&peer) else {
+                return false;
+            };
+            let pt = open(sess, typ, body);
+            if pt.is_some() {
+                sess.last_rx_ms = now_ms;
+            }
+            pt
+        }) else {
+            // Подделка/повтор/не та сессия — молча роняем.
+            return false;
+        };
+        let r = match typ {
+            federation::FED_GROUP_PUSH => fed.on_group_push(peer, &pt),
+            federation::FED_GROUP_DELTA => fed.on_group_delta(peer, &pt),
+            federation::FED_ADDR_PUSH | federation::FED_ADDR_REVOKE => {
+                fed.on_addr(peer, typ, &pt, &local, now_unix, &mut out)
+            }
+            federation::FED_RELAY => fed.on_relay(peer, &pt),
+            federation::FED_RELAY_ACK | federation::FED_RELAY_NACK => fed.on_reply(peer, typ, &pt),
+            _ => Ok(Vec::new()),
+        };
+        match r {
+            Ok(a) => a,
+            Err(e) => {
+                sh.log(format!("federation: {typ:#04x} от {src}: {e}"));
+                return false;
+            }
+        }
+    };
+    sh.flush(out);
+    apply(sh, actions);
+    true
+}
+
 /// `SERVER_HINT` от клиента: кандидаты-серверы. Сервер им **не доверяет** —
 /// на каждого кандидата уходит `SRV_HELLO`, ключ проверяется по ответу.
 pub(crate) fn on_hint(sh: &Shared, from: &[u8; 32], hints: &[ServerHint]) {
@@ -636,13 +1375,7 @@ pub(crate) fn on_hint(sh: &Shared, from: &[u8; 32], hints: &[ServerHint]) {
     apply(sh, actions);
 }
 
-/// `JOIN_FED` от клиента: вход в федерированную группу по uuid. T4b вернёт
-/// обычный `GROUP_STATE`; пока — честная ошибка (клиент его пока не шлёт).
-pub(crate) fn on_join_fed(_sh: &Shared, _from: &[u8; 32], _uuid: &[u8]) -> anyhow::Result<()> {
-    anyhow::bail!("вход в федерированную группу ещё не реализован (T4b)")
-}
-
-/// Старт федерации: рукопожатие с закреплёнными пирами и `--peer`.
+/// Старт федерации: рукопожатие с закреплёнными пирами, `--peer`, пулом.
 pub(crate) fn bootstrap(sh: &Shared) {
     let actions = {
         let mut fed = sh.fed.lock().unwrap();
@@ -658,30 +1391,248 @@ pub(crate) fn tick(sh: &Shared) {
         fed.tick(sh.now_ms())
     };
     apply(sh, actions);
+    reconcile(sh);
+}
+
+/// Полная синхронизация с пирами, установившими сессию: все наши группы и
+/// заявки на адреса. Собирается без блокировки федерации и без неё же
+/// отправляется — вызывать без блокировки состояния.
+pub(crate) fn reconcile(sh: &Shared) {
+    let needs = {
+        let mut fed = sh.fed.lock().unwrap();
+        let needs = fed.sync_pending || fed.has_unsynced();
+        fed.sync_pending = false;
+        needs
+    };
+    if !needs {
+        return;
+    }
+    let (snaps, claims) = {
+        let s = sh.state.read().unwrap();
+        (
+            crate::fed_snaps(&s),
+            crate::fed_claims(&s, &sh.identity.ed_pub()),
+        )
+    };
+    let mut out = crate::Outbox::new();
+    {
+        let mut fed = sh.fed.lock().unwrap();
+        if !fed.enabled {
+            return;
+        }
+        fed.sync(&snaps, &claims, &mut out);
+    }
+    sh.flush(out);
+}
+
+/// Опубликовать изменение группы владельца всем пирам. Вызывается под
+/// блокировкой состояния (порядок `state → fed`).
+pub(crate) fn publish_group(sh: &Shared, snap: &GroupSnap, out: &mut crate::Outbox) {
+    let mut fed = sh.fed.lock().unwrap();
+    if !fed.enabled {
+        return;
+    }
+    fed.publish(snap, out);
+}
+
+/// Опубликовать удаление группы владельца пирам.
+pub(crate) fn publish_deleted(sh: &Shared, snap: &GroupSnap, out: &mut crate::Outbox) {
+    let mut fed = sh.fed.lock().unwrap();
+    if !fed.enabled {
+        return;
+    }
+    fed.publish_deleted(snap, out);
+}
+
+/// Опубликовать заявку на адрес identity (наш адрес в общем пуле) и
+/// разослать её пирам. Вызывается без блокировки состояния.
+pub(crate) fn publish_claim(sh: &Shared, pk: [u8; 32], ip: u32) {
+    let c = FedAddrClaim {
+        pk,
+        ip,
+        server: sh.identity.ed_pub(),
+        ts_ms: crate::unix_ms(),
+    };
+    let mut out = crate::Outbox::new();
+    {
+        let mut fed = sh.fed.lock().unwrap();
+        if !fed.enabled {
+            return;
+        }
+        fed.announced.insert(pk, ip);
+        fed.broadcast(federation::FED_ADDR_PUSH, &c.encode(), &mut out, None);
+    }
+    sh.flush(out);
+}
+
+/// Разослать заявки на адреса (общий пул), не дублируя уже отправленные.
+/// Вызывается под блокировкой состояния (порядок `state → fed`).
+pub(crate) fn publish_claims(sh: &Shared, claims: &[FedAddrClaim], out: &mut crate::Outbox) {
+    let mut fed = sh.fed.lock().unwrap();
+    if !fed.enabled {
+        return;
+    }
+    fed.publish_claims(claims, out);
+}
+
+/// Включена ли федерация (`--federate`).
+pub(crate) fn enabled(sh: &Shared) -> bool {
+    sh.fed.lock().unwrap().enabled
+}
+
+/// Отправить владельцу заявку на вход в реплицированную группу (его клиент
+/// войдёт по `JOIN_FED`). Нет сессии с владельцем — заявка не уходит.
+pub(crate) fn request_join(
+    sh: &Shared,
+    uuid: &[u8; 16],
+    owner: &[u8; 32],
+    pk: [u8; 32],
+    ip: u32,
+    rev: u32,
+    out: &mut crate::Outbox,
+) {
+    let d = FedGroupDelta {
+        uuid: *uuid,
+        owner: *owner,
+        rev: rev.wrapping_add(1),
+        base_rev: rev,
+        changes: vec![FedChange::MemberAdd { pk, ip }],
+    };
+    let mut fed = sh.fed.lock().unwrap();
+    if !fed.enabled {
+        return;
+    }
+    if let Some(origin) = fed.origin.get(uuid).copied() {
+        let body = d.encode();
+        fed.send_to_peer(&origin, federation::FED_GROUP_DELTA, &body, out);
+    }
+}
+
+/// Обернуть групповой кадр для сервера, на котором живёт получатель
+/// (`FED_RELAY`). `None` — адрес получателя не заявлен другим сервером или
+/// сессии с ним нет: кадр отбрасывается.
+///
+/// Вызывается из `relay_group` под блокировкой состояния (порядок
+/// `state → fed`); отправка — после её освобождения.
+pub(crate) fn relay_for_peer(
+    sh: &Shared,
+    uuid: &[u8; 16],
+    sender: &[u8; 32],
+    dst: &[u8; 32],
+    frame: &[u8],
+) -> Option<(SocketAddr, Vec<u8>)> {
+    let mut out = crate::Outbox::new();
+    {
+        let mut fed = sh.fed.lock().unwrap();
+        fed.wrap_relay(uuid, sender, dst, frame, &mut out);
+    }
+    out.into_iter().next()
+}
+
+/// Ответ пиру на `FED_RELAY` (`ACK`/`NACK`).
+pub(crate) fn reply_relay(sh: &Shared, peer: &[u8; 32], reply: &FedRelayReply) {
+    let typ = if reply.ok {
+        federation::FED_RELAY_ACK
+    } else {
+        federation::FED_RELAY_NACK
+    };
+    let body = reply.encode();
+    let mut out = crate::Outbox::new();
+    {
+        let mut fed = sh.fed.lock().unwrap();
+        if !fed.enabled {
+            return;
+        }
+        fed.send_to_peer(peer, typ, &body, &mut out);
+    }
+    sh.flush(out);
+}
+
+/// Счётчик для ре-шифрования релейного кадра под локальный gid: старшие 32
+/// бита случайны на процесс (два сервера не столкнутся одним nonce), младшие
+/// растут на каждый релей.
+pub(crate) fn relay_counter(sh: &Shared, uuid: &[u8; 16]) -> u64 {
+    let mut fed = sh.fed.lock().unwrap();
+    let e = fed
+        .relay_seq
+        .entry(*uuid)
+        .or_insert_with(|| (rand::random::<u32>() as u64) << 32);
+    *e = e.wrapping_add(1);
+    *e
 }
 
 /// Пиры для `server.json → federation.peers`.
-pub(crate) fn persisted(sh: &Shared) -> persist::PFederation {
-    persist::PFederation {
-        peers: sh
-            .fed
-            .lock()
-            .unwrap()
-            .pins
-            .values()
-            .map(|p| persist::PPeer {
-                addr: p.addr.to_string(),
-                ed: crate::hex(&p.ed),
-                x: crate::hex(&p.x),
-                added_at: p.added_at,
-            })
-            .collect(),
-    }
+pub(crate) fn persisted_peers(sh: &Shared) -> Vec<persist::PPeer> {
+    sh.fed
+        .lock()
+        .unwrap()
+        .pins
+        .values()
+        .map(|p| persist::PPeer {
+            addr: p.addr.to_string(),
+            ed: crate::hex(&p.ed),
+            x: crate::hex(&p.x),
+            added_at: p.added_at,
+        })
+        .collect()
+}
+
+/// Заявки на адреса удалённых identity (`server.json →
+/// federation.addr_claims`).
+pub(crate) fn persisted_claims(sh: &Shared) -> Vec<persist::PAddrClaim> {
+    sh.fed
+        .lock()
+        .unwrap()
+        .claims
+        .iter()
+        .map(|(pk, c)| persist::PAddrClaim {
+            pk: crate::hex(pk),
+            ip: c.ip,
+            server: crate::hex(&c.server),
+            ts_ms: c.ts_ms,
+        })
+        .collect()
 }
 
 /// Закреплённые пиров столько (датчик `voidlink_fed_peers`).
 pub(crate) fn pin_count(sh: &Shared) -> usize {
     sh.fed.lock().unwrap().pins.len()
+}
+
+/// Датчик `voidlink_fed_groups`: сколько реплицированных (чужих) групп
+/// сервер знает.
+pub(crate) fn repl_count(sh: &Shared) -> usize {
+    sh.fed.lock().unwrap().origin.len()
+}
+
+/// Датчик `voidlink_fed_addr_claims`: заявок на адреса в общем пуле.
+pub(crate) fn claim_count(sh: &Shared) -> usize {
+    sh.fed.lock().unwrap().claims.len()
+}
+
+/// Закреплён ли пир с ключом `ed` (тесты федерации).
+#[cfg(test)]
+pub(crate) fn has_pin(sh: &Shared, ed: &[u8; 32]) -> bool {
+    sh.fed.lock().unwrap().pins.contains_key(ed)
+}
+
+/// Заявленный адрес identity в общем пуле (тесты федерации).
+#[cfg(test)]
+pub(crate) fn claim_of(sh: &Shared, pk: &[u8; 32]) -> Option<u32> {
+    sh.fed.lock().unwrap().claims.get(pk).map(|c| c.ip)
+}
+
+/// Тесты: записать заявку адреса в таблицу (как пришедшую от пира).
+#[cfg(test)]
+pub(crate) fn test_claim(sh: &Shared, pk: [u8; 32], ip: u32, server: [u8; 32]) {
+    sh.fed.lock().unwrap().claims.insert(
+        pk,
+        Claim {
+            ip,
+            server,
+            ts_ms: 1,
+        },
+    );
 }
 
 /// Разбор `federation.peers` из `server.json`. Битая запись — пропуск с
@@ -1236,5 +2187,394 @@ mod tests {
         std::thread::sleep(Duration::from_millis(400));
         assert!(b.shared.fed.lock().unwrap().pins.is_empty());
         assert!(a.shared.fed.lock().unwrap().pins.is_empty());
+    }
+
+    // ---------- репликация групп/адресов и релей (T4b1) ----------
+
+    /// Пара серверов с установленной федеративной сессией (a — инициатор).
+    fn pair() -> (Identity, Identity, Fed, Fed) {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let (aa, ba) = (addr(30_001), addr(30_002));
+        let mut fa = Fed::new_with(true, a.ed_pub(), Vec::new(), &[ba], &[], &[], &[]);
+        let mut fb = Fed::new_with(true, b.ed_pub(), Vec::new(), &[aa], &[], &[], &[]);
+        let hello = sends(fa.bootstrap(&a, NOW_UNIX, NOW_MS));
+        let (_, body) = proto::split_frame(&hello[0].1).unwrap();
+        let ack = sends(fb.on_hello(&b, aa, body, NOW_UNIX, NOW_MS).unwrap());
+        let acts = fa.on_ack(ba, &ack_of(&ack[0].1), NOW_UNIX, NOW_MS).unwrap();
+        assert!(rejects(acts).is_empty());
+        assert!(fa.sessions.contains_key(&b.ed_pub()));
+        assert!(fb.sessions.contains_key(&a.ed_pub()));
+        (a, b, fa, fb)
+    }
+
+    /// Расшифровать исходящий кадр принимающей стороной: (тип, тело).
+    fn open_from(fed: &mut Fed, peer: &[u8; 32], frame: &[u8]) -> (u8, Vec<u8>) {
+        let (typ, body) = proto::split_frame(frame).unwrap();
+        let sess = fed.sessions.get_mut(peer).expect("нет сессии пира");
+        let pt = open(sess, typ, body).expect("кадр не расшифровался");
+        (typ, pt)
+    }
+
+    /// Снимок группы владельца для публикации.
+    fn snap_of(uuid: [u8; 16], owner: [u8; 32], rev: u32) -> GroupSnap {
+        GroupSnap {
+            uuid,
+            gid: 3,
+            name: "фед".into(),
+            owner,
+            private: false,
+            key: [rev as u8; 32],
+            epoch: rev,
+            rev,
+            members: vec![(owner, 0x6442_0101)],
+        }
+    }
+
+    #[test]
+    fn репликация_группы_push_и_delta() {
+        let (a, b, mut fa, mut fb) = pair();
+        let uuid = [7u8; 16];
+        let owner = [9u8; 32];
+        let snap = snap_of(uuid, owner, 1);
+        // Первая публикация — полная запись, одному пиру — один кадр.
+        let mut out = Vec::new();
+        fa.publish(&snap, &mut out);
+        assert_eq!(out.len(), 1);
+        let (typ, body) = open_from(&mut fb, &a.ed_pub(), &out[0].1);
+        assert_eq!(typ, federation::FED_GROUP_PUSH);
+        // Тело кадра — ровно запись группы.
+        let decoded = proto::federation::FedGroup::decode(&body).unwrap();
+        assert_eq!((decoded.uuid, decoded.owner), (uuid, owner));
+        let acts = fb.on_group_push(a.ed_pub(), &body).unwrap();
+        match acts.as_slice() {
+            [Action::ReplGroup { rec, from }] => {
+                assert_eq!(rec.uuid, uuid);
+                assert_eq!(rec.owner, owner);
+                assert_eq!(rec.gid, 3, "gid владельца информативен");
+                assert_eq!(*from, a.ed_pub());
+                assert_eq!(rec.members.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Запись от незакреплённого сервера — не принимается.
+        assert!(fb.on_group_push([0xAB; 32], &body).is_err());
+
+        // Вход участника: MemberAdd + Meta (ротация ключа) — дельта.
+        let newcomer = [8u8; 32];
+        let mut snap2 = snap.clone();
+        snap2.rev = 2;
+        snap2.epoch = 2;
+        snap2.key = [0x22; 32];
+        snap2.members.push((newcomer, 0x6442_0102));
+        let mut out = Vec::new();
+        fa.publish(&snap2, &mut out);
+        assert_eq!(out.len(), 1);
+        let (typ, body) = open_from(&mut fb, &a.ed_pub(), &out[0].1);
+        assert_eq!(typ, federation::FED_GROUP_DELTA);
+        let d = proto::federation::FedGroupDelta::decode(&body).unwrap();
+        assert_eq!((d.rev, d.base_rev), (2, 1));
+        assert!(
+            d.changes
+                .iter()
+                .any(|c| matches!(c, FedChange::MemberAdd { pk, .. } if *pk == newcomer)),
+            "нет MemberAdd: {:?}",
+            d.changes
+        );
+        assert!(
+            d.changes
+                .iter()
+                .any(|c| matches!(c, FedChange::Meta { epoch: 2, .. })),
+            "нет ротации ключа: {:?}",
+            d.changes
+        );
+        let acts = fb.on_group_delta(a.ed_pub(), &body).unwrap();
+        match acts.as_slice() {
+            [Action::ReplDelta { delta, from }] => {
+                assert_eq!(delta.rev, 2);
+                assert_eq!(*from, a.ed_pub());
+            }
+            other => panic!("{other:?}"),
+        }
+        // Повторная публикация того же состояния — тишина.
+        let mut out = Vec::new();
+        fa.publish(&snap2, &mut out);
+        assert!(out.is_empty());
+
+        // Дельта по неизвестной группе — заявка на вход для локального слоя
+        // (группа не наша — он её отбросит).
+        let unknown = proto::federation::FedGroupDelta {
+            uuid: [0x55; 16],
+            owner,
+            rev: 1,
+            base_rev: 0,
+            changes: vec![FedChange::MemberAdd {
+                pk: [1; 32],
+                ip: 0x6442_0103,
+            }],
+        };
+        let acts = fb.on_group_delta(a.ed_pub(), &unknown.encode()).unwrap();
+        assert!(
+            matches!(acts.as_slice(), [Action::JoinRequest { uuid: u, .. }] if *u == [0x55; 16]),
+            "{acts:?}"
+        );
+
+        // Дельта по нашей группе — заявка на вход, её решает владелец.
+        let join = proto::federation::FedGroupDelta {
+            uuid,
+            owner,
+            rev: 9,
+            base_rev: 8,
+            changes: vec![FedChange::MemberAdd {
+                pk: [3; 32],
+                ip: 0x6442_0104,
+            }],
+        };
+        let acts = fa.on_group_delta(b.ed_pub(), &join.encode()).unwrap();
+        assert!(
+            matches!(acts.as_slice(), [Action::JoinRequest { uuid: u, .. }] if *u == uuid),
+            "{acts:?}"
+        );
+
+        // Удаление владельцем — полная запись с флагом deleted.
+        let mut out = Vec::new();
+        fa.publish_deleted(&snap2, &mut out);
+        let (typ, body) = open_from(&mut fb, &a.ed_pub(), &out[0].1);
+        assert_eq!(typ, federation::FED_GROUP_PUSH);
+        let rec = proto::federation::FedGroup::decode(&body).unwrap();
+        assert!(rec.deleted && rec.members.is_empty());
+        let acts = fb.on_group_push(a.ed_pub(), &body).unwrap();
+        assert!(matches!(acts.as_slice(), [Action::ReplDelete(u)] if *u == uuid));
+    }
+
+    #[test]
+    fn конфликт_адресов_решает_меньший_id() {
+        let (a, b, fa, fb) = pair();
+        // Наша identity владеет адресом ip1; пир заявляет ей другой адрес.
+        let local_pk = [9u8; 32];
+        let ip1 = 0x6442_0101;
+        let ip2 = 0x6442_0202;
+        let local = [(local_pk, ip1)];
+        // a.id < b.id: если a меньше, a побеждает; иначе побеждает b.
+        let (mut small, mut big, small_id, big_id, _small_is_a) = if a.ed_pub() < b.ed_pub() {
+            (fa, fb, a.ed_pub(), b.ed_pub(), true)
+        } else {
+            (fb, fa, b.ed_pub(), a.ed_pub(), false)
+        };
+        // Заявку шлёт «больший» (пир), получает «меньший».
+        let claim = FedAddrClaim {
+            pk: local_pk,
+            ip: ip2,
+            server: big_id,
+            ts_ms: NOW_UNIX,
+        };
+        let mut out = Vec::new();
+        let acts = small
+            .on_addr(
+                big_id,
+                federation::FED_ADDR_PUSH,
+                &claim.encode(),
+                &local,
+                NOW_UNIX,
+                &mut out,
+            )
+            .unwrap();
+        // Меньший id не отдаёт свой адрес: потерь нет, пиру уходит наша заявка.
+        assert!(
+            !acts.iter().any(|x| matches!(x, Action::AddrLost { .. })),
+            "{acts:?}"
+        );
+        assert!(!out.is_empty(), "своя заявка должна уйти пиру");
+        let (typ, body) = open_from(&mut big, &small_id, &out[0].1);
+        assert_eq!(typ, federation::FED_ADDR_PUSH);
+        let ours = FedAddrClaim::decode(&body).unwrap();
+        assert_eq!((ours.pk, ours.ip), (local_pk, ip1));
+        assert_eq!(ours.server, small_id);
+        assert!(small.claims.is_empty(), "чужой адрес не принят");
+
+        // Обратный случай: заявку шлёт меньший, получает больший — локальная
+        // identity теряет адрес и перевыдаёт его.
+        let claim = FedAddrClaim {
+            pk: local_pk,
+            ip: ip2,
+            server: small_id,
+            ts_ms: NOW_UNIX,
+        };
+        let mut out = Vec::new();
+        let acts = big
+            .on_addr(
+                small_id,
+                federation::FED_ADDR_PUSH,
+                &claim.encode(),
+                &local,
+                NOW_UNIX,
+                &mut out,
+            )
+            .unwrap();
+        match acts.as_slice() {
+            [
+                Action::AddrLost { pk, ip },
+                Action::AddrReserve { on: true, .. },
+            ] => {
+                assert_eq!((*pk, *ip), (local_pk, ip1));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Адрес меньшего записан, наш — освобождён.
+        let cur = big.claims.get(&local_pk).copied().unwrap();
+        assert_eq!((cur.ip, cur.server), (ip2, small_id));
+
+        // Адрес занят другой локальной identity: побеждает меньший server id.
+        let other_pk = [10u8; 32];
+        let claim = FedAddrClaim {
+            pk: other_pk,
+            ip: ip1,
+            server: big_id,
+            ts_ms: NOW_UNIX,
+        };
+        let mut out = Vec::new();
+        let acts = small
+            .on_addr(
+                big_id,
+                federation::FED_ADDR_PUSH,
+                &claim.encode(),
+                &local,
+                NOW_UNIX,
+                &mut out,
+            )
+            .unwrap();
+        assert!(
+            !acts.iter().any(|x| matches!(x, Action::AddrLost { .. })),
+            "меньший id не отдаёт адрес своего участника: {acts:?}"
+        );
+    }
+
+    #[test]
+    fn заявка_адреса_принимается_и_резервируется() {
+        let (_a, b, mut fa, _fb) = pair();
+        let remote_pk = [10u8; 32];
+        let ip = 0x6442_0303;
+        let c = FedAddrClaim {
+            pk: remote_pk,
+            ip,
+            server: b.ed_pub(),
+            ts_ms: NOW_UNIX,
+        };
+        // Адрес за другой identity, локальных конфликтов нет.
+        let mut out = Vec::new();
+        let acts = fa
+            .on_addr(
+                b.ed_pub(),
+                federation::FED_ADDR_PUSH,
+                &c.encode(),
+                &[],
+                NOW_UNIX,
+                &mut out,
+            )
+            .unwrap();
+        assert!(
+            acts.iter()
+                .any(|x| matches!(x, Action::AddrReserve { pk, ip: i, on: true } if *pk == remote_pk && *i == ip)),
+            "{acts:?}"
+        );
+        assert_eq!(fa.claims[&remote_pk].ip, ip);
+        // Заявка от имени чужого сервера не принимается.
+        let mut bogus = c;
+        bogus.server = [0xEE; 32];
+        assert!(
+            fa.on_addr(
+                b.ed_pub(),
+                federation::FED_ADDR_PUSH,
+                &bogus.encode(),
+                &[],
+                NOW_UNIX,
+                &mut out
+            )
+            .is_err()
+        );
+        // Отзыв снимает заявку и резерв.
+        let acts = fa
+            .on_addr(
+                b.ed_pub(),
+                federation::FED_ADDR_REVOKE,
+                &c.encode(),
+                &[],
+                NOW_UNIX,
+                &mut out,
+            )
+            .unwrap();
+        assert!(
+            acts.iter()
+                .any(|x| matches!(x, Action::AddrReserve { on: false, .. })),
+            "{acts:?}"
+        );
+        assert!(fa.claims.is_empty());
+    }
+
+    #[test]
+    fn релей_заворачивается_и_проверяется() {
+        let (a, b, mut fa, mut fb) = pair();
+        let uuid = [0x42; 16];
+        let sender = [1u8; 32];
+        let dst = [2u8; 32];
+        let frame = proto::plain_frame(proto::grp::DATA, &[0u8; 64]);
+        // Получатель не заявлен — релей некуда.
+        let mut out = Vec::new();
+        assert!(!fa.wrap_relay(&uuid, &sender, &dst, &frame, &mut out));
+        // Пир заявляет адрес получателя — кадр уходит ему.
+        let claim = FedAddrClaim {
+            pk: dst,
+            ip: 0x6442_0404,
+            server: b.ed_pub(),
+            ts_ms: NOW_UNIX,
+        };
+        let acts = fa
+            .on_addr(
+                b.ed_pub(),
+                federation::FED_ADDR_PUSH,
+                &claim.encode(),
+                &[],
+                NOW_UNIX,
+                &mut out,
+            )
+            .unwrap();
+        assert!(
+            acts.iter()
+                .any(|x| matches!(x, Action::AddrReserve { on: true, .. })),
+            "{acts:?}"
+        );
+        let mut out = Vec::new();
+        assert!(fa.wrap_relay(&uuid, &sender, &dst, &frame, &mut out));
+        assert_eq!(out.len(), 1);
+        let (typ, body) = open_from(&mut fb, &a.ed_pub(), &out[0].1);
+        assert_eq!(typ, federation::FED_RELAY);
+        let rel = FedRelay::decode(&body).unwrap();
+        assert_eq!((rel.uuid, rel.sender, rel.dst), (uuid, sender, dst));
+        assert_eq!(rel.frame, frame);
+
+        // Кадр больше предела релея не заворачивается (не паникует).
+        let huge = vec![0u8; federation::FED_RELAY_MAX_FRAME + 1];
+        let mut out = Vec::new();
+        assert!(!fa.wrap_relay(&uuid, &sender, &dst, &huge, &mut out));
+
+        // Входящий релей от закреплённого пира — действие для локального слоя.
+        let acts = fb.on_relay(a.ed_pub(), &body).unwrap();
+        assert!(
+            matches!(acts.as_slice(), [Action::Relay { rel, .. }] if rel.dst == dst),
+            "{acts:?}"
+        );
+        // От незакреплённого сервера — отказ.
+        assert!(fb.on_relay([0xCD; 32], &body).is_err());
+        // Ответ на релей: NACK попадает в лог, ошибок разбора нет.
+        let no = FedRelayReply {
+            uuid,
+            dst,
+            ok: false,
+            reason: proto::federation::nack::NO_SESSION,
+        };
+        let acts = fb
+            .on_reply(a.ed_pub(), federation::FED_RELAY_NACK, &no.encode())
+            .unwrap();
+        assert!(matches!(acts.as_slice(), [Action::Info(_)]), "{acts:?}");
     }
 }
