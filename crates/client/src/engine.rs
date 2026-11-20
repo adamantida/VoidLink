@@ -1900,6 +1900,17 @@ fn server_label(cfg: &Config, server: SocketAddr) -> String {
         .unwrap_or_default()
 }
 
+/// Закреплённый ed-ключ сервера `addr` (проба просит его в ответе —
+/// `want_key`). `None` — сервера нет в конфиге или ключ не разбирается.
+fn pinned_server_key(cfg: &Mutex<Config>, addr: SocketAddr) -> Option<[u8; 32]> {
+    let cfg = cfg.lock().unwrap_or_else(|e| e.into_inner());
+    cfg.servers
+        .iter()
+        .find(|s| s.addr.parse::<SocketAddr>().ok() == Some(addr))
+        .and_then(|s| proto::hex_to_bytes(&s.pubkey).ok())
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+}
+
 /// Запуск движка поверх произвольного TUN-устройства (без чтения из него:
 /// исходящие пакеты подаются через [`Engine::send_ip_packet`] или tun-поток).
 pub fn start_with_tun(
@@ -2093,9 +2104,9 @@ fn dispatch(
         if let Some(r) = env.probes.on_response(src, body) {
             env.emit(Event::ProbeResult {
                 addr: r.addr,
-                success: true,
+                success: r.available,
                 rtt_ms: r.rtt_ms,
-                key_match: r.key_match,
+                key_match: r.key_match.as_bool(),
             });
         }
         return true;
@@ -2614,6 +2625,16 @@ fn establish(env: &Env, st: &mut State, eph: proto::EphemeralKey, acc: Accepted)
 
 /// Таймеры: идут по часам на каждой итерации цикла.
 fn tick(env: &Env, st: &mut State, now: Instant) {
+    // Пробы серверов: свой поток складывает результаты в очередь — отдаём их
+    // событиями (TUI не различает, откуда пришёл ответ).
+    for r in env.probes.poll() {
+        env.emit(Event::ProbeResult {
+            addr: r.addr,
+            success: r.available,
+            rtt_ms: r.rtt_ms,
+            key_match: r.key_match.as_bool(),
+        });
+    }
     if env.tcp_link().is_some_and(|t| !t.is_alive()) {
         drop_tcp(env);
         lose_server(env, st, "TCP-соединение с сервером закрыто");
@@ -2902,21 +2923,22 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             return;
         }
         Cmd::ProbeServer { addr } => {
-            // Проба не требует сессии (PROBE_REQ — открытым текстом, §3.7).
-            // T2 добавит отправку; пока — честный результат «недоступен».
-            match env.probes.start_probe(addr, epoch_ms()) {
-                Ok(frame) => env.send(&frame, addr),
-                Err(e) => {
-                    if debug() {
-                        eprintln!("[engine] проба {addr}: {e:#}");
-                    }
-                    env.emit(Event::ProbeResult {
-                        addr,
-                        success: false,
-                        rtt_ms: None,
-                        key_match: None,
-                    });
+            // Проба не требует сессии (PROBE_REQ — открытым текстом, §3.7) и
+            // идёт своим сокетом/потоком (`probe::ProbeState`), не мешая
+            // сессии. Результат — `Event::ProbeResult` из `tick`.
+            if let Err(e) = env
+                .probes
+                .start_probe(addr, pinned_server_key(&env.cfg, addr), epoch_ms())
+            {
+                if debug() {
+                    eprintln!("[engine] проба {addr}: {e:#}");
                 }
+                env.emit(Event::ProbeResult {
+                    addr,
+                    success: false,
+                    rtt_ms: None,
+                    key_match: None,
+                });
             }
             return;
         }
@@ -5009,11 +5031,38 @@ mod tests {
     }
 
     #[test]
-    fn проба_сервера_пока_не_реализована_но_не_паникует() {
+    fn проба_сервера_идёт_своим_потоком_и_становится_событием() {
         let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
         let (env, ev) = test_env(server);
         let mut st = State::new([1; 32]);
+        // Проба не требует сессии и не занимает сокет движка: задание уходит
+        // в отдельный поток, мгновенного события нет.
         do_cmd(&env, &mut st, Cmd::ProbeServer { addr: server });
+        assert_eq!(env.probes.pending(), 1);
+        assert!(ev.try_recv().is_err(), "результат не мгновенный");
+        // Ответ сервера (сверка по nonce) — `tick` отдаёт его событием.
+        let nonce = env.probes.pending_nonces()[0];
+        let resp = payloads::enc_probe_resp(&payloads::ProbeResp {
+            nonce,
+            ts_ms: 0,
+            ed_pub: None,
+        });
+        assert!(env.probes.on_response(server, &resp).is_some());
+        tick(&env, &mut st, Instant::now());
+        match ev.try_recv().expect("нет события пробы") {
+            Event::ProbeResult {
+                addr,
+                success: true,
+                rtt_ms: Some(_),
+                key_match: None,
+            } => assert_eq!(addr, server),
+            other => panic!("неожиданное событие: {other:?}"),
+        }
+        // Молчание сервера — «недоступен» с тем же адресом.
+        do_cmd(&env, &mut st, Cmd::ProbeServer { addr: server });
+        let nonce = env.probes.pending_nonces()[0];
+        env.probes.timeout_nonce(nonce);
+        tick(&env, &mut st, Instant::now());
         match ev.try_recv().expect("нет события пробы") {
             Event::ProbeResult {
                 addr,
@@ -5023,6 +5072,7 @@ mod tests {
             } => assert_eq!(addr, server),
             other => panic!("неожиданное событие: {other:?}"),
         }
+        assert_eq!(env.probes.pending(), 0);
     }
 
     #[test]
