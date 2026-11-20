@@ -25,10 +25,37 @@
 //!   ключам; сам федеративный диапазон открытым текстом не ходит.
 //! * Таймаут рукопожатия и простоя сессии — 30 с; `SRV_HELLO` переотправляется
 //!   раз в `HELLO_RESEND`, пока не пришёл `ACK`.
+//! * Встречные `SRV_HELLO` разрешаются детерминированным тай-брейком —
+//!   см. «Встречные `SRV_HELLO` (T4c)» ниже.
 //! * Все действия собираются под блокировкой таблицы ([`Action`]) и
 //!   применяются после неё: отправка, метрики, лог, сохранение на диск,
 //!   репликация в состояние (уже без блокировки федерации — порядок
 //!   `state → fed`).
+//!
+//! ## Встречные `SRV_HELLO` (T4c)
+//!
+//! Оба сервера одновременно получили `SERVER_HINT` друг о друге и оба
+//! отправили `HELLO` — односторонняя подсказка такого не даёт. Если каждая
+//! сторона просто примет входящий `HELLO` и оставит свою последнюю сессию,
+//! ключи разойдутся: репликация и релей будут висеть до `FED_TIMEOUT` (30 с).
+//! Поэтому инициатор выбирается детерминированно:
+//!
+//! * меньший ed25519-ключ — инициатор: свою попытку сохраняет, входящий
+//!   `HELLO` игнорирует и дожидается `ACK` на собственный `HELLO`;
+//! * больший — отменяет свою попытку, принимает входящий `HELLO`, отвечает
+//!   `ACK` и встаёт ответчиком.
+//!
+//! Пара эфемерных ключей одна и та же с обеих сторон, поэтому сессия
+//! устанавливается сразу, а не после таймаута. Встречный `HELLO` опознаётся
+//! и по адресу, и по заявленному ed: адрес может не совпасть за NAT/прокси.
+//!
+//! Запоздалый `HELLO` от пира не перезаписывает нашу свежую initiator-сессию:
+//! у пира уже нет ожидающей попытки, наш `ACK` ушёл бы впустую, и ключи
+//! разошлись бы. Больший ed входящий `HELLO` принимает всегда: в гонке он
+//! уже отменил свою попытку, а вне гонки это переустановка сессии после
+//! перезапуска/истечения у пира либо повтор, на который уходит тот же `ACK`.
+//! `SRV_HELLO_ACK` без ожидающей попытки — не ошибка, а запоздалый ответ:
+//! он игнорируется.
 //!
 //! ## Репликация (T4b1)
 //!
@@ -504,6 +531,27 @@ impl Fed {
         out
     }
 
+    /// Наша ожидающая попытка к тому же пиру. Адрес мог не совпасть с
+    /// адресом подсказки (NAT/прокси): сверяем ещё и заявленный ed.
+    fn collision(&self, src: SocketAddr, ed: &[u8; 32]) -> Option<SocketAddr> {
+        if self.pending.contains_key(&src) {
+            return Some(src);
+        }
+        self.pending
+            .iter()
+            .find(|(_, p)| p.expected_ed.as_ref().is_some_and(|e| proto::ct_eq(e, ed)))
+            .map(|(a, _)| *a)
+    }
+
+    /// Свежая сессия, где инициатор — мы. Запоздалый `SRV_HELLO` от пира не
+    /// должен её перезаписывать: у пира уже нет ожидающей попытки (он ответил
+    /// ACK'ом), ACK на его новый HELLO уйдёт в пустоту и ключи разойдутся.
+    fn initiator_session(&self, ed: &[u8; 32], now_ms: u64) -> bool {
+        self.sessions
+            .get(ed)
+            .is_some_and(|s| s.initiator && now_ms.saturating_sub(s.last_rx_ms) < FED_TIMEOUT_MS)
+    }
+
     /// Входящий `SRV_HELLO`: проверка подписи/свежести, TOFU-закрепление,
     /// ответ `SRV_HELLO_ACK`. `Err` — кадр не разбирается (молча роняем);
     /// `Ok` — разобран, действия (в т. ч. отказ) применяются вызывающим.
@@ -553,12 +601,38 @@ impl Fed {
         {
             return Ok(vec![Action::Send(src, ack.clone())]);
         }
+        // Встречные `SRV_HELLO`: оба сервера получили подсказку друг о друге
+        // и одновременно начали рукопожатие. Тай-брейк детерминированный —
+        // инициатор меньший ed25519-ключ. Меньший не отвечает на входящий
+        // HELLO (ACK придёт на его собственный), больший отменяет свою
+        // попытку и принимает входящий: обе стороны приходят к паре
+        // (эфемерный меньшего, эфемерный большего).
+        let mut out = Vec::new();
+        if self.id < hello.ed {
+            if self.collision(src, &hello.ed).is_some() {
+                return Ok(vec![Action::Info(format!(
+                    "SRV_HELLO с {src}: встречное рукопожатие — наш ed меньше, остаёмся инициатором"
+                ))]);
+            }
+            if self.initiator_session(&hello.ed, now_ms) {
+                return Ok(vec![Action::Info(format!(
+                    "SRV_HELLO с {src}: сессия уже установлена (мы — инициатор), HELLO игнорируем"
+                ))]);
+            }
+        } else if let Some(pend) = self.collision(src, &hello.ed) {
+            self.pending.remove(&pend);
+            out.push(Action::Info(format!(
+                "SRV_HELLO с {src}: встречное рукопожатие — ed пира меньше, уступаем инициативу"
+            )));
+        }
         let my_eph = EphemeralKey::generate();
         let shared = match hello.dh(&my_eph) {
             Ok(k) => k,
-            Err(e) => return Ok(vec![Action::Reject(format!("SRV_HELLO с {src}: {e}"))]),
+            Err(e) => {
+                out.push(Action::Reject(format!("SRV_HELLO с {src}: {e}")));
+                return Ok(out);
+            }
         };
-        let mut out = Vec::new();
         if !self.pins.contains_key(&hello.ed) {
             if self.pins.len() >= MAX_PEERS {
                 return Ok(vec![Action::Reject(format!(
@@ -613,10 +687,15 @@ impl Fed {
         if !self.enabled {
             return Ok(Vec::new());
         }
-        // Ответ ждём только оттуда, куда уходил HELLO.
+        // Ответ ждём только оттуда, куда уходил HELLO. ACK без ожидающей
+        // попытки — не ошибка: это запоздалый/лишний ответ (например, на
+        // HELLO, чью попытку уже отменил тай-брейк встречного рукопожатия
+        // или забрал таймаут). Просто игнорируем, ничего не меняя.
         {
             let Some(p) = self.pending.get(&src) else {
-                return Err(anyhow::anyhow!("SRV_HELLO_ACK без нашей попытки"));
+                return Ok(vec![Action::Info(format!(
+                    "SRV_HELLO_ACK с {src}: ожидающей попытки нет — игнорируем"
+                ))]);
             };
             // Ключ ответа обязан совпасть с заявленным (подсказка/пин).
             if let Some(ed) = p.expected_ed
@@ -660,7 +739,7 @@ impl Fed {
             ))]);
         }
         let Some(p) = self.pending.remove(&src) else {
-            return Err(anyhow::anyhow!("SRV_HELLO_ACK без нашей попытки"));
+            return Ok(Vec::new());
         };
         let shared = match ack.dh(&p.eph) {
             Ok(k) => k,
@@ -1787,6 +1866,18 @@ mod tests {
         body.to_vec()
     }
 
+    /// Пара identity с детерминированным порядком: у `a` ed меньше, значит
+    /// по тай-брейку встречных `SRV_HELLO` инициатор — именно `a`.
+    fn pair_small_big() -> (Identity, Identity) {
+        loop {
+            let a = Identity::generate();
+            let b = Identity::generate();
+            if a.ed_pub() < b.ed_pub() {
+                return (a, b);
+            }
+        }
+    }
+
     // ---------- чистое ядро (без сокетов) ----------
 
     #[test]
@@ -1862,6 +1953,161 @@ mod tests {
         let ack2 = sends(fb.on_hello(&b, aa, body, NOW_UNIX, NOW_MS).unwrap());
         assert_eq!(ack1[0].1, ack2[0].1, "повтор HELLO — тот же ACK");
         assert_eq!(fb.sessions.len(), 1, "новая сессия не создаётся");
+    }
+
+    /// T4c: встречные `SRV_HELLO` (оба сервера одновременно получили
+    /// подсказку друг о друге) сходятся на одной сессии по тай-брейку
+    /// «меньший ed — инициатор», сразу и с одинаковыми ключами, без
+    /// 30-секундного ожидания таймаута.
+    #[test]
+    fn встречные_hello_сходятся_на_одной_сессии() {
+        let (a, b) = pair_small_big();
+        let (aa, ba) = (addr(21_001), addr(21_002));
+        let mut fa = Fed::new_with(true, a.ed_pub(), Vec::new(), &[], &[], &[], &[]);
+        let mut fb = Fed::new_with(true, b.ed_pub(), Vec::new(), &[], &[], &[], &[]);
+        // Оба одновременно получают SERVER_HINT друг о друге и шлют HELLO.
+        let hint_a = [ServerHint {
+            addr: ba.to_string(),
+            ed_pub: b.ed_pub(),
+        }];
+        let hint_b = [ServerHint {
+            addr: aa.to_string(),
+            ed_pub: a.ed_pub(),
+        }];
+        let ha = sends(fa.hint(&a, &[1; 32], &hint_a, NOW_UNIX, NOW_MS));
+        let hb = sends(fb.hint(&b, &[2; 32], &hint_b, NOW_UNIX, NOW_MS));
+        assert_eq!(
+            (ha.len(), hb.len()),
+            (1, 1),
+            "по одному HELLO с каждой стороны"
+        );
+        assert_eq!(ha[0].0, ba);
+        assert_eq!(hb[0].0, aa);
+        let (_, body_a) = proto::split_frame(&ha[0].1).unwrap();
+        let (_, body_b) = proto::split_frame(&hb[0].1).unwrap();
+        assert_eq!(fa.pending.len(), 1);
+        assert_eq!(fb.pending.len(), 1);
+
+        // Меньший (a) игнорирует встречный HELLO: попытка жива, ACK не шлётся.
+        let acts = fa.on_hello(&a, ba, body_b, NOW_UNIX, NOW_MS).unwrap();
+        assert!(
+            acts.iter().all(|x| matches!(x, Action::Info(_))),
+            "меньший не должен отвечать ACK: {acts:?}"
+        );
+        assert!(fa.sessions.is_empty());
+        assert!(fa.pending.contains_key(&ba), "попытка меньшего отменена");
+
+        // Больший (b) уступает инициативу: отменяет свою попытку, принимает
+        // входящий HELLO и отвечает ACK.
+        let acts = fb.on_hello(&b, aa, body_a, NOW_UNIX, NOW_MS).unwrap();
+        let ack = sends(acts);
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].0, aa);
+        assert!(fb.pending.is_empty(), "pending большего не отменён");
+        assert_eq!(fb.sessions.len(), 1);
+        assert!(!fb.sessions[&a.ed_pub()].initiator);
+
+        // ACK завершает рукопожатие у меньшего — сразу, без таймаута.
+        let acts = fa.on_ack(ba, &ack_of(&ack[0].1), NOW_UNIX, NOW_MS).unwrap();
+        assert!(
+            !acts.iter().any(|x| matches!(x, Action::Reject(_))),
+            "{acts:?}"
+        );
+        assert!(fa.pending.is_empty());
+        assert_eq!(fa.sessions.len(), 1);
+        assert!(fa.sessions[&b.ed_pub()].initiator);
+
+        // Переотправок HELLO больше нет: обе попытки закрыты.
+        assert!(sends(fa.tick(NOW_MS + HELLO_RESEND_MS)).is_empty());
+        assert!(sends(fb.tick(NOW_MS + HELLO_RESEND_MS)).is_empty());
+
+        // Ключи совпали — AEAD в обе стороны.
+        let frame = seal(
+            fa.sessions.get_mut(&b.ed_pub()).unwrap(),
+            federation::FED_RELAY,
+            b"a->b",
+        );
+        let (typ, body) = proto::split_frame(&frame).unwrap();
+        let pt = open(fb.sessions.get_mut(&a.ed_pub()).unwrap(), typ, body);
+        assert_eq!(pt.as_deref(), Some(&b"a->b"[..]), "a→b не расшифровался");
+        let frame = seal(
+            fb.sessions.get_mut(&a.ed_pub()).unwrap(),
+            federation::FED_GROUP_PUSH,
+            b"b->a",
+        );
+        let (typ, body) = proto::split_frame(&frame).unwrap();
+        let pt = open(fa.sessions.get_mut(&b.ed_pub()).unwrap(), typ, body);
+        assert_eq!(pt.as_deref(), Some(&b"b->a"[..]), "b→a не расшифровался");
+    }
+
+    /// T4c: запоздалый `SRV_HELLO` не перезаписывает уже установленную
+    /// initiator-сессию, а `SRV_HELLO_ACK` без ожидающей попытки — не ошибка
+    /// и ничего не меняет.
+    #[test]
+    fn запоздалый_hello_не_перезаписывает_initiator_сессию() {
+        let (a, b) = pair_small_big();
+        let (aa, ba) = (addr(22_001), addr(22_002));
+        let mut fa = Fed::new_with(true, a.ed_pub(), Vec::new(), &[], &[], &[], &[]);
+        let mut fb = Fed::new_with(true, b.ed_pub(), Vec::new(), &[], &[], &[], &[]);
+        // Сводим пару тем же встречным рукопожатием (T4c).
+        let hint_a = [ServerHint {
+            addr: ba.to_string(),
+            ed_pub: b.ed_pub(),
+        }];
+        let hint_b = [ServerHint {
+            addr: aa.to_string(),
+            ed_pub: a.ed_pub(),
+        }];
+        let ha = sends(fa.hint(&a, &[1; 32], &hint_a, NOW_UNIX, NOW_MS));
+        let hb = sends(fb.hint(&b, &[2; 32], &hint_b, NOW_UNIX, NOW_MS));
+        let (_, body_a) = proto::split_frame(&ha[0].1).unwrap();
+        let (_, body_b) = proto::split_frame(&hb[0].1).unwrap();
+        fa.on_hello(&a, ba, body_b, NOW_UNIX, NOW_MS).unwrap();
+        let ack = sends(fb.on_hello(&b, aa, body_a, NOW_UNIX, NOW_MS).unwrap());
+        fa.on_ack(ba, &ack_of(&ack[0].1), NOW_UNIX, NOW_MS).unwrap();
+        assert!(fa.sessions[&b.ed_pub()].initiator);
+        let keys_before = fa.sessions[&b.ed_pub()].keys.clone();
+
+        // Запоздалый HELLO большего (новая попытка, новый эфемерный ключ):
+        // initiator-сессию меньшего он перезаписать не должен.
+        let late = hello_for(&b, NOW_UNIX);
+        let acts = fa.on_hello(&a, ba, &late, NOW_UNIX, NOW_MS + 1).unwrap();
+        assert!(
+            acts.iter().all(|x| matches!(x, Action::Info(_))),
+            "на запоздалый HELLO не шлём ACK: {acts:?}"
+        );
+        assert_eq!(fa.sessions.len(), 1);
+        assert!(fa.sessions[&b.ed_pub()].initiator, "сессия перезаписана");
+        assert_eq!(
+            fa.sessions[&b.ed_pub()].keys,
+            keys_before,
+            "ключи сессии изменились"
+        );
+        assert!(fa.pending.is_empty());
+
+        // Установленная сессия по-прежнему работает в обе стороны.
+        let frame = seal(
+            fa.sessions.get_mut(&b.ed_pub()).unwrap(),
+            federation::FED_RELAY,
+            b"still",
+        );
+        let (typ, body) = proto::split_frame(&frame).unwrap();
+        let pt = open(fb.sessions.get_mut(&a.ed_pub()).unwrap(), typ, body);
+        assert_eq!(pt.as_deref(), Some(&b"still"[..]));
+
+        // ACK без ожидающей попытки — не ошибка и не меняет сессию.
+        let keys_b = fb.sessions[&a.ed_pub()].keys.clone();
+        let acts = fb
+            .on_ack(aa, &hello_for(&a, NOW_UNIX), NOW_UNIX, NOW_MS + 2)
+            .unwrap();
+        assert!(
+            !acts.iter().any(|x| matches!(x, Action::Reject(_))),
+            "ACK без pending не должен быть отказом: {acts:?}"
+        );
+        assert!(!acts.iter().any(|x| matches!(x, Action::Send(..))));
+        assert_eq!(fb.sessions.len(), 1);
+        assert!(!fb.sessions[&a.ed_pub()].initiator);
+        assert_eq!(fb.sessions[&a.ed_pub()].keys, keys_b);
     }
 
     #[test]
