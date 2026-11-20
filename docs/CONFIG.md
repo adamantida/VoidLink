@@ -42,6 +42,7 @@
 | Конфиг клиента `client.json` | `%APPDATA%\tunnel\` | `~/.tunnel-client/` | `tunnel-client --dir <путь>` |
 | Профиль клиента | `%APPDATA%\tunnel\profiles\<имя>\` | `~/.tunnel-client/profiles/<имя>/` | `--profile <имя>` |
 | Настройки UI `ui.json` | `%APPDATA%\tunnel\` | `~/.tunnel-client/` | тема TUI в тонком режиме (при демоне) |
+| Очередь офлайн-правок `ui-pending.json` | `%APPDATA%\tunnel\` | `~/.tunnel-client/` | появляется, пока TUI работает без движка (уходит демону, когда он появляется) |
 | Конфиг и данные демона | `%ProgramData%\tunnel\` (`C:\ProgramData\tunnel`, если переменной нет) | `~/.tunnel-client/` (как у клиента) | `tunnel-daemon console\|service --data-dir <каталог>` |
 | Состояние сервера `server.json` | — | `tunnel-data/` рядом с запуском по умолчанию, в systemd-юните `/var/lib/tunnel/` | `--data <каталог>` |
 | IPC демона | пайп `\\.\pipe\tunnel-daemon` | сокет `daemon.sock` в каталоге данных | — |
@@ -93,8 +94,8 @@
 |---|---|---|
 | `enabled` | `true` | Участвовать в mesh: публиковать `MESH_INFO`, принимать пиров. |
 | `relay_enabled` | `true` | Релеить чужой трафик (L2). |
-| `relay_budget_kbps` | `16384` (≈ 2 МБ/с) | Лимит отдачи релея; учёт и ограничение — T3. |
-| `contacts` | `[]` | Сохранённые DHT-контакты: `ed`, `x` (hex), `addr` (`ip:port`), `rtt_ms`, `seen_s`. Переживают рестарт; нужны, когда сервер недоступен (T3). |
+| `relay_budget_kbps` | `16384` (≈ 2 МБ/с) | Лимит отдачи релея **на каждого пира** в окне 10 с; одновременно ≤ 8 реле-пиров. |
+| `contacts` | `[]` | Сохранённые DHT-контакты: `ed`, `x` (hex), `addr` (`ip:port`), `rtt_ms`, `seen_s`. Переживают рестарт и работают, когда сервер недоступен. |
 
 **`pinned_paths` (этап 9).** Ключ — IPv4-адрес оверлея в виде строки. Значения:
 `direct` (L0), `server` (L1) или `relay:<hex>` (L2 через конкретного пира).
