@@ -33,7 +33,6 @@ use ratatui::prelude::*;
 
 use crate::api::{EngineApi, LocalEngine};
 use crate::engine::{self, Cmd};
-use crate::remote::IpcEngine;
 use crate::store::{Config, Store};
 
 use app::App;
@@ -82,10 +81,10 @@ pub fn run(
     res
 }
 
-/// Тонкий клиент: движок в демоне, TUI только рисует и шлёт команды
-/// (права администратора не нужны). `ui` — локальные настройки (тема).
-/// Закрытие TUI туннель не трогает.
-pub fn run_remote(eng: IpcEngine, ui: &Config) -> Result<()> {
+/// Тонкий клиент: движок в демоне (или офлайн-движок), TUI только рисует и
+/// шлёт команды (права администратора не нужны). `ui` — локальные настройки
+/// (тема). Закрытие TUI туннель не трогает.
+pub fn run_remote(eng: impl EngineApi, ui: &Config) -> Result<()> {
     clock::init();
     let mut term = setup_terminal(true)?;
     let mut app = App::new(eng.me().my_pub, &eng.me().my_code, ui);

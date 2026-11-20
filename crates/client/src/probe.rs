@@ -55,6 +55,15 @@ pub enum KeyMatch {
 }
 
 impl KeyMatch {
+    /// Из формы события движка (`Event::ProbeResult.key_match`).
+    pub fn from_bool(b: Option<bool>) -> KeyMatch {
+        match b {
+            Some(true) => KeyMatch::Match,
+            Some(false) => KeyMatch::Mismatch,
+            None => KeyMatch::Unknown,
+        }
+    }
+
     /// Форма события движка (`Event::ProbeResult.key_match`).
     pub fn as_bool(self) -> Option<bool> {
         match self {

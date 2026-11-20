@@ -13,15 +13,18 @@ use tunnel_protocol as proto;
 
 use crate::api::{EngineApi, EngineMode};
 use crate::engine::{Cmd, Event};
+use crate::probe::KeyMatch;
 use crate::snapshot::Snapshot;
 use crate::store::{self, Config, StoredFriend, StoredServer};
 use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
-use crate::tui::badges::Transport;
-use crate::tui::servers::{ServerEntry, ServersAction, ServersView};
+use crate::tui::badges::{ConnState, Transport};
+use crate::tui::servers::{ProbeLine, ServerEntry, ServersAction, ServersView};
 use crate::tui::theme::ThemeKind;
 use crate::tui::{clipboard, keymap};
 
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
+/// Интервал автопробы серверов на экране «Серверы»: по одному за раз.
+pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// Окно приглашения первые мгновения не принимает «Принять»/«Отклонить»:
 /// оно появляется само, и Enter или клик, адресованные основному экрану,
 /// не должны случайно ответить за пользователя. Esc («Позже») — сразу.
@@ -457,6 +460,18 @@ pub struct App {
     pub mode: Option<EngineMode>,
     /// Тонкий клиент потерял демона («демон недоступен»).
     pub daemon_down: bool,
+    /// Состояние пилюли соединения (шапка/статус-бар).
+    pub conn: ConnState,
+    /// Сколько офлайн-правок ждёт демона (бейдж «⏳ ожидает применения»).
+    pub pending_edits: usize,
+    /// Причина офлайна: нет демона / демон без движка.
+    pub offline_reason: Option<String>,
+    /// Очередь автопробы серверов (resolved-адреса, не строки).
+    probe_queue: VecDeque<std::net::SocketAddr>,
+    /// Когда можно запускать следующую автопробу.
+    probe_next_at: Option<Instant>,
+    /// Адреса, которые проверяются по явной команде `p` (им — тост).
+    probe_manual: HashSet<std::net::SocketAddr>,
     /// Разбираем историю событий демона: только лог, без тостов и окон.
     replaying: bool,
     /// Неотвеченные приглашения из снимка уже разложены по окнам (после
@@ -512,6 +527,12 @@ impl App {
             transport: Transport::Udp,
             mode: None,
             daemon_down: false,
+            conn: ConnState::Reconnecting,
+            pending_edits: 0,
+            offline_reason: None,
+            probe_queue: VecDeque::new(),
+            probe_next_at: None,
+            probe_manual: HashSet::new(),
             replaying: false,
             invites_seeded: false,
         }
@@ -541,6 +562,19 @@ impl App {
         }
         self.pump_invites();
         self.sync_snapshot(&snap);
+        // Пилюли режима: нет серверов / демон недоступен / сервер недоступен.
+        self.pending_edits = snap.meta.pending_edits as usize;
+        self.offline_reason = snap.meta.offline_reason.clone();
+        self.conn = if self.servers.is_empty() {
+            ConnState::NoServer
+        } else if self.daemon_down {
+            ConnState::DaemonDown
+        } else if self.connected {
+            ConnState::Online
+        } else {
+            ConnState::Reconnecting
+        };
+        self.pump_probes(eng);
     }
 
     /// Неотвеченные приглашения из снимка (демон знал о них до нашего
@@ -940,24 +974,47 @@ impl App {
                     }
                 }
                 // Проба сервера (этап 9, §3.7): доступен/недоступен, RTT,
-                // совпадение ключа с закреплённым. Экран «Серверы» — T2.
+                // совпадение ключа с закреплённым.
                 E::ProbeResult {
                     addr,
                     success,
                     rtt_ms,
                     key_match,
                 } => {
-                    if !success {
-                        self.toast(MsgKind::Error, format!("проба {}: недоступен", addr));
-                    } else if key_match == Some(false) {
-                        self.toast(
-                            MsgKind::Warn,
-                            format!("проба {}: сервер отвечает чужим ключом", addr),
-                        );
-                    } else if let Some(rtt) = rtt_ms {
-                        self.toast(MsgKind::Ok, format!("проба {}: {} мс", addr, rtt));
+                    let line = ProbeLine {
+                        available: success,
+                        rtt_ms,
+                        key_match: KeyMatch::from_bool(key_match),
+                    };
+                    // Экран «Серверы»: результат — по resolved-адресу, не по
+                    // строке (hostname после resolve).
+                    for p in self.stack.iter_mut() {
+                        if let Popup::Servers(v) = p {
+                            v.update_probe(addr, line);
+                        }
+                    }
+                    let manual = self.probe_manual.remove(&addr);
+                    if success && key_match == Some(false) {
+                        // Не «сервер подменён»: ключ не совпал с закреплённым
+                        // (ротация/другой сервер) — решает пользователь.
+                        let msg = format!("{addr}: сервер отвечает чужим ключом");
+                        self.log(MsgKind::Warn, msg.clone());
+                        self.toast(MsgKind::Warn, msg);
+                    } else if success {
+                        let what = match rtt_ms {
+                            Some(rtt) => format!("{addr}: доступен, {rtt} мс"),
+                            None => format!("{addr}: доступен"),
+                        };
+                        self.log(MsgKind::Info, what.clone());
+                        if manual {
+                            self.toast(MsgKind::Ok, what);
+                        }
                     } else {
-                        self.toast(MsgKind::Ok, format!("проба {}: доступен", addr));
+                        let msg = format!("{addr}: недоступен");
+                        self.log(MsgKind::Warn, msg.clone());
+                        if manual {
+                            self.toast(MsgKind::Error, msg);
+                        }
                     }
                 }
                 // Колонка «путь» и счётчик релея — T5 (TUI этапа 9).
@@ -2608,6 +2665,45 @@ impl App {
             &self.dll_path,
         );
         self.stack.push(Popup::Servers(v));
+        // Автопроба при открытии экрана: все серверы по одному, с интервалом
+        // [`PROBE_INTERVAL`] (см. `pump_probes` в `sync`).
+        self.probe_queue = cfg
+            .servers
+            .iter()
+            .filter_map(|s| resolve_addr(&s.addr))
+            .collect();
+        self.probe_next_at = None;
+    }
+
+    /// Автопроба серверов: пока экран «Серверы» открыт, по одному адресу за
+    /// [`PROBE_INTERVAL`]. Результат — `Event::ProbeResult` по resolved-адресу.
+    fn pump_probes(&mut self, eng: &dyn EngineApi) {
+        if !matches!(self.stack.last(), Some(Popup::Servers(_))) {
+            self.probe_queue.clear();
+            self.probe_next_at = None;
+            return;
+        }
+        let now = Instant::now();
+        if let Some(at) = self.probe_next_at
+            && now < at
+        {
+            return;
+        }
+        while let Some(addr) = self.probe_queue.pop_front() {
+            let busy = match self.stack.last() {
+                Some(Popup::Servers(v)) => v.is_probing(addr),
+                _ => false,
+            };
+            if busy {
+                continue;
+            }
+            if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                v.set_probing(addr);
+            }
+            self.send(eng, Cmd::ProbeServer { addr });
+            self.probe_next_at = Some(now + PROBE_INTERVAL);
+            break;
+        }
     }
 
     /// Ввод в экран «Серверы» (клавиша или мышь — `f`): действие
@@ -2643,7 +2739,7 @@ impl App {
             }),
             ServersAction::Delete(i) => Then::Cmd(Cmd::DelServer { idx: *i }),
             ServersAction::SetAdapter { name, dll } => Then::Adapter(name.clone(), dll.clone()),
-            ServersAction::Close | ServersAction::Switch(_) | ServersAction::Ping(_) => {
+            ServersAction::Close | ServersAction::Switch(_) | ServersAction::Probe(_) => {
                 Then::Nothing
             }
         };
@@ -2747,13 +2843,18 @@ impl App {
                 );
                 (None, true)
             }
-            ServersAction::Ping(i) => {
+            ServersAction::Probe(i) => {
                 if let Some(s) = cfg.servers.get(i) {
                     let Some(addr) = resolve_addr(&s.addr) else {
                         self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
                         return (None, false);
                     };
-                    (Some(Cmd::PingServer { addr }), false)
+                    // Явная проба `p`: результат покажем тостом.
+                    self.probe_manual.insert(addr);
+                    if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                        v.set_probing(addr);
+                    }
+                    (Some(Cmd::ProbeServer { addr }), false)
                 } else {
                     (None, false)
                 }
@@ -3146,12 +3247,14 @@ fn server_entries(cfg: &Config) -> Vec<ServerEntry> {
             addr: s.addr.clone(),
             pubkey: hex32(&s.pubkey).unwrap_or([0; 32]),
             ping_ms: None,
+            probe: None,
+            probing: false,
         })
         .collect()
 }
 
 /// `ip:port` или `host:port` → адрес (первый из разрешённых).
-fn resolve_addr(addr: &str) -> Option<std::net::SocketAddr> {
+pub(crate) fn resolve_addr(addr: &str) -> Option<std::net::SocketAddr> {
     if let Ok(a) = addr.parse() {
         return Some(a);
     }

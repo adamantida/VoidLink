@@ -22,13 +22,19 @@ use super::theme::Theme;
 /// Клавиша, открывающая список приглашений.
 pub const INVITES_KEY: char = 'o';
 
-/// Состояние соединения с сервером (или демоном).
+/// Состояние соединения с сервером (или демоном) — пилюля в шапке и
+/// статус-баре.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ConnState {
+    /// Движок есть, сервер отвечает.
     Online,
-    Reconnecting,
+    /// Движок есть, сервер не отвечает (переподключение).
     #[default]
-    Offline,
+    Reconnecting,
+    /// Демон недоступен: IPC потерян или TUI работает офлайн (движка нет).
+    DaemonDown,
+    /// В конфиге нет серверов — подключаться некуда.
+    NoServer,
 }
 
 /// Транспорт до сервера.
@@ -50,12 +56,15 @@ pub struct BadgeState {
     pub direct: usize,
     /// Онлайн-пиры через релей.
     pub relay: usize,
+    /// Сколько правок TUI ждёт применения демоном (офлайн-очередь).
+    pub pending_edits: usize,
 }
 
 /// Вид бейджа. Порядок вариантов = порядок слева направо.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BadgeKind {
     Conn,
+    Pending,
     Invites,
     Invisible,
     Transport,
@@ -68,10 +77,11 @@ impl BadgeKind {
     pub fn priority(self) -> u8 {
         match self {
             BadgeKind::Conn => 0,
-            BadgeKind::Invites => 1,
-            BadgeKind::Invisible => 2,
-            BadgeKind::Peers => 3,
-            BadgeKind::Transport => 4,
+            BadgeKind::Pending => 1,
+            BadgeKind::Invites => 2,
+            BadgeKind::Invisible => 3,
+            BadgeKind::Peers => 4,
+            BadgeKind::Transport => 5,
         }
     }
 
@@ -105,12 +115,13 @@ const SEP: &str = " ";
 
 /// Собирает все видимые бейджи (без учёта ширины) в порядке слева направо.
 pub fn badges(state: &BadgeState, th: &Theme) -> Vec<Badge> {
-    let mut out = Vec::with_capacity(5);
+    let mut out = Vec::with_capacity(6);
 
     let (glyph, text, style) = match state.conn {
-        ConnState::Online => ("●", "В сети", th.ok),
-        ConnState::Reconnecting => ("◐", "Переподключение", th.warn),
-        ConnState::Offline => ("○", "Офлайн", th.error),
+        ConnState::Online => ("●", "в сети", th.ok),
+        ConnState::Reconnecting => ("○", "сервер недоступен", th.warn),
+        ConnState::DaemonDown => ("⚠", "демон недоступен", th.error),
+        ConnState::NoServer => ("○", "нет сервера", th.error),
     };
     out.push(Badge {
         kind: BadgeKind::Conn,
@@ -119,6 +130,22 @@ pub fn badges(state: &BadgeState, th: &Theme) -> Vec<Badge> {
             style.add_modifier(Modifier::REVERSED | Modifier::BOLD),
         )],
     });
+
+    // Офлайн-правки: показываем, что они ещё не на демоне (⏳).
+    if state.pending_edits > 0 {
+        let n = if state.pending_edits > 1 {
+            format!(" ({})", state.pending_edits)
+        } else {
+            String::new()
+        };
+        out.push(Badge {
+            kind: BadgeKind::Pending,
+            spans: vec![Span::styled(
+                format!("⏳ ожидает применения{n}"),
+                th.warn.add_modifier(Modifier::BOLD),
+            )],
+        });
+    }
 
     if state.pending_invites > 0 {
         out.push(Badge {
@@ -267,6 +294,7 @@ mod tests {
             transport: Transport::Tcp,
             direct: 2,
             relay: 1,
+            pending_edits: 0,
         }
     }
 
@@ -285,7 +313,7 @@ mod tests {
     fn все_бейджи_на_широком_экране() {
         for kind in ThemeKind::ALL {
             let (text, hits) = render(&full(), kind, 120);
-            assert!(text.contains("В сети"), "{text}");
+            assert!(text.contains("в сети"), "{text}");
             assert!(text.contains("✦ 3"), "{text}");
             assert!(text.contains("[o]"), "{text}");
             assert!(text.contains("◌ невидимка"), "{text}");
@@ -307,7 +335,7 @@ mod tests {
                 assert_eq!(line.kinds[0], BadgeKind::Conn);
                 assert!(line.kinds.contains(&BadgeKind::Invites), "w={w}");
                 let (text, hits) = render(&full(), kind, w);
-                assert!(text.contains("В сети"), "w={w}: {text}");
+                assert!(text.contains("в сети"), "w={w}: {text}");
                 assert!(text.contains("✦ 3"), "w={w}: {text}");
                 assert_eq!(hits.len(), 1);
             }
@@ -356,9 +384,10 @@ mod tests {
     fn состояния_соединения_и_транспорт() {
         let th = Theme::of(ThemeKind::Contrast);
         for (conn, want) in [
-            (ConnState::Online, "В сети"),
-            (ConnState::Reconnecting, "Переподключение"),
-            (ConnState::Offline, "Офлайн"),
+            (ConnState::Online, "в сети"),
+            (ConnState::Reconnecting, "сервер недоступен"),
+            (ConnState::DaemonDown, "демон недоступен"),
+            (ConnState::NoServer, "нет сервера"),
         ] {
             let st = BadgeState {
                 conn,
@@ -372,6 +401,35 @@ mod tests {
             assert!(text.contains("UDP"), "{text}");
             assert!(!text.contains("невидимка"));
         }
+    }
+
+    #[test]
+    fn офлайн_правки_ждут_применения() {
+        let th = Theme::of(ThemeKind::Dark);
+        let st = BadgeState {
+            pending_edits: 2,
+            ..Default::default()
+        };
+        let text: String = status_badges(&st, &th)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains("⏳ ожидает применения (2)"), "{text}");
+        // Одна правка — без числа; нет правок — нет бейджа.
+        let st = BadgeState {
+            pending_edits: 1,
+            ..Default::default()
+        };
+        let text: String = status_badges(&st, &th)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains("⏳ ожидает применения") && !text.contains("(1)"), "{text}");
+        let text: String = status_badges(&BadgeState::default(), &th)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(!text.contains("ожидает применения"), "{text}");
     }
 
     #[test]
