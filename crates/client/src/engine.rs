@@ -35,8 +35,10 @@ use proto::handshake;
 use proto::payloads;
 use tunnel_protocol as proto;
 
+use crate::path::{self, PathKind, PathTable};
 use crate::store::{Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
+use crate::{dht, federation, mesh, probe};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
@@ -58,6 +60,8 @@ const PUNCH_EVERY: Duration = Duration::from_secs(5);
 /// CTRL_PING серверу (сервер держит сессию 30 с без пакетов).
 const PING_EVERY: Duration = Duration::from_secs(5);
 const LIST_EVERY: Duration = Duration::from_secs(15);
+/// Пересчёт путей доставки (стоимость/гистерезис, §3.6).
+const PATHS_EVERY: Duration = Duration::from_secs(10);
 const SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// Повтор HELLO3 одной попытки, пока нет WELCOME.
@@ -548,6 +552,12 @@ pub struct Meta {
     pub rx_hist: VecDeque<u64>,
     pub tx_hist: VecDeque<u64>,
     pub started: Instant,
+    /// RTT до сервера по CTRL_PONG с меткой (этап 9).
+    pub server_rtt_ms: Option<u32>,
+    /// Mesh включён клиентом.
+    pub mesh_enabled: bool,
+    /// Байт, отрелеенных этим клиентом через mesh (T3).
+    pub relay_bytes: u64,
 }
 
 impl Meta {
@@ -673,6 +683,31 @@ pub enum Event {
         rtt_ms: Option<u32>,
         success: bool,
     },
+    /// Выбран другой путь доставки до участника (этап 9, §3.6).
+    PathChanged {
+        ip: u32,
+        name: String,
+        path: PathKind,
+        rtt_ms: Option<u32>,
+    },
+    /// Доступных путей до участника не осталось: трафик не доставляется.
+    PathLost {
+        ip: u32,
+        name: String,
+    },
+    /// Результат пробы сервера (`Cmd::ProbeServer`, §3.7). Для недоступного
+    /// сервера — `success: false`; `key_match` — сверка с закреплённым ключом.
+    ProbeResult {
+        addr: SocketAddr,
+        success: bool,
+        rtt_ms: Option<u32>,
+        key_match: Option<bool>,
+    },
+    /// Счётчик релея через пиров (T3): всего байт и активных реле-пиров.
+    RelayStats {
+        bytes_total: u64,
+        peers: u32,
+    },
     Error(String),
     Notice(String),
 }
@@ -747,6 +782,23 @@ pub enum Cmd {
     PingServer {
         addr: SocketAddr,
     },
+    /// Закрепить путь до участника (сильнее автоматики; пишется в конфиг).
+    PinPath {
+        ip: u32,
+        path: PathKind,
+    },
+    /// Снять закрепление пути.
+    UnpinPath {
+        ip: u32,
+    },
+    /// Разрешить/запретить релей чужого трафика через себя (L2).
+    SetRelayEnabled(bool),
+    /// Включить/выключить mesh-оверлей.
+    SetMeshEnabled(bool),
+    /// Проба доступности сервера без сессии (PROBE_REQ, §3.7).
+    ProbeServer {
+        addr: SocketAddr,
+    },
     Quit,
 }
 
@@ -758,6 +810,9 @@ pub struct Engine {
     pub groups: Groups,
     pub meta: Arc<Mutex<Meta>>,
     pub stats: Arc<Stats>,
+    /// Таблица путей доставки (этап 9): путь в снимке состояния и будущий
+    /// выбор транспорта (T3).
+    pub paths: Arc<PathTable>,
     pub my_pub: [u8; 32],
     pub my_code: String,
     pub events: mpsc::Receiver<Event>,
@@ -1027,6 +1082,14 @@ struct Env {
     tun: Arc<dyn TunDev>,
     quit: AtomicBool,
     key_log: KeyLog,
+    /// Mesh-подсистема (T3): рукопожатия, RPC, ретрансляция.
+    mesh: Arc<Mutex<mesh::MeshState>>,
+    /// DHT-таблица контактов (T3).
+    dht: Arc<Mutex<dht::Dht>>,
+    /// Выбор пути доставки (этап 9): измерения, гистерезис, закрепления.
+    paths: Arc<PathTable>,
+    /// Пробы серверов (T2).
+    probes: Arc<probe::ProbeState>,
 }
 
 impl Env {
@@ -1089,6 +1152,14 @@ fn epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Миллисекунды от старта движка — время для [`PathTable`]. Таблица путей
+/// работает на числах (а не `Instant`), чтобы юнит-тесты были
+/// детерминированы; захват `meta` короткий и без вложенных блокировок.
+fn uptime_ms(env: &Env) -> u64 {
+    let started = env.meta.lock().unwrap().started;
+    started.elapsed().as_millis() as u64
 }
 
 fn bind_addr(server: SocketAddr) -> SocketAddr {
@@ -1843,13 +1914,13 @@ pub fn start_with_tun(
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (in_tx, in_rx) = mpsc::channel::<Input>();
 
-    let server_label = {
+    let (server_label, pinned, mesh_enabled) = {
         let mut c = cfg.lock().unwrap();
         // Автовход — этого сервера (gid у каждого сервера свои).
         if c.activate_server(server) {
             save(&c);
         }
-        server_label(&c, server)
+        (server_label(&c, server), c.pinned_paths.clone(), c.mesh.enabled)
     };
     let meta = Arc::new(Mutex::new(Meta {
         connected: false,
@@ -1860,6 +1931,9 @@ pub fn start_with_tun(
         rx_hist: VecDeque::new(),
         tx_hist: VecDeque::new(),
         started: Instant::now(),
+        server_rtt_ms: None,
+        mesh_enabled,
+        relay_bytes: 0,
     }));
 
     let sock = Arc::new(UdpSocket::bind(bind_addr(server)).context("bind udp")?);
@@ -1867,6 +1941,7 @@ pub fn start_with_tun(
     set_recv_buffer(&sock, UDP_RECV_BUF);
 
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
+    let paths = Arc::new(PathTable::new(&pinned));
     let env = Arc::new(Env {
         groups: groups.clone(),
         meta: meta.clone(),
@@ -1881,6 +1956,10 @@ pub fn start_with_tun(
         tun,
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
+        mesh: Arc::new(Mutex::new(mesh::MeshState::new(mesh_enabled))),
+        dht: Arc::new(Mutex::new(dht::Dht::new())),
+        paths: paths.clone(),
+        probes: Arc::new(probe::ProbeState::new()),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -1929,6 +2008,7 @@ pub fn start_with_tun(
         groups,
         meta,
         stats: env.stats.clone(),
+        paths,
         my_pub,
         my_code,
         events: ev_rx,
@@ -1996,6 +2076,30 @@ fn dispatch(
     let Ok((typ, body)) = proto::split_frame(datagram) else {
         return true;
     };
+    // Этап 9: диапазоны разбираются до проверки «только от сервера».
+    // Mesh-кадры приходят от пиров (они не сервер), проба — от любого
+    // сервера из списка (пробуемый сервер не обязан быть текущим), кадры
+    // федерации — от чужих серверов (клиенту не адресованы).
+    if proto::mesh::is_mesh(typ) {
+        let st = env.mesh.lock().unwrap();
+        let _ = mesh::on_frame(&st, src, typ, body);
+        return true;
+    }
+    if typ == ctrl::PROBE_RESP {
+        if let Some(r) = env.probes.on_response(src, body) {
+            env.emit(Event::ProbeResult {
+                addr: r.addr,
+                success: true,
+                rtt_ms: r.rtt_ms,
+                key_match: r.key_match,
+            });
+        }
+        return true;
+    }
+    if proto::federation::is_fed(typ) {
+        let _ = federation::on_frame(src, typ, body);
+        return true;
+    }
     if proto::grp::is_group(typ) {
         match handle_group_frame(env, src, datagram) {
             Some(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
@@ -2035,6 +2139,15 @@ fn tcp_rx_loop(env: Arc<Env>, link: Arc<TcpLink>, in_tx: mpsc::Sender<Input>) {
 }
 
 // ---------- цикл движка ----------
+
+/// Ожидаемый ответ CTRL_PONG: метка, время отправки и признак «показать
+/// результат событием» (периодический замер RTT идёт молча).
+struct PendingPong {
+    addr: SocketAddr,
+    label: u64,
+    at: Instant,
+    report: bool,
+}
 
 /// Состояние цикла движка (живёт только в потоке engine).
 struct State {
@@ -2091,8 +2204,10 @@ struct State {
     last_rtt: Instant,
     last_punch: Instant,
     last_leave: Instant,
-    /// Ожидающий ответ CTRL_PONG для измерения RTT: (addr, start_time).
-    pending_ping: Option<(SocketAddr, Instant)>,
+    /// Ожидающий ответ CTRL_PONG для измерения RTT (метка в payload).
+    pending_ping: Option<PendingPong>,
+    /// Последний пересчёт путей доставки (§3.6).
+    last_paths: Instant,
 }
 
 impl State {
@@ -2129,6 +2244,7 @@ impl State {
             last_punch: now,
             last_leave: now,
             pending_ping: None,
+            last_paths: now,
         }
     }
 
@@ -2536,7 +2652,19 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
     if st.connected() {
         if now.duration_since(st.last_ping) >= PING_EVERY {
             st.last_ping = now;
-            st.send_ctrl(env, ctrl::CTRL_PING, &[]);
+            // 8-байтовая метка: сервер вернёт её в CTRL_PONG, и мы узнаем RTT
+            // до сервера — стоимость пути L1 (§3.6). Замер молчаливый:
+            // событие только на явный `Cmd::PingServer`.
+            let label = epoch_ms();
+            st.send_ctrl(env, ctrl::CTRL_PING, &label.to_be_bytes());
+            if st.pending_ping.is_none() {
+                st.pending_ping = Some(PendingPong {
+                    addr: env.server(),
+                    label,
+                    at: now,
+                    report: false,
+                });
+            }
         }
         if now.duration_since(st.last_list) >= LIST_EVERY {
             st.last_list = now;
@@ -2620,6 +2748,62 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
         st.last_punch = now;
         punch_round(env);
     }
+    // Пути доставки: пересчёт раз в 10 с и сразу при падении пути (§3.6).
+    if now.duration_since(st.last_paths) >= PATHS_EVERY {
+        st.last_paths = now;
+        paths_round(env, st.connected(), now);
+    }
+}
+
+/// Пересчёт путей всех участников: события `PathChanged`/`PathLost` (§3.6).
+fn paths_round(env: &Env, connected: bool, _now: Instant) {
+    // Каждому участнику — запись в таблице: у кого нет ни прямого канала, ни
+    // mesh-маршрута, путь по умолчанию — сервер.
+    {
+        let g = env.groups.lock().unwrap();
+        for gs in g.values() {
+            for p in gs.members.values() {
+                env.paths.ensure_target(p.ip);
+            }
+        }
+    }
+    for change in env.paths.recalc(uptime_ms(env), connected) {
+        match change {
+            path::PathChange::Changed {
+                ip,
+                from,
+                to,
+                rtt_ms,
+            } => {
+                if debug() {
+                    eprintln!("[engine] путь {ip}: {from:?} -> {to:?} ({rtt_ms:?} мс)");
+                }
+                env.emit(Event::PathChanged {
+                    ip,
+                    name: peer_name(env, ip),
+                    path: to,
+                    rtt_ms,
+                });
+            }
+            path::PathChange::Lost { ip, from } => {
+                if debug() {
+                    eprintln!("[engine] путь {ip} потерян (был {from:?})");
+                }
+                env.emit(Event::PathLost {
+                    ip,
+                    name: peer_name(env, ip),
+                });
+            }
+        }
+    }
+}
+
+/// Имя участника по адресу оверлея (первая группа, где он есть).
+fn peer_name(env: &Env, ip: u32) -> String {
+    let g = env.groups.lock().unwrap();
+    g.values()
+        .find_map(|gs| gs.members.get(&ip).map(|p| p.name.clone()))
+        .unwrap_or_default()
 }
 
 fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
@@ -2692,12 +2876,17 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             return;
         }
         Cmd::PingServer { addr } => {
-            // Send CTRL_PING and measure RTT
+            // Метка (8 байт) — сервер вернёт её в CTRL_PONG; по ней отличаем
+            // свой ответ от чужого/запоздалого и считаем RTT.
             if let Some(sess) = st.sess.as_mut() {
-                let start = Instant::now();
-                // Store the ping start time to measure RTT on response
-                st.pending_ping = Some((addr, start));
-                let frame = sess.seal(proto::ctrl::CTRL_PING, &[]);
+                let label = epoch_ms();
+                st.pending_ping = Some(PendingPong {
+                    addr,
+                    label,
+                    at: Instant::now(),
+                    report: true,
+                });
+                let frame = sess.seal(proto::ctrl::CTRL_PING, &label.to_be_bytes());
                 env.send(&frame, addr);
             } else {
                 env.emit(Event::ServerPingResult {
@@ -2708,12 +2897,35 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             }
             return;
         }
+        Cmd::ProbeServer { addr } => {
+            // Проба не требует сессии (PROBE_REQ — открытым текстом, §3.7).
+            // T2 добавит отправку; пока — честный результат «недоступен».
+            match env.probes.start_probe(addr, epoch_ms()) {
+                Ok(frame) => env.send(&frame, addr),
+                Err(e) => {
+                    if debug() {
+                        eprintln!("[engine] проба {addr}: {e:#}");
+                    }
+                    env.emit(Event::ProbeResult {
+                        addr,
+                        success: false,
+                        rtt_ms: None,
+                        key_match: None,
+                    });
+                }
+            }
+            return;
+        }
         Cmd::AddFriend { .. }
         | Cmd::DelFriend(_)
         | Cmd::SetAlias { .. }
         | Cmd::AddServer { .. }
         | Cmd::DelServer { .. }
-        | Cmd::SetPrimaryServer { .. } => {
+        | Cmd::SetPrimaryServer { .. }
+        | Cmd::PinPath { .. }
+        | Cmd::UnpinPath { .. }
+        | Cmd::SetRelayEnabled(_)
+        | Cmd::SetMeshEnabled(_) => {
             cfg_cmd(env, st, cmd);
             return;
         }
@@ -2779,7 +2991,12 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::DelServer { .. }
         | Cmd::SetPrimaryServer { .. }
         | Cmd::Leave(_)
-        | Cmd::PingServer { .. } => {}
+        | Cmd::PingServer { .. }
+        | Cmd::PinPath { .. }
+        | Cmd::UnpinPath { .. }
+        | Cmd::SetRelayEnabled(_)
+        | Cmd::SetMeshEnabled(_)
+        | Cmd::ProbeServer { .. } => {}
     }
 }
 
@@ -2818,6 +3035,21 @@ pub fn check_cfg_cmd(cfg: &Config, current: SocketAddr, cmd: &Cmd) -> Option<Str
                 (bad_addr || bad_key).then(|| format!("сервер №{idx}: неверный адрес или ключ"))
             }
         },
+        // Закрепление пути: адрес — оверлей, ключ реле — настоящий ed25519
+        // (нулевой ключ заведомо не пир).
+        Cmd::PinPath { ip, path } => {
+            if !proto::is_overlay_ip(*ip) {
+                return Some(format!("{} — не адрес оверлея", proto::ip_str(*ip)));
+            }
+            match path {
+                PathKind::PeerRelay { via } if *via == [0u8; 32] => {
+                    Some("у реле нет ключа".into())
+                }
+                _ => None,
+            }
+        }
+        Cmd::UnpinPath { ip } => (!proto::is_overlay_ip(*ip))
+            .then(|| format!("{} — не адрес оверлея", proto::ip_str(*ip))),
         _ => None,
     }
 }
@@ -2912,6 +3144,48 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
                 );
                 switch_server(env, st, addr, pk, s.label);
             }
+        }
+        Cmd::PinPath { ip, path } => {
+            // Закрепление сильнее автоматики (§3.6): конфиг — источник правды
+            // (переживает рестарт), таблица путей — рабочая копия.
+            env.update_cfg(|c| {
+                c.pinned_paths.insert(path::ip_key(ip), path.to_config());
+            });
+            env.paths.set_pin(ip, Some(path));
+            env.emit(Event::Notice(format!(
+                "путь до {} закреплён: {}",
+                proto::ip_str(ip),
+                path.label()
+            )));
+        }
+        Cmd::UnpinPath { ip } => {
+            env.update_cfg(|c| {
+                c.pinned_paths.remove(&path::ip_key(ip));
+            });
+            env.paths.set_pin(ip, None);
+            env.emit(Event::Notice(format!(
+                "закрепление пути до {} снято",
+                proto::ip_str(ip)
+            )));
+        }
+        Cmd::SetRelayEnabled(on) => {
+            env.update_cfg(|c| c.mesh.relay_enabled = on);
+            env.paths.set_relay_enabled(on);
+            env.emit(Event::Notice(if on {
+                "релей через пиров включён".into()
+            } else {
+                "релей через пиров выключен".into()
+            }));
+        }
+        Cmd::SetMeshEnabled(on) => {
+            env.update_cfg(|c| c.mesh.enabled = on);
+            env.mesh.lock().unwrap().set_enabled(on);
+            env.meta.lock().unwrap().mesh_enabled = on;
+            env.emit(Event::Notice(if on {
+                "mesh включён".into()
+            } else {
+                "mesh выключен".into()
+            }));
         }
         _ => {}
     }
@@ -3170,14 +3444,42 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
             }
         }
         ctrl::CTRL_PONG => {
-            // Handle ping response for RTT measurement
-            if let Some((addr, start)) = st.pending_ping.take() {
-                let rtt = start.elapsed().as_millis() as u32;
+            // RTT до сервера: 8-байтовая метка в payload отличает наш ответ
+            // от чужого/запоздалого. Пустой payload — старый сервер без метки:
+            // «RTT неизвестен», но ответ подлинный.
+            let label: Option<u64> = if payload.len() == 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(payload);
+                Some(u64::from_be_bytes(b))
+            } else {
+                None
+            };
+            let Some(p) = st.pending_ping.take() else { return };
+            if label.is_some_and(|l| l != p.label) {
+                // Не наша метка: ожидание не съедаем (ответ придёт отдельно).
+                st.pending_ping = Some(p);
+                return;
+            }
+            let rtt = p.at.elapsed().as_millis() as u32;
+            if label.is_some() {
+                env.paths.record_server_rtt(rtt, uptime_ms(env));
+                if p.addr == env.server() {
+                    env.meta.lock().unwrap().server_rtt_ms = Some(rtt);
+                }
+            }
+            if p.report {
                 env.emit(Event::ServerPingResult {
-                    addr,
-                    rtt_ms: Some(rtt),
+                    addr: p.addr,
+                    rtt_ms: label.map(|_| rtt),
                     success: true,
                 });
+            }
+        }
+        ctrl::MESH_SEED => {
+            // Семя DHT от сервера (§3.3): ближайшие онлайн-сессии. T3 наполнит
+            // таблицу и начнёт mesh-рукопожатия; T1 только принимает контакты.
+            if let Ok(seeds) = payloads::dec_mesh_seed(payload) {
+                env.dht.lock().unwrap().bootstrap(&seeds);
             }
         }
         _ => {}
@@ -3594,6 +3896,9 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
     let payload = payloads::enc_ping(epoch_ms());
     let mut frames: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    // Замеры прямого канала (RTT из PONG по прямому пути) и падения.
+    let mut direct_rtts: Vec<(u32, u32)> = Vec::new();
+    let mut failures: Vec<u32> = Vec::new();
     {
         let server = env.server();
         let mut g = env.groups.lock().unwrap();
@@ -3614,11 +3919,19 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                     peer.direct_addr = None;
                     peer.last_direct = None;
                     peer.rtt_ms = None;
+                    failures.push(ip);
                     events.push(Event::DirectLost {
                         gid: *gid,
                         ip,
                         name: peer.name.clone(),
                     });
+                }
+                // RTT прямого канала — в таблицу путей (стоимость L0).
+                if peer.direct_addr.is_some()
+                    && let Some(rtt) = peer.rtt_ms
+                {
+                    // RTT в протоколе — u64 мс; для таблицы хватает u32.
+                    direct_rtts.push((ip, u32::try_from(rtt).unwrap_or(u32::MAX)));
                 }
                 let target = match peer.direct_addr {
                     Some(a) => a,
@@ -3633,11 +3946,24 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
             }
         }
     }
+    // Таблица путей — свой короткий захват, без блокировки групп.
+    let now_ms = uptime_ms(env);
+    for (ip, rtt) in direct_rtts {
+        env.paths.record_direct_rtt(ip, rtt, now_ms);
+    }
     for ev in events {
         env.emit(ev);
     }
     for (f, to) in frames {
         env.send(&f, to);
+    }
+    if !failures.is_empty() {
+        // Прямой канал умер: путь снимается и пересчитывается сразу, не
+        // дожидаясь 10-секундного тика (§3.6, «немедленно при падении»).
+        for ip in failures {
+            env.paths.record_failure(ip);
+        }
+        paths_round(env, connected, now);
     }
 }
 
@@ -3850,6 +4176,10 @@ pub fn run(
             Event::InvitesSynced { .. } => {}
             Event::FriendGroups { .. } => {}
             Event::ServerPingResult { .. } => {}
+            // Этап 9: путь доставки, пробы, релей. UI-часть — T2/T3/T5.
+            Event::PathChanged { .. } | Event::PathLost { .. } => {}
+            Event::ProbeResult { .. } => {}
+            Event::RelayStats { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
             Event::Notice(n) => eprintln!("[engine] {n}"),
         }
@@ -4148,6 +4478,7 @@ mod tests {
             deleted: false,
             my_ip: 0x6442_0102,
             members: Vec::new(),
+            mesh: Vec::new(),
         }
     }
 

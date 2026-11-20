@@ -31,18 +31,24 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod federation;
 pub mod frag;
 pub mod handshake;
+pub mod mesh;
 pub mod payloads;
 pub mod replay;
 
 #[cfg(test)]
 mod fuzz_tests;
 
+pub use federation::{SRV_HELLO, SRV_HELLO_ACK};
 pub use frag::{FRAG_MAX_COUNT, FRAG_MAX_PAYLOAD, FRAG_THRESHOLD, Reassembler};
 pub use handshake::{
     CookieSecret, DirKeys, EphemeralKey, Hello3, PinResolution, Role, RotationLink, SessionKeys,
     Welcome, resolve_pin, session_keys,
+};
+pub use mesh::{
+    MeshForward, MeshHello, MeshHelloAck, MeshKeys, mesh_keys, x25519_distance,
 };
 pub use replay::ReplayWindow;
 
@@ -104,6 +110,15 @@ pub mod ctrl {
     pub const CANDIDATES: u8 = 0x15;
     /// invisible bool (`enc_presence`).
     pub const PRESENCE: u8 = 0x16;
+    /// Публикация mesh-контакта клиента: `x_pub(32) | caps(1)`
+    /// (`payloads::enc_mesh_info`). Mutation: сохраняется в сессии, в ответ —
+    /// MESH_SEED. Старые серверы тип не знают и молча роняют (§4.3).
+    pub const MESH_INFO: u8 = 0x17;
+    /// Кандидаты-серверы для федерации: `n u8 (≤ 8) × (addr str | ed(32))`
+    /// (`payloads::enc_server_hint`). Mutation (T4).
+    pub const SERVER_HINT: u8 = 0x18;
+    /// Вход в федерированную группу: `uuid(16)` (T4).
+    pub const JOIN_FED: u8 = 0x19;
 
     /// Открытым текстом, `handshake::Welcome`.
     pub const WELCOME: u8 = 0x81;
@@ -138,13 +153,32 @@ pub mod ctrl {
     /// сервере после обработки (`enc_presence`). Шлётся на каждый PRESENCE,
     /// и на повтор без изменения: клиент повторяет PRESENCE, пока не получит.
     pub const PRESENCE_ACK: u8 = 0x91;
+    /// Проба доступности сервера, **открытым текстом**, ровно 64 байта
+    /// (`payloads::enc_probe_req`): nonce(16) | ts_ms(8) | want_key(1) | pad.
+    /// Сервер отвечает без сессии; ответ не длиннее запроса.
+    pub const PROBE_REQ: u8 = 0x92;
+    /// Ответ на пробу, **открытым текстом**: nonce(16) | ts_ms(8) |
+    /// [ed_pub(32)] — 24 или 56 байт (`payloads::enc_probe_resp`).
+    pub const PROBE_RESP: u8 = 0x93;
+    /// Mesh-семя от сервера: `n u8 (≤ 16) × (ed(32) | x_pub(32) | addr str)`
+    /// (`payloads::enc_mesh_seed`). Сервер → клиент.
+    pub const MESH_SEED: u8 = 0x94;
+    /// Федерированные группы, доступные для входа: `n u8 × (uuid(16) |
+    /// gid(4) | name str | owner(32) | members(2))` (`payloads::enc_fed_groups`).
+    /// Сервер → клиент (T4).
+    pub const FED_GROUPS: u8 = 0x95;
 
     /// Фреймы, которые ходят открытым текстом (всё прочее — шифрованные ctrl
     /// или фреймы группы).
+    ///
+    /// Mesh/federation-рукопожатия (`0x30`, `0x40`) сюда **не** входят: их
+    /// обрабатывают отдельные ветки по диапазонам (`mesh::is_mesh`,
+    /// `federation::is_fed`) до ctrl-разбора — иначе сервер принял бы их за
+    /// ctrl-фрейм и ответил бы RESET.
     pub fn is_plaintext(typ: u8) -> bool {
         matches!(
             typ,
-            HELLO | HELLO3 | WELCOME | CHALLENGE | RESET | UNSUPPORTED
+            HELLO | HELLO3 | WELCOME | CHALLENGE | RESET | UNSUPPORTED | PROBE_REQ | PROBE_RESP
         )
     }
 }
@@ -647,6 +681,12 @@ impl<'a> Reader<'a> {
     pub fn u8(&mut self) -> Result<u8> {
         Ok(self.bytes(1)?[0])
     }
+    /// u32 BE без продвижения (`None` — остаток короче 4 байт). Нужен, чтобы
+    /// отличить свой хвост по магии от чужого расширения.
+    pub fn peek_u32(&self) -> Option<u32> {
+        let b = self.b.get(self.p..self.p.checked_add(4)?)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
     pub fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes(self.array()?))
     }
@@ -919,6 +959,9 @@ mod tests {
             TRANSFER_OWNER,
             CANDIDATES,
             PRESENCE,
+            MESH_INFO,
+            SERVER_HINT,
+            JOIN_FED,
             WELCOME,
             GROUP_STATE,
             GROUP_LIST,
@@ -935,12 +978,26 @@ mod tests {
             RESET,
             FRAG,
             UNSUPPORTED,
+            PRESENCE_ACK,
+            PROBE_REQ,
+            PROBE_RESP,
+            MESH_SEED,
+            FED_GROUPS,
         ];
         let uniq: std::collections::HashSet<u8> = all.iter().copied().collect();
         assert_eq!(uniq.len(), all.len());
         assert!(all.iter().all(|t| !grp::is_group(*t)));
+        assert!(all.iter().all(|t| !mesh::is_mesh(*t)));
+        assert!(all.iter().all(|t| !federation::is_fed(*t)));
         assert!(is_plaintext(HELLO3) && is_plaintext(WELCOME) && !is_plaintext(FRAG));
+        // Открытым текстом ходят только пробы: mesh/fed-рукопожатия — своими
+        // ветками по диапазонам, а не ctrl-плейнтекстом.
+        assert!(is_plaintext(PROBE_REQ) && is_plaintext(PROBE_RESP));
+        assert!(!is_plaintext(MESH_INFO) && !is_plaintext(MESH_SEED));
+        assert!(!is_plaintext(mesh::MESH_HELLO) && !is_plaintext(SRV_HELLO));
         assert_eq!(HELLO3, 0x10);
         assert_eq!(UNSUPPORTED, 0x90);
+        assert_eq!(MESH_INFO, 0x17);
+        assert_eq!(PROBE_REQ, 0x92);
     }
 }

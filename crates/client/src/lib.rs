@@ -3,13 +3,20 @@
 //! используют их через `tunnel_client::…`.
 
 pub mod api;
+pub mod dht;
 pub mod dns;
 pub mod engine;
 #[cfg(test)]
 mod engine_e2e;
+pub mod federation;
 pub mod invites;
 pub mod ipv6;
+/// Mesh-подсистема (L2) — каркас T3.
+pub mod mesh;
+pub mod path;
 pub mod profile;
+/// Проба сервера (PROBE_REQ/RESP) — каркас T2.
+pub mod probe;
 pub mod remote;
 pub mod remote_cli;
 pub mod snapshot;

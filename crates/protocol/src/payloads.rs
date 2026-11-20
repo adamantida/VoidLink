@@ -7,7 +7,9 @@
 
 use std::net::SocketAddr;
 
-use crate::{FRAG_MAX_PAYLOAD, Reader, put_bool, put_pub, put_str, put_u16, put_u32, str_wire_len};
+use crate::{
+    FRAG_MAX_PAYLOAD, Reader, put_bool, put_pub, put_str, put_u16, put_u32, put_u64, str_wire_len,
+};
 use anyhow::{Result, bail, ensure};
 
 /// Наибольшее число адресов-кандидатов (CANDIDATES, MemberInfo).
@@ -81,6 +83,100 @@ pub fn read_member(r: &mut Reader) -> Result<MemberInfo> {
         endpoint: r.str()?.parse().ok(),
         candidates: read_candidates(r)?,
     })
+}
+
+// ---------- mesh-метаданные в GROUP_STATE / GROUP_UPDATE (§4.2) ----------
+
+/// Магия mesh-хвоста `GROUP_STATE`: `'MSH1'` в big-endian (`0x4D534831`).
+pub const MESH_MAGIC: u32 = 0x4D53_4831;
+/// Минимальный размер `MeshEntry` на проводе.
+pub const MESH_ENTRY_MIN: usize = 4 + 32 + 1;
+/// Больше записей, чем влезает в u8-счётчик, не кодируется.
+pub const MAX_MESH_ENTRIES: usize = 255;
+
+/// Mesh-метаданные участника группы: статический x25519-ключ (идентификатор
+/// контакта DHT) и маска возможностей.
+///
+/// В `GROUP_STATE` записи идут по возрастанию `ip`; сопоставление — по `ip`
+/// (не по индексу), поэтому порядок массива не важен.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshEntry {
+    /// Адрес оверлея участника — ключ сопоставления с [`MemberInfo`].
+    pub ip: u32,
+    /// Статический x25519-ключ (для DHT-контактов; в рукопожатии mesh не
+    /// участвует — там эфемерные ключи).
+    pub x_pub: [u8; 32],
+    /// `mesh::caps::*`.
+    pub caps: u8,
+}
+
+pub fn put_mesh_entry(buf: &mut Vec<u8>, e: &MeshEntry) {
+    put_u32(buf, e.ip);
+    put_pub(buf, &e.x_pub);
+    buf.push(e.caps);
+}
+
+pub fn read_mesh_entry(r: &mut Reader) -> Result<MeshEntry> {
+    Ok(MeshEntry {
+        ip: r.u32()?,
+        x_pub: r.pub_key()?,
+        caps: r.u8()?,
+    })
+}
+
+/// Хвост `GROUP_STATE`: `MESH_MAGIC | n u8 | n × MeshEntry`. Пустой список не
+/// кодируется вовсе — старые серверы хвоста не шлют и не должны платить.
+pub fn enc_mesh_section(buf: &mut Vec<u8>, mesh: &[MeshEntry]) {
+    let n = mesh.len().min(MAX_MESH_ENTRIES);
+    if n == 0 {
+        return;
+    }
+    put_u32(buf, MESH_MAGIC);
+    buf.push(n as u8);
+    for e in &mesh[..n] {
+        put_mesh_entry(buf, e);
+    }
+}
+
+/// Разбор хвоста `GROUP_STATE`. Нет байт или хвост не наш (чужое будущее
+/// расширение) — mesh-метаданных нет: старый сервер и старый клиент
+/// совместимы без смены версии (§4.3).
+pub fn dec_mesh_section(r: &mut Reader) -> Result<Vec<MeshEntry>> {
+    if r.peek_u32() != Some(MESH_MAGIC) {
+        return Ok(Vec::new());
+    }
+    let _magic = r.u32()?;
+    let n = r.u8()? as usize;
+    let mut out = Vec::with_capacity(r.capacity_for(n, MESH_ENTRY_MIN));
+    for _ in 0..n {
+        out.push(read_mesh_entry(r)?);
+    }
+    Ok(out)
+}
+
+/// Хвост `GROUP_UPDATE` kind 1: `MESH_MAGIC | x_pub(32) | caps(1)` — только
+/// метаданные изменившегося участника (`ip` есть в самой дельте).
+pub fn enc_update_mesh_tail(buf: &mut Vec<u8>, mesh: &[MeshEntry]) {
+    let Some(e) = mesh.first() else { return };
+    put_u32(buf, MESH_MAGIC);
+    put_pub(buf, &e.x_pub);
+    buf.push(e.caps);
+}
+
+/// Разбор хвоста `GROUP_UPDATE`. `ip` в хвосте нет — в возвращаемой записи
+/// он нулевой: адрес берётся из `MemberInfo` дельты.
+pub fn dec_update_mesh_tail(r: &mut Reader) -> Result<Vec<MeshEntry>> {
+    if r.peek_u32() != Some(MESH_MAGIC) {
+        return Ok(Vec::new());
+    }
+    let _magic = r.u32()?;
+    let x_pub = r.pub_key()?;
+    let caps = r.u8()?;
+    Ok(vec![MeshEntry {
+        ip: 0,
+        x_pub,
+        caps,
+    }])
 }
 
 // ---------- клиент -> сервер ----------
@@ -190,6 +286,233 @@ pub fn dec_presence(p: &[u8]) -> Result<bool> {
     Reader::new(p).boolean()
 }
 
+/// MESH_INFO: `x_pub(32) | caps(1)` — публикация mesh-контакта клиента.
+pub fn enc_mesh_info(x_pub: &[u8; 32], caps: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(33);
+    put_pub(&mut v, x_pub);
+    v.push(caps);
+    v
+}
+
+pub fn dec_mesh_info(p: &[u8]) -> Result<([u8; 32], u8)> {
+    let mut r = Reader::new(p);
+    let x = r.pub_key()?;
+    let caps = r.u8()?;
+    Ok((x, caps))
+}
+
+/// Наибольшее число кандидатов-серверов в `SERVER_HINT` (§3.5).
+pub const MAX_SERVER_HINT: usize = 8;
+
+/// Кандидат-сервер для федерации: адрес (строка) и ожидаемый ed-ключ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHint {
+    pub addr: String,
+    pub ed_pub: [u8; 32],
+}
+
+/// SERVER_HINT: `n u8 (≤ 8) | n × (addr str | ed_pub 32)`. Больше 8 — берутся
+/// первые: сервер и так не доверяет кандидатам, но лишние байты ему не нужны.
+pub fn enc_server_hint(items: &[ServerHint]) -> Vec<u8> {
+    let items = &items[..items.len().min(MAX_SERVER_HINT)];
+    let mut v = Vec::new();
+    v.push(items.len() as u8);
+    for i in items {
+        put_str(&mut v, &i.addr);
+        put_pub(&mut v, &i.ed_pub);
+    }
+    v
+}
+
+pub fn dec_server_hint(p: &[u8]) -> Result<Vec<ServerHint>> {
+    let mut r = Reader::new(p);
+    let n = r.u8()? as usize;
+    ensure!(n <= MAX_SERVER_HINT, "кандидатов {n} > {MAX_SERVER_HINT}");
+    let mut out = Vec::with_capacity(r.capacity_for(n, 1 + 32));
+    for _ in 0..n {
+        out.push(ServerHint {
+            addr: r.str()?,
+            ed_pub: r.pub_key()?,
+        });
+    }
+    Ok(out)
+}
+
+/// PROBE_REQ: ровно 64 байта — падинг, чтобы ответ (56 макс) был не длиннее
+/// запроса. Падинг не имеет смысла и не проверяется.
+pub const PROBE_REQ_LEN: usize = 64;
+/// Длина nonce пробы.
+pub const PROBE_NONCE_LEN: usize = 16;
+/// PROBE_RESP без ключа: nonce(16) | ts_ms(8).
+pub const PROBE_RESP_LEN: usize = PROBE_NONCE_LEN + 8;
+/// PROBE_RESP с ключом: + ed_pub(32).
+pub const PROBE_RESP_KEY_LEN: usize = PROBE_RESP_LEN + 32;
+
+/// Тело PROBE_REQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeReq {
+    pub nonce: [u8; PROBE_NONCE_LEN],
+    /// Время отправки, unix мс (сервер не отвечает на просроченные).
+    pub ts_ms: u64,
+    /// Просить ed-ключ сервера в ответе (сверка с закреплённым).
+    pub want_key: bool,
+}
+
+/// PROBE_REQ: `nonce(16) | ts_ms(8, BE) | want_key(1) | pad` — ровно 64 байта.
+pub fn enc_probe_req(req: &ProbeReq) -> Vec<u8> {
+    let mut v = vec![0u8; PROBE_REQ_LEN];
+    v[..PROBE_NONCE_LEN].copy_from_slice(&req.nonce);
+    v[PROBE_NONCE_LEN..PROBE_NONCE_LEN + 8].copy_from_slice(&req.ts_ms.to_be_bytes());
+    v[PROBE_NONCE_LEN + 8] = req.want_key as u8;
+    v
+}
+
+pub fn dec_probe_req(p: &[u8]) -> Result<ProbeReq> {
+    ensure!(
+        p.len() == PROBE_REQ_LEN,
+        "PROBE_REQ: длина {} вместо {PROBE_REQ_LEN}",
+        p.len()
+    );
+    let mut r = Reader::new(p);
+    let nonce = r.array()?;
+    let ts_ms = r.u64()?;
+    let want_key = r.boolean()?;
+    Ok(ProbeReq {
+        nonce,
+        ts_ms,
+        want_key,
+    })
+}
+
+/// Тело PROBE_RESP: `nonce(16) | ts_ms(8) | [ed_pub(32)]` — 24 или 56 байт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeResp {
+    pub nonce: [u8; PROBE_NONCE_LEN],
+    /// Эхо `ts_ms` запроса (клиент считает RTT по своим часам).
+    pub ts_ms: u64,
+    /// Ключ сервера — только если просили (`want_key`).
+    pub ed_pub: Option<[u8; 32]>,
+}
+
+pub fn enc_probe_resp(resp: &ProbeResp) -> Vec<u8> {
+    let mut v = Vec::with_capacity(match resp.ed_pub {
+        Some(_) => PROBE_RESP_KEY_LEN,
+        None => PROBE_RESP_LEN,
+    });
+    v.extend_from_slice(&resp.nonce);
+    put_u64(&mut v, resp.ts_ms);
+    if let Some(k) = &resp.ed_pub {
+        put_pub(&mut v, k);
+    }
+    v
+}
+
+pub fn dec_probe_resp(p: &[u8]) -> Result<ProbeResp> {
+    ensure!(
+        p.len() == PROBE_RESP_LEN || p.len() == PROBE_RESP_KEY_LEN,
+        "PROBE_RESP: длина {} не 24/56",
+        p.len()
+    );
+    let mut r = Reader::new(p);
+    let nonce = r.array()?;
+    let ts_ms = r.u64()?;
+    let ed_pub = if p.len() == PROBE_RESP_KEY_LEN {
+        Some(r.pub_key()?)
+    } else {
+        None
+    };
+    Ok(ProbeResp {
+        nonce,
+        ts_ms,
+        ed_pub,
+    })
+}
+
+/// Наибольшее число контактов в `MESH_SEED` (§3.3: сервер шлёт до 16).
+pub const MAX_MESH_SEED: usize = 16;
+
+/// Контакт mesh-сети: ed-ключ (DHT-идентификатор), статический x-ключ и
+/// публичный endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshSeed {
+    pub ed_pub: [u8; 32],
+    pub x_pub: [u8; 32],
+    pub addr: SocketAddr,
+}
+
+/// MESH_SEED: `n u8 (≤ 16) | n × (ed_pub 32 | x_pub 32 | addr str)`.
+/// Неразборчивый адрес выбрасывается (как в CANDIDATES): такой контакт
+/// бесполезен, а ошибка из-за одного битого поля — нет.
+pub fn enc_mesh_seed(items: &[MeshSeed]) -> Vec<u8> {
+    let items = &items[..items.len().min(MAX_MESH_SEED)];
+    let mut v = Vec::new();
+    v.push(items.len() as u8);
+    for i in items {
+        put_pub(&mut v, &i.ed_pub);
+        put_pub(&mut v, &i.x_pub);
+        put_str(&mut v, &i.addr.to_string());
+    }
+    v
+}
+
+pub fn dec_mesh_seed(p: &[u8]) -> Result<Vec<MeshSeed>> {
+    let mut r = Reader::new(p);
+    let n = r.u8()? as usize;
+    ensure!(n <= MAX_MESH_SEED, "контактов {n} > {MAX_MESH_SEED}");
+    let mut out = Vec::with_capacity(r.capacity_for(n, 32 + 32 + 1));
+    for _ in 0..n {
+        let ed_pub = r.pub_key()?;
+        let x_pub = r.pub_key()?;
+        if let Ok(addr) = r.str()?.parse() {
+            out.push(MeshSeed { ed_pub, x_pub, addr });
+        }
+    }
+    Ok(out)
+}
+
+/// Федерированная группа в FED_GROUPS (§3.5): `uuid` — идентификатор у
+/// владельца, `gid` — локальный номер на этом сервере.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FedGroup {
+    pub uuid: [u8; 16],
+    pub gid: u32,
+    pub name: String,
+    pub owner: [u8; 32],
+    /// Сколько участников (для экрана «группы федерации»).
+    pub members: u16,
+}
+
+/// FED_GROUPS: `n u8 | n × (uuid 16 | gid 4 | name str | owner 32 | members 2)`.
+pub fn enc_fed_groups(items: &[FedGroup]) -> Vec<u8> {
+    let items = &items[..items.len().min(255)];
+    let mut v = Vec::new();
+    v.push(items.len() as u8);
+    for i in items {
+        v.extend_from_slice(&i.uuid);
+        put_u32(&mut v, i.gid);
+        put_str(&mut v, &i.name);
+        put_pub(&mut v, &i.owner);
+        put_u16(&mut v, i.members);
+    }
+    v
+}
+
+pub fn dec_fed_groups(p: &[u8]) -> Result<Vec<FedGroup>> {
+    let mut r = Reader::new(p);
+    let n = r.u8()? as usize;
+    let mut out = Vec::with_capacity(r.capacity_for(n, 16 + 4 + 1 + 32 + 2));
+    for _ in 0..n {
+        out.push(FedGroup {
+            uuid: r.array()?,
+            gid: r.u32()?,
+            name: r.str()?,
+            owner: r.pub_key()?,
+            members: r.u16()?,
+        });
+    }
+    Ok(out)
+}
+
 // ---------- сервер -> клиент ----------
 
 /// GROUP_STATE: полное состояние одной группы.
@@ -209,6 +532,9 @@ pub struct GroupState {
     pub deleted: bool,
     pub my_ip: u32,
     pub members: Vec<MemberInfo>,
+    /// Mesh-метаданные участников (хвост `'MSH1'`, §4.2). Пусто — старый
+    /// сервер или никто ещё не публиковал mesh-контакт.
+    pub mesh: Vec<MeshEntry>,
 }
 
 pub fn enc_group_state(g: &GroupState) -> Vec<u8> {
@@ -227,6 +553,7 @@ pub fn enc_group_state(g: &GroupState) -> Vec<u8> {
     for m in &g.members {
         put_member(&mut v, m);
     }
+    enc_mesh_section(&mut v, &g.mesh);
     v
 }
 
@@ -247,6 +574,7 @@ pub fn dec_group_state(p: &[u8]) -> Result<GroupState> {
     for _ in 0..n {
         members.push(read_member(&mut r)?);
     }
+    let mesh = dec_mesh_section(&mut r)?;
     Ok(GroupState {
         gid,
         rev,
@@ -259,6 +587,7 @@ pub fn dec_group_state(p: &[u8]) -> Result<GroupState> {
         deleted,
         my_ip,
         members,
+        mesh,
     })
 }
 
@@ -298,6 +627,10 @@ pub struct GroupUpdate {
     pub revoke_prev: bool,
     pub key: [u8; 32],
     pub delta: GroupDelta,
+    /// Mesh-метаданные изменившегося участника (хвост kind 1, §4.2).
+    /// Не больше одной записи; `ip` в хвосте нет — он в `GroupDelta::Member`
+    /// (у записи из разбора `ip == 0`). Пусто — хвоста нет.
+    pub mesh: Vec<MeshEntry>,
 }
 
 pub fn enc_group_update(u: &GroupUpdate) -> Vec<u8> {
@@ -322,6 +655,9 @@ pub fn enc_group_update(u: &GroupUpdate) -> Vec<u8> {
             put_bool(&mut v, *private);
         }
     }
+    if matches!(u.delta, GroupDelta::Member(_)) {
+        enc_update_mesh_tail(&mut v, &u.mesh);
+    }
     v
 }
 
@@ -334,7 +670,8 @@ pub fn dec_group_update(p: &[u8]) -> Result<GroupUpdate> {
     let epoch = r.u32()?;
     let revoke_prev = r.boolean()?;
     let key = r.array()?;
-    let delta = match r.u8()? {
+    let kind = r.u8()?;
+    let delta = match kind {
         1 => GroupDelta::Member(read_member(&mut r)?),
         2 => GroupDelta::Removed(r.pub_key()?),
         3 => GroupDelta::Meta {
@@ -344,6 +681,11 @@ pub fn dec_group_update(p: &[u8]) -> Result<GroupUpdate> {
         },
         k => bail!("GROUP_UPDATE: неизвестный kind {k}"),
     };
+    let mesh = if kind == 1 {
+        dec_update_mesh_tail(&mut r)?
+    } else {
+        Vec::new()
+    };
     Ok(GroupUpdate {
         gid,
         rev,
@@ -352,6 +694,7 @@ pub fn dec_group_update(p: &[u8]) -> Result<GroupUpdate> {
         revoke_prev,
         key,
         delta,
+        mesh,
     })
 }
 
@@ -744,6 +1087,26 @@ pub(crate) mod tests {
             deleted: false,
             my_ip: 0x6442_0302,
             members: (0..6).map(member).collect(),
+            mesh: Vec::new(),
+        }
+    }
+
+    /// То же состояние с mesh-метаданными двух участников.
+    pub(crate) fn group_state_mesh() -> GroupState {
+        GroupState {
+            mesh: vec![
+                MeshEntry {
+                    ip: 0x6442_0100,
+                    x_pub: [0xAA; 32],
+                    caps: crate::mesh::caps::MESH | crate::mesh::caps::RELAY,
+                },
+                MeshEntry {
+                    ip: 0x6442_0102,
+                    x_pub: [0xBB; 32],
+                    caps: crate::mesh::caps::MESH,
+                },
+            ],
+            ..group_state()
         }
     }
 
@@ -814,6 +1177,7 @@ pub(crate) mod tests {
             revoke_prev: false,
             key: [4; 32],
             delta: GroupDelta::Member(member(2)),
+            mesh: Vec::new(),
         };
         let deltas = [
             GroupDelta::Member(member(2)),
@@ -1109,5 +1473,378 @@ pub(crate) mod tests {
         assert_eq!(dec_ping(&enc_ping(77)).unwrap(), 77);
         assert!(dec_gid(&[1, 2, 3]).is_err());
         assert!(dec_ping(&[0; 7]).is_err());
+    }
+
+    // ---------- этап 9: mesh-секция, probe, hint/fed/seed ----------
+
+    /// Копия декодера `GROUP_STATE` до этапа 9 (без mesh-хвоста) — так его
+    /// читает v4-клиент: известные поля разбираются, хвост игнорируется.
+    fn dec_group_state_v4(p: &[u8]) -> Result<GroupState> {
+        let mut r = Reader::new(p);
+        let gid = r.u32()?;
+        let rev = r.u32()?;
+        let epoch = r.u32()?;
+        let revoke_prev = r.boolean()?;
+        let name = r.str()?;
+        let owner = r.pub_key()?;
+        let private = r.boolean()?;
+        let key = r.array()?;
+        let deleted = r.boolean()?;
+        let my_ip = r.u32()?;
+        let n = r.u32()? as usize;
+        let mut members = Vec::with_capacity(r.capacity_for(n, MEMBER_MIN));
+        for _ in 0..n {
+            members.push(read_member(&mut r)?);
+        }
+        Ok(GroupState {
+            gid,
+            rev,
+            epoch,
+            revoke_prev,
+            name,
+            owner,
+            private,
+            key,
+            deleted,
+            my_ip,
+            members,
+            mesh: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn mesh_секция_group_state_и_v4_совместимость() {
+        let with_mesh = group_state_mesh();
+        let enc = enc_group_state(&with_mesh);
+        assert_eq!(dec_group_state(&enc).unwrap(), with_mesh);
+        let plain = enc_group_state(&group_state());
+        assert_eq!(
+            enc.len(),
+            plain.len() + 4 + 1 + 2 * MESH_ENTRY_MIN,
+            "хвост = магия + n + записи"
+        );
+        // Хвост — ровно после участников, ничего не сдвинулось.
+        assert_eq!(&enc[..plain.len()], &plain[..]);
+        assert_eq!(u32::from_be_bytes(enc[plain.len()..plain.len() + 4].try_into().unwrap()), MESH_MAGIC);
+        // Пустой mesh не кодируется: старые серверы не платят за фичу.
+        assert_eq!(
+            enc_group_state(&GroupState {
+                mesh: Vec::new(),
+                ..with_mesh.clone()
+            }),
+            plain
+        );
+        // Обрезка ровно до конца участников — валидный payload без mesh; хвост
+        // короче магии — «чужое расширение» и тоже игнорируется.
+        assert_eq!(dec_group_state(&enc[..plain.len()]).unwrap(), group_state());
+        for n in plain.len() + 1..plain.len() + 4 {
+            assert!(dec_group_state(&enc[..n]).is_ok(), "хвост короче магии: {n}");
+        }
+        // Обрезка внутри хвоста (магия и записи) — ошибка.
+        for n in plain.len() + 4..enc.len() {
+            assert!(dec_group_state(&enc[..n]).is_err(), "обрезка до {n}");
+        }
+        // Чужой хвост (не наша магия) игнорируется — расширение без смены
+        // версии допустимо.
+        let mut future = plain.clone();
+        put_u32(&mut future, 0x5745_4952);
+        future.extend_from_slice("будущее расширение".as_bytes());
+        assert_eq!(dec_group_state(&future).unwrap(), group_state());
+        // **v4-декодер игнорирует хвост**: читает то же состояние, mesh пуст.
+        assert_eq!(dec_group_state_v4(&enc).unwrap(), group_state());
+    }
+
+    #[test]
+    fn mesh_секция_счётчик_из_сети_не_аллоцирует() {
+        // n больше остатка: ошибка, без раздувания аллокации.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, MESH_MAGIC);
+        raw.push(255);
+        assert!(dec_mesh_section(&mut Reader::new(&raw)).is_err());
+        // n = 0 — валидный пустой хвост.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, MESH_MAGIC);
+        raw.push(0);
+        assert!(dec_mesh_section(&mut Reader::new(&raw)).unwrap().is_empty());
+        // Мусорный хвост без магии — пусто (совместимость).
+        assert!(
+            dec_mesh_section(&mut Reader::new(&[1, 2, 3, 4, 5]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            dec_mesh_section(&mut Reader::new(&[]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn group_update_mesh_хвост() {
+        let m = member(2);
+        let u = GroupUpdate {
+            gid: 3,
+            rev: 18,
+            base_rev: 17,
+            epoch: 6,
+            revoke_prev: false,
+            key: [4; 32],
+            delta: GroupDelta::Member(m.clone()),
+            mesh: vec![MeshEntry {
+                ip: 0,
+                x_pub: [0xCC; 32],
+                caps: crate::mesh::caps::MESH,
+            }],
+        };
+        let enc = enc_group_update(&u);
+        let got = dec_group_update(&enc).unwrap();
+        assert_eq!(got.delta, GroupDelta::Member(m));
+        assert_eq!(
+            got.mesh,
+            vec![MeshEntry {
+                ip: 0,
+                x_pub: [0xCC; 32],
+                caps: crate::mesh::caps::MESH
+            }],
+            "ip в хвосте нет — адрес берётся из дельты"
+        );
+        // Без хвоста (старый сервер) — пусто.
+        let no_mesh = GroupUpdate {
+            mesh: Vec::new(),
+            ..u.clone()
+        };
+        assert!(dec_group_update(&enc_group_update(&no_mesh)).unwrap().mesh.is_empty());
+        // Обрезка внутри хвоста — ошибка; ровно без хвоста (и короче магии) —
+        // валидно, хвост считается чужим/отсутствующим.
+        let base = enc_group_update(&no_mesh);
+        assert_eq!(dec_group_update(&enc[..base.len()]).unwrap().mesh, vec![]);
+        for n in base.len() + 1..base.len() + 4 {
+            assert!(dec_group_update(&enc[..n]).is_ok(), "хвост короче магии: {n}");
+        }
+        for n in base.len() + 4..enc.len() {
+            assert!(dec_group_update(&enc[..n]).is_err(), "обрезка до {n}");
+        }
+        // Хвост не для kind 1 не кодируется (у Removed/Meta нет x_pub).
+        for delta in [GroupDelta::Removed([7; 32]), GroupDelta::Meta {
+            name: "n".into(),
+            owner: [8; 32],
+            private: false,
+        }] {
+            let u = GroupUpdate {
+                delta,
+                mesh: vec![MeshEntry {
+                    ip: 0,
+                    x_pub: [0xCC; 32],
+                    caps: 1,
+                }],
+                ..u.clone()
+            };
+            let enc = enc_group_update(&u);
+            assert_eq!(enc, enc_group_update(&GroupUpdate {
+                mesh: Vec::new(),
+                ..u.clone()
+            }));
+            assert!(dec_group_update(&enc).unwrap().mesh.is_empty());
+        }
+    }
+
+    #[test]
+    fn mesh_info_и_server_hint() {
+        let enc = enc_mesh_info(&[0xAB; 32], crate::mesh::caps::MESH | crate::mesh::caps::RELAY);
+        assert_eq!(enc.len(), 33);
+        assert_eq!(
+            dec_mesh_info(&enc).unwrap(),
+            ([0xAB; 32], crate::mesh::caps::MESH | crate::mesh::caps::RELAY)
+        );
+        truncations_fail(&enc, dec_mesh_info);
+        // Хвост после известных полей допускается (расширение без смены версии).
+        let mut tail = enc.clone();
+        tail.push(0);
+        assert_eq!(dec_mesh_info(&tail).unwrap(), ([0xAB; 32], crate::mesh::caps::MESH | crate::mesh::caps::RELAY));
+
+        let items = vec![
+            ServerHint {
+                addr: "203.0.113.9:5555".into(),
+                ed_pub: [1; 32],
+            },
+            ServerHint {
+                addr: "[2001:db8::1]:5555".into(),
+                ed_pub: [2; 32],
+            },
+        ];
+        let enc = enc_server_hint(&items);
+        assert_eq!(dec_server_hint(&enc).unwrap(), items);
+        truncations_fail(&enc, dec_server_hint);
+        assert!(dec_server_hint(&enc_server_hint(&[])).unwrap().is_empty());
+        // Больше 8 не кодируется; 9 в заголовке — ошибка.
+        let many: Vec<ServerHint> = (0..12)
+            .map(|i| ServerHint {
+                addr: format!("10.0.0.{i}:1"),
+                ed_pub: [i as u8; 32],
+            })
+            .collect();
+        let enc = enc_server_hint(&many);
+        assert_eq!(dec_server_hint(&enc).unwrap().len(), MAX_SERVER_HINT);
+        assert!(dec_server_hint(&[9]).is_err());
+    }
+
+    #[test]
+    fn probe_req_ровно_64_и_ответ_не_длиннее() {
+        let req = ProbeReq {
+            nonce: [7; PROBE_NONCE_LEN],
+            ts_ms: 1_700_000_000_123,
+            want_key: true,
+        };
+        let enc = enc_probe_req(&req);
+        assert_eq!(enc.len(), PROBE_REQ_LEN, "запрос всегда 64 байта");
+        assert_eq!(dec_probe_req(&enc).unwrap(), req);
+        assert!(enc[PROBE_NONCE_LEN + 8 + 1..].iter().all(|b| *b == 0), "падинг нулевой");
+        // Ответ не длиннее запроса при любом want_key.
+        let key = [9u8; 32];
+        let with_key = enc_probe_resp(&ProbeResp {
+            nonce: req.nonce,
+            ts_ms: req.ts_ms,
+            ed_pub: Some(key),
+        });
+        let without = enc_probe_resp(&ProbeResp {
+            nonce: req.nonce,
+            ts_ms: req.ts_ms,
+            ed_pub: None,
+        });
+        assert_eq!((with_key.len(), without.len()), (PROBE_RESP_KEY_LEN, PROBE_RESP_LEN));
+        assert!(with_key.len() <= enc.len() && without.len() <= enc.len());
+        assert_eq!(
+            dec_probe_resp(&with_key).unwrap(),
+            ProbeResp {
+                nonce: req.nonce,
+                ts_ms: req.ts_ms,
+                ed_pub: Some(key)
+            }
+        );
+        assert_eq!(
+            dec_probe_resp(&without).unwrap(),
+            ProbeResp {
+                nonce: req.nonce,
+                ts_ms: req.ts_ms,
+                ed_pub: None
+            }
+        );
+        // Строгие длины: не 24 и не 56 — ошибка; у запроса — не 64.
+        for n in 0..PROBE_REQ_LEN {
+            assert!(dec_probe_req(&enc[..n]).is_err(), "обрезка запроса до {n}");
+        }
+        assert!(dec_probe_req(&[0u8; PROBE_REQ_LEN + 1]).is_err());
+        for n in 0..PROBE_RESP_LEN {
+            assert!(dec_probe_resp(&without[..n]).is_err(), "обрезка ответа до {n}");
+        }
+        assert!(dec_probe_resp(&[0u8; PROBE_RESP_LEN + 1]).is_err());
+        assert!(dec_probe_resp(&[0u8; PROBE_RESP_KEY_LEN - 1]).is_err());
+        // want_key = 0 сохраняется.
+        let no_key = ProbeReq {
+            want_key: false,
+            ..req
+        };
+        assert!(!dec_probe_req(&enc_probe_req(&no_key)).unwrap().want_key);
+    }
+
+    #[test]
+    fn mesh_seed_туда_обратно_и_лимит() {
+        let items = vec![
+            MeshSeed {
+                ed_pub: [1; 32],
+                x_pub: [2; 32],
+                addr: sa("203.0.113.7:4000"),
+            },
+            MeshSeed {
+                ed_pub: [3; 32],
+                x_pub: [4; 32],
+                addr: sa("[2001:db8::5]:4000"),
+            },
+        ];
+        let enc = enc_mesh_seed(&items);
+        assert_eq!(dec_mesh_seed(&enc).unwrap(), items);
+        truncations_fail(&enc, dec_mesh_seed);
+        assert!(dec_mesh_seed(&enc_mesh_seed(&[])).unwrap().is_empty());
+        // Неразборчивый адрес выбрасывается, остальные читаются.
+        let mut raw = vec![2u8];
+        put_pub(&mut raw, &[1; 32]);
+        put_pub(&mut raw, &[2; 32]);
+        put_str(&mut raw, "не адрес");
+        put_pub(&mut raw, &[3; 32]);
+        put_pub(&mut raw, &[4; 32]);
+        put_str(&mut raw, "10.0.0.1:9");
+        let got = dec_mesh_seed(&raw).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ed_pub, [3; 32]);
+        // n > 16 — ошибка; кодируется не больше 16.
+        assert!(dec_mesh_seed(&[17]).is_err());
+        let many: Vec<MeshSeed> = (0..20)
+            .map(|i| MeshSeed {
+                ed_pub: [i as u8; 32],
+                x_pub: [i as u8; 32],
+                addr: sa("10.0.0.1:1"),
+            })
+            .collect();
+        assert_eq!(dec_mesh_seed(&enc_mesh_seed(&many)).unwrap().len(), MAX_MESH_SEED);
+    }
+
+    #[test]
+    fn fed_groups_туда_обратно() {
+        let items = vec![
+            FedGroup {
+                uuid: [7u8; 16],
+                gid: 12,
+                name: "федерация".into(),
+                owner: [8; 32],
+                members: 3,
+            },
+            FedGroup {
+                uuid: [9u8; 16],
+                gid: 13,
+                name: String::new(),
+                owner: [10; 32],
+                members: u16::MAX,
+            },
+        ];
+        let enc = enc_fed_groups(&items);
+        assert_eq!(dec_fed_groups(&enc).unwrap(), items);
+        truncations_fail(&enc, dec_fed_groups);
+        assert!(dec_fed_groups(&enc_fed_groups(&[])).unwrap().is_empty());
+        // Счётчик — из сети: 255 записей на 1 байте входа — ошибка, не паника.
+        assert!(dec_fed_groups(&[255]).is_err());
+    }
+
+    #[test]
+    fn худший_group_state_с_mesh_влезает_в_frag() {
+        let long = "w".repeat(255);
+        let m = MemberInfo {
+            pubkey: [1; 32],
+            name: long.clone(),
+            ip: 2,
+            online: true,
+            status: long.clone(),
+            endpoint: Some(sa("203.0.113.9:4000")),
+            candidates: vec![sa("192.168.1.5:4000")],
+        };
+        let mesh: Vec<MeshEntry> = (0..253)
+            .map(|i| MeshEntry {
+                ip: 0x6442_0000 + i,
+                x_pub: [7; 32],
+                caps: 0xFF,
+            })
+            .collect();
+        let g = GroupState {
+            name: long,
+            members: vec![m; 253],
+            mesh,
+            ..group_state()
+        };
+        let enc = enc_group_state(&g);
+        assert!(
+            enc.len() <= FRAG_MAX_PAYLOAD,
+            "{} > {FRAG_MAX_PAYLOAD}",
+            enc.len()
+        );
+        assert_eq!(dec_group_state(&enc).unwrap().mesh.len(), 253);
     }
 }

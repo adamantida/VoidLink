@@ -32,9 +32,11 @@
 //!   чаще раза в `HOUSEKEEPING_EVERY`, а не на каждую команду;
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
+pub mod federation;
 pub mod leases;
 pub mod metrics;
 pub mod persist;
+pub mod probe;
 pub mod signals;
 pub mod tcp;
 
@@ -582,6 +584,14 @@ struct Session {
     last_seen: AtomicU64,
     relay: Mutex<Bucket>,
     ctrl: Mutex<Bucket>,
+    /// Статический x25519-ключ клиента (MESH_INFO): идентификатор контакта
+    /// DHT и mesh-метаданные в GROUP_STATE (§4.2). `None` — клиент mesh не
+    /// поддерживает или ещё не публиковал.
+    x_pub: Option<[u8; 32]>,
+    /// Возможности mesh (`mesh::caps::*`) из MESH_INFO.
+    caps: u8,
+    /// Когда приходил MESH_INFO, мс от старта сервера (0 — ни разу).
+    mesh_last_seen: u64,
 }
 
 struct Member {
@@ -1479,6 +1489,10 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
     };
     if proto::grp::is_group(typ) {
         relay_group(sh, src, datagram);
+    } else if typ == ctrl::PROBE_REQ {
+        // Проба доступности: открытым текстом, без сессии и рукопожатия,
+        // ответ не длиннее запроса (§3.7).
+        probe::handle_probe_req(sh, src, body);
     } else if typ == ctrl::HELLO || typ == ctrl::HELLO3 {
         // Один жетон на HELLO — он же покрывает ответ (CHALLENGE /
         // UNSUPPORTED / WELCOME): ответ без жетона не уходит.
@@ -1496,8 +1510,19 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         } else {
             handle_hello3(sh, src, body);
         }
+    } else if proto::mesh::is_mesh(typ) {
+        // Mesh-кадры — пир ↔ пир: серверу они не адресованы (пир не
+        // зарегистрирован сессией). Молча роняем, без RESET — иначе
+        // mesh-пиры получали бы RESET на каждый кадр (§4.3).
+        sh.drop_frame();
+    } else if proto::federation::is_fed(typ) {
+        // Федеративные кадры: T4; пока — молча отброшены.
+        if !federation::on_frame(sh, src, typ, body) {
+            sh.drop_frame();
+        }
     } else if ctrl::is_plaintext(typ) {
-        // WELCOME / CHALLENGE / RESET / UNSUPPORTED от клиента — мусор.
+        // WELCOME / CHALLENGE / RESET / UNSUPPORTED / PROBE_RESP от клиента —
+        // мусор.
         sh.drop_frame();
     } else {
         handle_ctrl_frame(sh, src, typ, body);
@@ -1620,6 +1645,23 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
         .map(|(pk, m)| member_info(s, pk, m, viewer))
         .collect();
     members.sort_by_key(|m| m.ip);
+    // Mesh-метаданные — только у тех, кто их опубликовал (MESH_INFO) и кто
+    // сейчас онлайн: офлайн-участник без сессии x_pub не имеет. Сортировка по
+    // ip — как у участников; сопоставление на клиенте по ip, не по индексу.
+    let mut mesh: Vec<pl::MeshEntry> = g
+        .members
+        .iter()
+        .filter_map(|(pk, m)| {
+            let (_, ses) = s.session_of(pk)?;
+            let x_pub = ses.x_pub?;
+            Some(pl::MeshEntry {
+                ip: m.ip,
+                x_pub,
+                caps: ses.caps,
+            })
+        })
+        .collect();
+    mesh.sort_by_key(|e| e.ip);
     GroupState {
         gid: g.id,
         rev: g.rev,
@@ -1632,7 +1674,39 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
         deleted: false,
         my_ip: g.members.get(viewer).map(|m| m.ip).unwrap_or(0),
         members,
+        mesh,
     }
+}
+
+/// До `limit` ближайших к `me` онлайн-сессий по XOR ed-ключей — MESH_SEED
+/// (§3.3): клиент начинает DHT-таблицу с них, даже если сервер потом пропадёт.
+///
+/// Невидимки не выдаются: их endpoint — ровно то, что скрывает `invisible`
+/// (`member_info` им адреса тоже не показывает).
+fn mesh_seed(s: &State, me: &[u8; 32], limit: usize) -> Vec<pl::MeshSeed> {
+    let mut v: Vec<([u8; 32], pl::MeshSeed)> = s
+        .sessions
+        .iter()
+        .filter_map(|(addr, ses)| {
+            if ses.ed_pub == *me || ses.invisible {
+                return None;
+            }
+            let x_pub = ses.x_pub?;
+            let dist = proto::mesh::x25519_distance(me, &ses.ed_pub);
+            Some((
+                dist,
+                pl::MeshSeed {
+                    ed_pub: ses.ed_pub,
+                    x_pub,
+                    addr: *addr,
+                },
+            ))
+        })
+        .collect();
+    // Порядок детерминирован: одинаковое расстояние — по ключу.
+    v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.ed_pub.cmp(&b.1.ed_pub)));
+    v.truncate(limit);
+    v.into_iter().map(|(_, seed)| seed).collect()
 }
 
 /// GROUP_STATE удалённой (или несуществующей) группы: всё, кроме gid, — нули.
@@ -1649,6 +1723,7 @@ fn deleted_state(gid: u32) -> GroupState {
         deleted: true,
         my_ip: 0,
         members: vec![],
+        mesh: vec![],
     }
 }
 
@@ -1696,6 +1771,23 @@ fn push_update(
                 private: g.private,
             },
         };
+        // Mesh-хвост kind 1 (§4.2): ключ и возможности изменившегося
+        // участника. Старые клиенты хвост игнорируют, v4-сервер его не шлёт.
+        let mesh = match change {
+            Change::Member(who) => s
+                .session_of(who)
+                .and_then(|(_, x)| x.x_pub.map(|x_pub| (x_pub, x.caps)))
+                .map(|(x_pub, caps)| {
+                    vec![pl::MeshEntry {
+                        // ip в хвосте UPDATE нет — он в MemberInfo дельты.
+                        ip: 0,
+                        x_pub,
+                        caps,
+                    }]
+                })
+                .unwrap_or_default(),
+            Change::Removed(_) | Change::Meta => Vec::new(),
+        };
         let u = GroupUpdate {
             gid: g.id,
             rev: g.rev,
@@ -1704,6 +1796,7 @@ fn push_update(
             revoke_prev: g.revoke_prev,
             key: g.key,
             delta,
+            mesh,
         };
         push_ctrl(
             out,
@@ -2123,6 +2216,9 @@ fn install_session(
             last_seen: AtomicU64::new(sh.now_ms()),
             relay: Mutex::new(Bucket::new(sh.limits.relay_burst)),
             ctrl: Mutex::new(Bucket::new(sh.limits.ctrl_burst)),
+            x_pub: None,
+            caps: 0,
+            mesh_last_seen: 0,
         },
     );
     s.by_pub.insert(ed, src);
@@ -2182,6 +2278,11 @@ fn is_mutation(typ: u8) -> bool {
             | ctrl::DELETE_GROUP
             | ctrl::CANDIDATES
             | ctrl::PRESENCE
+            // Этап 9: меняют состояние сессии/федерации. MESH_SEED и
+            // FED_GROUPS — сервер → клиент (в is_query их быть не должно).
+            | ctrl::MESH_INFO
+            | ctrl::SERVER_HINT
+            | ctrl::JOIN_FED
     )
 }
 
@@ -2290,7 +2391,17 @@ fn handle_query(
 ) -> Result<()> {
     let me = &ses.ed_pub;
     match typ {
-        ctrl::CTRL_PING => push_ctrl(out, src, ses, ctrl::CTRL_PONG, &[]),
+        ctrl::CTRL_PING => {
+            // Эхо 8-байтовой метки клиента (RTT до сервера, в т.ч. по TCP):
+            // старый клиент шлёт пустой payload — получает пустой ответ
+            // («RTT неизвестен»), и его измерение сервера не ломается.
+            let pong: Vec<u8> = if payload.len() == 8 {
+                payload.to_vec()
+            } else {
+                Vec::new()
+            };
+            push_ctrl(out, src, ses, ctrl::CTRL_PONG, &pong)
+        }
         ctrl::LIST_GROUPS => push_group_list(s, src, ses, out),
         ctrl::LIST_INVITES => {
             let from = pl::dec_u32(payload)?;
@@ -2413,6 +2524,43 @@ fn handle_mutation(
                 ctrl::PRESENCE_ACK,
                 &pl::enc_presence(invisible),
             );
+        }
+        ctrl::MESH_INFO => {
+            // Публикация mesh-контакта (§4.1): статический x-ключ и caps.
+            // Хранится в сессии: участнику он нужен, пока тот онлайн.
+            let (x_pub, caps) = pl::dec_mesh_info(payload)?;
+            let checked = {
+                let ses = s.sessions.get_mut(&src).unwrap();
+                let changed = ses.x_pub != Some(x_pub) || ses.caps != caps;
+                ses.x_pub = Some(x_pub);
+                ses.caps = caps;
+                ses.mesh_last_seen = sh.now_ms();
+                changed
+            };
+            // Изменился видимый состав (mesh-секция GROUP_STATE) — дельта
+            // всем участникам, иначе ключ узнают лишь при следующем изменении.
+            if checked {
+                member_changed(s, &me, out);
+            }
+            // Ответ — семя DHT: ближайшие онлайн-сессии (≤ 16). Шлётся и на
+            // повтор: клиенту нужен список после переподключения.
+            let seeds = mesh_seed(s, &me, pl::MAX_MESH_SEED);
+            push_ctrl(
+                out,
+                src,
+                &s.sessions[&src],
+                ctrl::MESH_SEED,
+                &pl::enc_mesh_seed(&seeds),
+            );
+        }
+        ctrl::SERVER_HINT => {
+            // Кандидаты-серверы: сервер им не доверяет (T4 проверит ключи).
+            let hints = pl::dec_server_hint(payload)?;
+            federation::on_hint(sh, &me, &hints);
+        }
+        ctrl::JOIN_FED => {
+            anyhow::ensure!(payload.len() == 16, "JOIN_FED: uuid 16 байт");
+            federation::on_join_fed(sh, &me, payload)?;
         }
         ctrl::CREATE_GROUP => {
             let (name, private) = pl::dec_create_group(payload)?;
@@ -4373,6 +4521,9 @@ mod tests {
                         last_seen: AtomicU64::new(u64::MAX / 2),
                         relay: Mutex::new(Bucket::new(1.0)),
                         ctrl: Mutex::new(Bucket::new(1.0)),
+                        x_pub: None,
+                        caps: 0,
+                        mesh_last_seen: 0,
                     },
                 );
                 s.by_pub.insert(pk, addr);

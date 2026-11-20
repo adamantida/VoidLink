@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 
 use crate::handshake::{self, EphemeralKey, Hello3, RotationLink, Welcome, make_link};
+use crate::mesh::{MeshForward, MeshHello};
 use crate::payloads::{self as p, *};
 use crate::*;
 
@@ -43,7 +44,11 @@ fn mutate(rng: &mut StdRng, src: &[u8]) -> Vec<u8> {
 }
 
 /// Все декодеры payload'ов и рукопожатия на одном входе.
-fn feed_all(b: &[u8], client_ed: &[u8; 32], client_eph: &[u8; 32], pin: &[u8; 32]) {
+///
+/// `mesh_ed` — ed-ключ, которого ждём в mesh-рукопожатии: на нём проверяется
+/// ветка «свой ключ → проверка просрочки и подписи», а не только дешёвый
+/// отказ по чужому ed.
+fn feed_all(b: &[u8], client_ed: &[u8; 32], client_eph: &[u8; 32], pin: &[u8; 32], mesh_ed: &[u8; 32]) {
     let _ = dec_create_group(b);
     let _ = dec_gid(b);
     let _ = dec_gid_target(b);
@@ -63,6 +68,20 @@ fn feed_all(b: &[u8], client_ed: &[u8; 32], client_eph: &[u8; 32], pin: &[u8; 32
     let _ = dec_error(b);
     let _ = dec_friend_groups(b);
     let _ = dec_ping(b);
+    // Этап 9: mesh, probe, hint/fed/seed.
+    let _ = dec_mesh_info(b);
+    let _ = dec_server_hint(b);
+    let _ = dec_probe_req(b);
+    let _ = dec_probe_resp(b);
+    let _ = dec_mesh_seed(b);
+    let _ = dec_fed_groups(b);
+    let _ = dec_mesh_section(&mut Reader::new(b));
+    if let Ok(h) = MeshHello::decode(b) {
+        let _ = h.verify_from(mesh_ed, 1_700_000_000_000);
+        let _ = h.dh(&EphemeralKey::generate());
+        let _ = h.signing_payload();
+    }
+    let _ = MeshForward::decode(b);
     let _ = read_member(&mut Reader::new(b));
     let _ = handshake::hello_version(b);
     let _ = Hello3::decode(b).map(|h| h.verify());
@@ -105,9 +124,64 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
         dst: 3,
         epoch: 4,
     };
+    // Mesh-рукопожатие: подписано `mesh_id`, его же и ждём при проверке.
+    let mesh_id = Identity::generate();
+    let mesh_eph = EphemeralKey::generate();
+    let mesh_hello = MeshHello::new(
+        &mesh_id,
+        mesh_eph.public(),
+        [5u8; crate::mesh::MESH_NONCE_LEN],
+        1_700_000_000_000,
+        crate::mesh::caps::MESH | crate::mesh::caps::RELAY,
+    );
+    let inner = seal_group(&key, grp::DATA, &gh, 0, &[0x45; 40]);
 
     let gs = p::tests::group_state();
+    let gs_mesh = p::tests::group_state_mesh();
     let seeds: Vec<Vec<u8>> = vec![
+        enc_group_state(&gs_mesh),
+        enc_mesh_info(&[3; 32], 0b111),
+        enc_server_hint(&[ServerHint {
+            addr: "203.0.113.9:5555".into(),
+            ed_pub: [4; 32],
+        }]),
+        enc_probe_req(&ProbeReq {
+            nonce: [6; PROBE_NONCE_LEN],
+            ts_ms: 1_700_000_000_000,
+            want_key: true,
+        }),
+        enc_probe_resp(&ProbeResp {
+            nonce: [6; PROBE_NONCE_LEN],
+            ts_ms: 1_700_000_000_000,
+            ed_pub: Some([7; 32]),
+        }),
+        enc_probe_resp(&ProbeResp {
+            nonce: [6; PROBE_NONCE_LEN],
+            ts_ms: 1_700_000_000_000,
+            ed_pub: None,
+        }),
+        enc_mesh_seed(&[MeshSeed {
+            ed_pub: [8; 32],
+            x_pub: [9; 32],
+            addr: "198.51.100.4:4000".parse().unwrap(),
+        }]),
+        enc_fed_groups(&[FedGroup {
+            uuid: [11; 16],
+            gid: 3,
+            name: "федерация".into(),
+            owner: [12; 32],
+            members: 4,
+        }]),
+        mesh_hello.encode(),
+        MeshForward {
+            dst_ed: [1; 32],
+            src_ed: [2; 32],
+            hops: 1,
+            visited: vec![[13; 32]],
+            inner,
+        }
+        .encode()
+        .expect("валидный forward"),
         enc_create_group("g", true),
         enc_gid(7),
         enc_gid_target(7, &[2; 32]),
@@ -124,6 +198,11 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
             revoke_prev: true,
             key: [0; 32],
             delta: GroupDelta::Member(p::tests::member(1)),
+            mesh: vec![MeshEntry {
+                ip: 0,
+                x_pub: [14; 32],
+                caps: 0b101,
+            }],
         }),
         enc_group_update(&GroupUpdate {
             gid: 1,
@@ -137,6 +216,7 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
                 owner: [1; 32],
                 private: true,
             },
+            mesh: Vec::new(),
         }),
         enc_group_list(&[GroupSummary {
             gid: 1,
@@ -207,8 +287,10 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
     ];
 
     let (ced, ceph, pin) = (client.ed_pub(), c_eph.public(), old.ed_pub());
+    let mesh_ed = mesh_id.ed_pub();
     // Валидные входы разбираются (проверка, что сиды осмысленны).
     assert!(Welcome::decode(&welcome, &ced, &ceph).is_ok());
+    assert!(MeshHello::decode(&mesh_hello.encode()).is_ok());
     for _ in 0..20_000 {
         let input = if rng.random_range(0..4) == 0 {
             let n = rng.random_range(0..600);
@@ -219,7 +301,7 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
             let s = &seeds[rng.random_range(0..seeds.len())];
             mutate(&mut rng, s)
         };
-        feed_all(&input, &ced, &ceph, &pin);
+        feed_all(&input, &ced, &ceph, &pin, &mesh_ed);
     }
 }
 

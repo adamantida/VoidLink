@@ -65,6 +65,8 @@ pub struct Metrics {
     pub challenge_total: AtomicU64,
     pub ctrl_frames: AtomicU64,
     pub bytes_relayed: AtomicU64,
+    /// Пробы доступности (`PROBE_REQ`, этап 9).
+    pub probes_total: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +114,7 @@ impl Metrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 10] {
+    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 11] {
         use Kind::*;
         [
             (
@@ -169,6 +171,12 @@ impl Metrics {
                 "Байты релея",
                 Counter,
                 &self.bytes_relayed,
+            ),
+            (
+                "voidlink_probes_total",
+                "Пробы доступности (PROBE_REQ)",
+                Counter,
+                &self.probes_total,
             ),
         ]
     }
