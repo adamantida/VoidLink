@@ -19,8 +19,8 @@ Production-код не менялся; в ветке — только этот �
 | Гейты (`fmt`, `clippy`, `test`) | **PASS** |
 | Матрица пяти пунктов бэклога | **PASS** (код, тесты и e2e на месте; цепочки подтверждены codegraph) |
 | Безопасность/качество | **PASS** с замечаниями (фаззинг федеративных кодеков — пробел, см. §5) |
-| Документация | **FAIL** — расхождения перечислены в §4; правит T8, а не T7 |
-| **Итог этапа** | **PASS по коду и приёмке; закрытие — после T8** (правки только в docs/README) |
+| Документация | **PASS после T8** — расхождения из §4 закрыты (T8a), фаззинг Q1 добавлен (T8b); см. §9 |
+| **Итог этапа** | **PASS** — код, приёмка и документация; остаточные риски — ручной NAT/TUN |
 
 Блокеров в production-коде нет. Все «блокеры» ниже — это несинхронизированные
 документы (T8) и два необязательных улучшения качества.
@@ -508,3 +508,15 @@ codegraph node "join_fed"          # Called by ← handle_mutation
 codegraph node "choose"            # Called by ← route_packet
 codegraph node "start_probe"       # Called by ← do_cmd / probe_local
 ```
+---
+
+## 9. Закрытие T8 (после отчёта)
+
+| Пункт | Статус | Где |
+|---|---|---|
+| B1–B8 (документация) | **исправлено** T8a | `f52c533`, merge `01bd7af`: PROTOCOL §12 под T4c, PLAN/TESTING/README/SERVER/SECURITY/TUI/CLIENT/NETWORKING/ARCHITECTURE/CHANGELOG/GLOSSARY синхронизированы с кодом |
+| Q1 (фаззинг федеративных декодеров) | **исправлено** T8b | `ea5596c`, merge `6290424`: `SRV_HELLO/ACK`, `FED_GROUP_PUSH/DELTA`, `FED_ADDR_PUSH/REVOKE`, `FED_RELAY/ACK/NACK` в `fuzz_tests.rs` |
+| Гейты на финальном `dev` | **PASS** | `01bd7af`: `fmt` 0, `clippy -D warnings` 0, `cargo test --workspace -- --test-threads=1` — 565 passed, 0 failed |
+| Счёт тестов | 565 на Windows | совпадает в README, TESTING, PLAN, CHANGELOG |
+
+Финальное состояние: `dev` = `01bd7af`; код, приёмка и документация — **PASS**.
