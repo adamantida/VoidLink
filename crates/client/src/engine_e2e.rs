@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2997,6 +2997,261 @@ fn e2e_ложные_подсказки_федерации_отклоняются
     drop(proxy);
     b.stop();
     a.stop();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+// ---------- T4c: встречные SRV_HELLO (тай-брейк федерации) ----------
+
+/// UDP-концентратор федерации для теста гонки: оба сервера видят друг друга
+/// по одному адресу посредника (как за NAT). Первые `SRV_HELLO` с каждой
+/// стороны придерживаются до [`FedHub::release`] — обе стороны гарантированно
+/// получают встречный HELLO уже со своей ожидающей попыткой (настоящая гонка,
+/// а не односторонняя подсказка). Всё остальное пересылается сразу.
+struct FedHub {
+    addr: SocketAddr,
+    hellos: Arc<AtomicUsize>,
+    held_src: Arc<Mutex<HashSet<SocketAddr>>>,
+    release: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FedHub {
+    fn start() -> FedHub {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let addr = sock.local_addr().unwrap();
+        let hellos = Arc::new(AtomicUsize::new(0));
+        let held_src: Arc<Mutex<HashSet<SocketAddr>>> = Arc::default();
+        let release = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (h2, hsrc2) = (hellos.clone(), held_src.clone());
+        let (rel2, st2) = (release.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let mut peers: Vec<SocketAddr> = Vec::new();
+            let mut held: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+            let mut buf = vec![0u8; 65_535];
+            while !st2.load(Ordering::Relaxed) {
+                // Отпускание: отложенные HELLO уходят второму участнику.
+                if rel2.load(Ordering::Relaxed) && !held.is_empty() {
+                    for (src, frame) in held.drain(..) {
+                        if let Some(dst) = peers.iter().find(|p| **p != src).copied() {
+                            let _ = sock.send_to(&frame, dst);
+                        }
+                    }
+                    hsrc2.lock().unwrap().clear();
+                }
+                let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                if peers.len() < 2 && !peers.contains(&src) {
+                    peers.push(src);
+                }
+                let frame = &buf[..n];
+                let typ = proto::split_frame(frame).map(|(t, _)| t).unwrap_or(0);
+                if typ == proto::federation::SRV_HELLO {
+                    h2.fetch_add(1, Ordering::Relaxed);
+                    if !rel2.load(Ordering::Relaxed) {
+                        hsrc2.lock().unwrap().insert(src);
+                        held.push((src, frame.to_vec()));
+                        continue;
+                    }
+                }
+                if let Some(dst) = peers.iter().find(|p| **p != src).copied() {
+                    let _ = sock.send_to(frame, dst);
+                }
+            }
+        });
+        FedHub {
+            addr,
+            hellos,
+            held_src,
+            release,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Сколько разных серверов уже прислали HELLO (придержанный).
+    fn held(&self) -> usize {
+        self.held_src.lock().unwrap().len()
+    }
+
+    /// Всего `SRV_HELLO`, прошедших через посредника (включая придержанные).
+    fn hellos(&self) -> usize {
+        self.hellos.load(Ordering::Relaxed)
+    }
+
+    fn release(&self) {
+        self.release.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for FedHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// E2E 4/T4c: у каждого сервера свой клиент, и оба клиента знают **оба**
+/// сервера — серверы одновременно получают взаимные `SERVER_HINT` и шлют
+/// встречные `SRV_HELLO`. Посредник придерживает оба HELLO, поэтому гонка
+/// детерминирована. Тай-брейк T4c (меньший ed — инициатор) обязан свести
+/// стороны на одной сессии: группа реплицируется, `JOIN_FED` работает и
+/// пакет S1→S2 доходит до TunDev за < 5 с. Повторная подсказка (второй
+/// клиент A) не создаёт новых `SRV_HELLO` и не ломает доставку.
+#[test]
+fn e2e_встречные_подсказки_федерации_не_ломают_репликацию() {
+    let dir_a = temp_dir("fed-race-a");
+    let dir_b = temp_dir("fed-race-b");
+    let a = start_fed_server(&dir_a, 0, Some("127.0.0.1:0".parse().unwrap()));
+    let b = start_fed_server(&dir_b, 0, Some("127.0.0.1:0".parse().unwrap()));
+    let metrics_a = a.metrics_addr.expect("метрики A включены");
+    let metrics_b = b.metrics_addr.expect("метрики B включены");
+    let (a_pub, b_pub) = (a.pubkey, b.pubkey);
+    let (a_addr, b_addr) = (local(a.addr), local(b.addr));
+    // Оба сервера видны клиентам по адресу посредника: HELLO идут через
+    // него, и он может придержать их до одновременного получения.
+    let hub = FedHub::start();
+    let hub_addr = hub.addr;
+    let save: Arc<dyn Fn(&Config) + Send + Sync> = Arc::new(|_| {});
+    let mut s1 = Node::start_cfg(
+        Config {
+            name: "s1".into(),
+            servers: stored_servers(&[(a_addr, a_pub, "A"), (hub_addr, b_pub, "B")]),
+            ..Config::default()
+        },
+        a_addr,
+        a_pub,
+        proto::Identity::generate(),
+        save.clone(),
+    )
+    .expect("S1 подключается");
+    let mut s2 = Node::start_cfg(
+        Config {
+            name: "s2".into(),
+            servers: stored_servers(&[(b_addr, b_pub, "B"), (hub_addr, a_pub, "A")]),
+            ..Config::default()
+        },
+        b_addr,
+        b_pub,
+        proto::Identity::generate(),
+        save,
+    )
+    .expect("S2 подключается");
+    s1.wait("S1 подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    s2.wait("S2 подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+
+    // Оба сервера отправили HELLO и обе попытки придержаны — это гонка.
+    wait_until("встречные SRV_HELLO придержаны", T, || hub.held() >= 2);
+    hub.release();
+    wait_until("федеративная сессия на A", T, || {
+        metric_value(&metrics_text(metrics_a), "voidlink_fed_peers") == 1
+    });
+    wait_until("федеративная сессия на B", T, || {
+        metric_value(&metrics_text(metrics_b), "voidlink_fed_peers") == 1
+    });
+
+    // Своя группа на A реплицируется B (сессия одна, ключи совпали).
+    let gid1 = s1.create("fed-race", false);
+    let ev = s2.wait(
+        "FED_GROUPS на B",
+        T,
+        |e| matches!(e, Event::FedGroups { groups } if groups.iter().any(|g| g.name == "fed-race")),
+    );
+    let fed = match ev {
+        Event::FedGroups { groups } => groups.into_iter().find(|g| g.name == "fed-race").unwrap(),
+        _ => unreachable!(),
+    };
+    assert_ne!(fed.uuid, [0u8; 16], "uuid федерации не назначен");
+    let gid2 = fed.gid;
+
+    // S2 входит по uuid — ответ обычный GROUP_STATE.
+    s2.eng.cmds.send(Cmd::JoinFed { uuid: fed.uuid }).unwrap();
+    s2.wait(
+        "S2 вошёл в федеративную группу",
+        T,
+        |e| matches!(e, Event::GroupJoined { gid, name, .. } if *gid == gid2 && name == "fed-race"),
+    );
+    wait_until("S1 видит S2 в группе", T, || {
+        s1.members(gid1) == 1 && s1.member_ip(gid1, &s2.eng.my_pub).is_some()
+    });
+
+    // < 5 с — дольше висело бы расхождение ключей (FED_TIMEOUT = 30 с).
+    let took = deliver_across(
+        &s1,
+        gid1,
+        &s2,
+        gid2,
+        "S1→S2 после встречных hint",
+        Duration::from_secs(5),
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "пакет S1→S2 дошёл за {took:?} — федерация зависла?"
+    );
+    deliver_across(
+        &s2,
+        gid2,
+        &s1,
+        gid1,
+        "S2→S1 после встречных hint",
+        Duration::from_secs(5),
+    );
+
+    // Повторная подсказка: второй клиент A со списком серверов. Сессия уже
+    // установлена, поэтому SRV_HELLO не шлётся и доставка не ломается.
+    let hellos_before = hub.hellos();
+    let mut s3 = Node::start_cfg(
+        Config {
+            name: "s3".into(),
+            servers: stored_servers(&[(a_addr, a_pub, "A"), (hub_addr, b_pub, "B")]),
+            ..Config::default()
+        },
+        a_addr,
+        a_pub,
+        proto::Identity::generate(),
+        Arc::new(|_| {}),
+    )
+    .expect("S3 подключается");
+    s3.wait("S3 подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(
+        hub.hellos(),
+        hellos_before,
+        "повторная подсказка породила новый SRV_HELLO"
+    );
+    assert_eq!(
+        metric_value(&metrics_text(metrics_a), "voidlink_fed_peers"),
+        1,
+        "пиры A изменились после повторной подсказки"
+    );
+    deliver_across(
+        &s1,
+        gid1,
+        &s2,
+        gid2,
+        "S1→S2 после повторной подсказки",
+        Duration::from_secs(5),
+    );
+
+    drop(s1);
+    drop(s2);
+    drop(s3);
+    drop(hub);
+    a.stop();
+    b.stop();
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
