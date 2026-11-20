@@ -35,6 +35,10 @@ const USAGE: &str = "\
   --tcp / --no-tcp          TCP-фолбэк на том же порту, что UDP (включён)
   --metrics <addr>          HTTP-метрики: /metrics (Prometheus) и /healthz,
                             например 127.0.0.1:9100 (по умолчанию выключены)
+  --federate                федерация серверов (этап 9): SRV_HELLO/ACK,
+                            TOFU-пиннинг ключей пиров, SERVER_HINT
+  --peer <addr>             явный пин сервера-пира (можно повторять)
+  --fed-pool <addr>         пул адресов федерации (задел T4b, можно повторять)
 
 SIGTERM/SIGINT (Windows: Ctrl+C, закрытие консоли) — корректная остановка:
 воркеры останавливаются, состояние сохраняется, код выхода 0. Повторный
@@ -83,6 +87,27 @@ fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("rotate-key") {
         return rotate_key(&args[1..]);
     }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        eprintln!("{USAGE}");
+        return Ok(());
+    }
+    let cfg = parse_args(&args)?;
+    // Обработчики — до старта: сигнал в первые миллисекунды тоже корректно
+    // останавливает сервер.
+    let shutdown = tunnel_server::signals::Shutdown::install()?;
+    let quiet = cfg.quiet;
+    let server = tunnel_server::Server::start(cfg)?;
+    shutdown.wait();
+    if !quiet {
+        eprintln!("[server] сигнал остановки: сохраняю состояние и выхожу");
+    }
+    // Останавливает воркеры, TCP и метрики, затем финальный save_now.
+    server.stop();
+    Ok(())
+}
+
+/// Разбор аргументов запуска сервера (всё, кроме `rotate-key` и `--help`).
+fn parse_args(args: &[String]) -> Result<tunnel_server::Config> {
     let mut cfg = tunnel_server::Config::default();
     let mut listen = "0.0.0.0:5555".to_string();
     let l = &mut cfg.limits;
@@ -90,33 +115,44 @@ fn main() -> Result<()> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
-                eprintln!("{USAGE}");
-                return Ok(());
-            }
-            "--data" => cfg.data_dir = value::<String>(&args, i, a)?.into(),
-            "--workers" => cfg.workers = value(&args, i, a)?,
-            "--relay-rate" => l.relay_rate = value(&args, i, a)?,
-            "--relay-burst" => l.relay_burst = value(&args, i, a)?,
-            "--ctrl-rate" => l.ctrl_rate = value(&args, i, a)?,
-            "--ctrl-burst" => l.ctrl_burst = value(&args, i, a)?,
-            "--hello-rate" => l.hello_rate = value(&args, i, a)?,
-            "--hello-burst" => l.hello_burst = value(&args, i, a)?,
-            "--plain-rate" => l.plain_rate = value(&args, i, a)?,
-            "--plain-burst" => l.plain_burst = value(&args, i, a)?,
-            "--join-rate" => l.join_rate = value(&args, i, a)?,
-            "--join-burst" => l.join_burst = value(&args, i, a)?,
-            "--session-timeout" => l.session_timeout = Duration::from_secs(value(&args, i, a)?),
-            "--max-owned-groups" => l.max_owned_groups = value(&args, i, a)?,
-            "--max-invites-per-group" => l.max_invites_per_group = value(&args, i, a)?,
-            "--max-bans-per-group" => l.max_bans_per_group = value(&args, i, a)?,
-            "--max-invites-per-target" => l.max_invites_per_target = value(&args, i, a)?,
+            "--data" => cfg.data_dir = value::<String>(args, i, a)?.into(),
+            "--workers" => cfg.workers = value(args, i, a)?,
+            "--relay-rate" => l.relay_rate = value(args, i, a)?,
+            "--relay-burst" => l.relay_burst = value(args, i, a)?,
+            "--ctrl-rate" => l.ctrl_rate = value(args, i, a)?,
+            "--ctrl-burst" => l.ctrl_burst = value(args, i, a)?,
+            "--hello-rate" => l.hello_rate = value(args, i, a)?,
+            "--hello-burst" => l.hello_burst = value(args, i, a)?,
+            "--plain-rate" => l.plain_rate = value(args, i, a)?,
+            "--plain-burst" => l.plain_burst = value(args, i, a)?,
+            "--join-rate" => l.join_rate = value(args, i, a)?,
+            "--join-burst" => l.join_burst = value(args, i, a)?,
+            "--session-timeout" => l.session_timeout = Duration::from_secs(value(args, i, a)?),
+            "--max-owned-groups" => l.max_owned_groups = value(args, i, a)?,
+            "--max-invites-per-group" => l.max_invites_per_group = value(args, i, a)?,
+            "--max-bans-per-group" => l.max_bans_per_group = value(args, i, a)?,
+            "--max-invites-per-target" => l.max_invites_per_target = value(args, i, a)?,
             "--metrics" => {
-                let m: String = value(&args, i, a)?;
+                let m: String = value(args, i, a)?;
                 cfg.metrics = Some(
                     m.parse::<SocketAddr>()
                         .context("--metrics: неверный адрес")?,
                 );
+            }
+            // Федерация серверов (этап 9, T4a).
+            "--federate" => {
+                cfg.federate = true;
+                i += 1;
+                continue;
+            }
+            "--peer" => {
+                let s: String = value(args, i, a)?;
+                cfg.peers.push(s.parse().context("--peer: неверный адрес")?);
+            }
+            "--fed-pool" => {
+                let s: String = value(args, i, a)?;
+                cfg.fed_pool
+                    .push(s.parse().context("--fed-pool: неверный адрес")?);
             }
             "--tcp" | "--no-tcp" => {
                 cfg.tcp = a == "--tcp";
@@ -124,7 +160,7 @@ fn main() -> Result<()> {
                 continue;
             }
             "--invite-ttl-days" => {
-                let days: u64 = value(&args, i, a)?;
+                let days: u64 = value(args, i, a)?;
                 l.invite_ttl = Duration::from_secs(days.saturating_mul(24 * 3600));
             }
             "-q" | "--quiet" => {
@@ -168,16 +204,57 @@ fn main() -> Result<()> {
     );
     anyhow::ensure!(!l.invite_ttl.is_zero(), "--invite-ttl-days: нужно ≥ 1");
     cfg.listen = listen.parse::<SocketAddr>().context("bad listen addr")?;
-    // Обработчики — до старта: сигнал в первые миллисекунды тоже корректно
-    // останавливает сервер.
-    let shutdown = tunnel_server::signals::Shutdown::install()?;
-    let quiet = cfg.quiet;
-    let server = tunnel_server::Server::start(cfg)?;
-    shutdown.wait();
-    if !quiet {
-        eprintln!("[server] сигнал остановки: сохраняю состояние и выхожу");
+    Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<tunnel_server::Config> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&args)
     }
-    // Останавливает воркеры, TCP и метрики, затем финальный save_now.
-    server.stop();
-    Ok(())
+
+    #[test]
+    fn федерация_по_умолчанию_выключена() {
+        let c = parse(&[]).unwrap();
+        assert!(!c.federate);
+        assert!(c.peers.is_empty() && c.fed_pool.is_empty());
+        // Явный пин сам по себе федерацию не включает — нужен --federate.
+        let c = parse(&["--peer", "192.0.2.1:5555"]).unwrap();
+        assert!(!c.federate);
+        assert_eq!(c.peers.len(), 1);
+    }
+
+    #[test]
+    fn федеративные_флаги_разбираются() {
+        let c = parse(&[
+            "--federate",
+            "--peer",
+            "203.0.113.5:5555",
+            "--peer",
+            "[2001:db8::1]:7000",
+            "--fed-pool",
+            "198.51.100.9:443",
+        ])
+        .unwrap();
+        assert!(c.federate);
+        assert_eq!(c.peers.len(), 2, "флаг повторяемый");
+        assert_eq!(c.peers[0], "203.0.113.5:5555".parse().unwrap());
+        assert_eq!(c.peers[1].port(), 7000);
+        assert_eq!(c.fed_pool.len(), 1);
+        // Флаги не мешают остальным.
+        let c = parse(&["--federate", "--quiet", "--workers", "2"]).unwrap();
+        assert!(c.federate && c.quiet && c.workers == 2);
+    }
+
+    #[test]
+    fn федеративные_флаги_с_опечаткой_ошибка() {
+        assert!(parse(&["--peer", "не адрес"]).is_err());
+        assert!(parse(&["--peer"]).is_err(), "нужно значение");
+        assert!(parse(&["--fed-pool", "0.0.0.0"]).is_err());
+        assert!(parse(&["--federate=да"]).is_err(), "неизвестный флаг");
+        assert!(USAGE.contains("--federate") && USAGE.contains("--peer"));
+    }
 }

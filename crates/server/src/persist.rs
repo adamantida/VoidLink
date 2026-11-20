@@ -24,6 +24,29 @@ pub struct Persisted {
     /// файле сервера v3 поля нет: адреса берутся из групп (`PGroup::members`).
     #[serde(default)]
     pub user_ips: BTreeMap<String, u32>,
+    /// Федерация серверов (этап 9, T4a): закреплённые TOFU-пиры. В файле
+    /// v4 поля нет — федерация просто не настроена.
+    #[serde(default)]
+    pub federation: PFederation,
+}
+
+/// Секция `federation` в `server.json`.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PFederation {
+    /// Закреплённые (TOFU) серверы-пиры.
+    #[serde(default)]
+    pub peers: Vec<PPeer>,
+}
+
+/// Закреплённый сервер-пир: адрес, ed-ключ (якорь доверия) и x-ключ
+/// (долгоживущий ключ сервера). `added_at` — unix мс закрепления.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PPeer {
+    pub addr: String,
+    pub ed: String,
+    pub x: String,
+    #[serde(default)]
+    pub added_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
