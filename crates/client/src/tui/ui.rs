@@ -399,12 +399,18 @@ fn draw_groups(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let items: Vec<ListItem> = list
         .iter()
         .map(|g| {
+            // Доступная федерированная группа (`FED_GROUPS`, T4): метка и
+            // отдельный значок, вход — по uuid (JOIN_FED).
+            let fed = app.fed_group(g.gid).is_some();
             let (mark, mark_style) = if g.mine {
                 ("●", th.ok)
             } else {
                 ("○", th.dim)
             };
             let mut spans = vec![Span::styled(format!("{mark} "), mark_style)];
+            if fed {
+                spans.push(Span::styled("⇄ ", th.accent));
+            }
             spans.push(Span::styled(
                 g.name.clone(),
                 if g.mine { th.base } else { th.dim },
@@ -412,7 +418,9 @@ fn draw_groups(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             if g.private {
                 spans.push(Span::styled(" [priv]", th.warn));
             }
-            if g.mine {
+            if fed {
+                spans.push(Span::styled("  [федерация]", th.accent));
+            } else if g.mine {
                 spans.push(Span::styled(format!("  {}/{}", g.online, g.total), th.dim));
             } else if g.private {
                 spans.push(Span::styled("  (по приглашению)", th.dim));
@@ -1909,6 +1917,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("F6", "переименовать группу"),
         kv("F8", "удалить группу (только владелец)"),
         kv("j", "войти в публичную группу"),
+        kv(
+            "⇄ · :joinfed",
+            "федеративная группа: метка «федерация», вход по uuid/gid",
+        ),
         kv("x", "покинуть группу"),
         kv("i", "пригласить друга в группу"),
         kv("k / b", "исключить / забанить участника"),

@@ -66,6 +66,9 @@ const PATHS_EVERY: Duration = Duration::from_secs(10);
 const MESH_EVERY: Duration = Duration::from_secs(1);
 /// `MESH_INFO` серверу: сразу после WELCOME и далее раз в 5 минут (§4.1).
 const MESH_INFO_EVERY: Duration = Duration::from_secs(5 * 60);
+/// `SERVER_HINT` серверу (T4): сразу после WELCOME и далее не чаще раза в
+/// 5 минут. Старый сервер тип не знает и молча роняет — шлём всем.
+const SERVER_HINT_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Обслуживание DHT (устаревание, сохранение контактов) раз в 10 секунд:
 /// контакты должны пережить рестарт и мёртвый сервер, но запись файла —
 /// только когда таблица реально изменилась.
@@ -293,6 +296,10 @@ pub struct GroupSess {
     /// только растут, и запоздавшее состояние с меньшей ревизией — откат
     /// (в т.ч. к ключу, отозванному киком).
     state_sess: u64,
+    /// uuid группы в федерации (`FED_GROUPS`, T4): `Some` — группа пришла с
+    /// другого сервера, в UI у неё метка «федерация». `None` — своя группа
+    /// (сервер uuid не сообщает) или сервер без федерации.
+    pub fed_uuid: Option<[u8; 16]>,
 }
 
 impl Drop for GroupSess {
@@ -324,6 +331,7 @@ impl GroupSess {
             hint_gap: GET_GROUP_EVERY,
             hint_log: VecDeque::new(),
             state_sess: 0,
+            fed_uuid: None,
         }
     }
 
@@ -606,6 +614,38 @@ pub enum Transport {
     Tcp,
 }
 
+/// Доступная федерированная группа (`FED_GROUPS`, T4): `uuid` — имя группы
+/// в федерации (по нему `JOIN_FED`), `gid` — её локальный номер на этом
+/// сервере. `payloads::FedGroup` в `Event`/`Meta` не годится: у него нет
+/// serde (форма событий IPC демона — JSON).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FedGroupInfo {
+    pub uuid: [u8; 16],
+    pub gid: u32,
+    pub name: String,
+    pub owner: [u8; 32],
+    pub members: u16,
+}
+
+impl From<&payloads::FedGroup> for FedGroupInfo {
+    fn from(g: &payloads::FedGroup) -> Self {
+        Self {
+            uuid: g.uuid,
+            gid: g.gid,
+            name: g.name.clone(),
+            owner: g.owner,
+            members: g.members,
+        }
+    }
+}
+
+impl FedGroupInfo {
+    /// Короткий hex uuid — для логов и подсказок UI.
+    pub fn uuid_short(&self) -> String {
+        proto::hex_of(&self.uuid)[..8].to_string()
+    }
+}
+
 /// Метаданные для статус-бара UI.
 pub struct Meta {
     pub connected: bool,
@@ -614,6 +654,9 @@ pub struct Meta {
     pub server: SocketAddr,
     pub server_label: String,
     pub group_list: Vec<payloads::GroupSummary>,
+    /// Доступные федерированные группы (`FED_GROUPS`, T4): по возрастанию
+    /// локального gid. Пусто — сервер без федерации или реплик нет.
+    pub fed_groups: Vec<FedGroupInfo>,
     /// Байт/с по последним секундам (для спарклайна).
     pub rx_hist: VecDeque<u64>,
     pub tx_hist: VecDeque<u64>,
@@ -726,6 +769,12 @@ pub enum Event {
         pubkey: [u8; 32],
         items: Vec<payloads::FriendGroup>,
     },
+    /// Доступные федерированные группы сервера (`FED_GROUPS`, T4) — снимок
+    /// списка целиком; пустой список — реплик больше нет. `Cmd::JoinFed`
+    /// входит в группу по `uuid`.
+    FedGroups {
+        groups: Vec<FedGroupInfo>,
+    },
     /// ADMIN_INFO (владельцу): баны (pk, имя) и неотвеченные приглашения
     /// (pk, имя, секунд до истечения).
     AdminInfo {
@@ -789,6 +838,11 @@ pub enum Cmd {
         private: bool,
     },
     Join(u32),
+    /// Вход в федерированную группу по uuid (`JOIN_FED`, T4). Ответ —
+    /// обычный `GROUP_STATE` (и `FedGroups`); ошибка — `Event::Error`.
+    JoinFed {
+        uuid: [u8; 16],
+    },
     Leave(u32),
     Delete(u32),
     Rename(u32, String),
@@ -2016,6 +2070,7 @@ pub fn start_with_tun(
         server,
         server_label,
         group_list: Vec::new(),
+        fed_groups: Vec::new(),
         rx_hist: VecDeque::new(),
         tx_hist: VecDeque::new(),
         started: Instant::now(),
@@ -2314,6 +2369,9 @@ struct State {
     last_route_probe: Instant,
     /// Номер следующего поиска DHT.
     lookup_seq: u64,
+    /// Последний отправленный `SERVER_HINT` (T4): `None` — ещё не слали
+    /// этому серверу (сразу после WELCOME, не чаще `SERVER_HINT_EVERY`).
+    last_hint: Option<Instant>,
 }
 
 impl State {
@@ -2359,6 +2417,7 @@ impl State {
             last_lookup: HashMap::new(),
             last_route_probe: now,
             lookup_seq: 1,
+            last_hint: None,
         }
     }
 
@@ -2930,6 +2989,74 @@ fn paths_round(env: &Env, connected: bool, _now: Instant) {
     }
 }
 
+/// `SERVER_HINT` (T4): кандидаты-серверы для федерации — серверы из
+/// `client.json.servers` (addr + ed) и контакты DHT, батч ≤ 8. Шлётся сразу
+/// после WELCOME и далее не чаще `SERVER_HINT_EVERY`; старый сервер тип не
+/// знает и молча роняет, поэтому шлём всем. Пустой список не шлём (и период
+/// не сдвигаем: добавили сервер — подсказка уйдёт на ближайшем шаге).
+fn hint_round(env: &Env, st: &mut State, now: Instant) {
+    if !st.connected() {
+        return;
+    }
+    if st
+        .last_hint
+        .is_some_and(|t| now.duration_since(t) < SERVER_HINT_EVERY)
+    {
+        return;
+    }
+    let hints = hint_candidates(env);
+    if hints.is_empty() {
+        return;
+    }
+    st.last_hint = Some(now);
+    if debug() {
+        eprintln!("[engine] SERVER_HINT: {} кандидат(ов)", hints.len());
+    }
+    st.send_ctrl(env, ctrl::SERVER_HINT, &payloads::enc_server_hint(&hints));
+}
+
+/// Кандидаты для `SERVER_HINT`: `client.json.servers` и контакты DHT
+/// (ed + addr), без текущего сервера, без повторов по адресу и не больше
+/// [`payloads::MAX_SERVER_HINT`]. Неразборчивый адрес/ключ — пропуск: сервер
+/// такие всё равно отверг бы, а кадр от этого не растёт.
+fn hint_candidates(env: &Env) -> Vec<payloads::ServerHint> {
+    let me = env.server();
+    let mut out: Vec<payloads::ServerHint> = Vec::new();
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let mut push = |addr: &str, ed: &str| {
+        let Ok(addr) = addr.parse::<SocketAddr>() else {
+            return;
+        };
+        let Ok(ed) = proto::hex_to_bytes(ed) else {
+            return;
+        };
+        let Ok(ed_pub) = <[u8; 32]>::try_from(ed) else {
+            return;
+        };
+        if addr == me || out.len() >= payloads::MAX_SERVER_HINT || !seen.insert(addr) {
+            return;
+        }
+        out.push(payloads::ServerHint {
+            addr: addr.to_string(),
+            ed_pub,
+        });
+    };
+    {
+        let cfg = env.cfg.lock().unwrap();
+        for s in &cfg.servers {
+            push(&s.addr, &s.pubkey);
+        }
+        for c in &cfg.mesh.contacts {
+            push(&c.addr, &c.ed);
+        }
+    }
+    // Живая таблица DHT: адрес контакта мог обновиться (mesh-сессия).
+    for c in env.dht.lock().unwrap().to_stored() {
+        push(&c.addr, &c.ed);
+    }
+    out
+}
+
 /// Шаг mesh/DHT (раз в секунду): `MESH_INFO`, сессии и рукопожатия, DHT
 /// (пинги/устаревание/сохранение), поиски `find_node`, измерения маршрутов
 /// через реле, разбор ответов `MESH_NODES`.
@@ -2946,6 +3073,8 @@ fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
             &payloads::enc_mesh_info(&env.identity.x_pub(), caps),
         );
     }
+    // 0b. SERVER_HINT серверу (T4): кандидаты-серверы для федерации.
+    hint_round(env, st, now);
     // 1. DHT: устаревание (TTL 15 мин) + сохранение контактов в client.json.
     if now.duration_since(st.last_dht) >= DHT_EVERY {
         st.last_dht = now;
@@ -3668,6 +3797,26 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             st.declining.remove(&gid);
             st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(gid))
         }
+        // T4: вход в федерированную группу по uuid. Ответ — обычный
+        // GROUP_STATE (плюс свежий FED_GROUPS с локальным gid); ошибка —
+        // Event::Error от сервера. Метка «федерация» ставится по gid из
+        // списка, а если gid уже известен — снимаем прежние выход/tomb.
+        Cmd::JoinFed { uuid } => {
+            let gid = env
+                .meta
+                .lock()
+                .unwrap()
+                .fed_groups
+                .iter()
+                .find(|f| f.uuid == uuid)
+                .map(|f| f.gid);
+            if let Some(gid) = gid {
+                st.leaving.remove(&gid);
+                st.declining.remove(&gid);
+                st.tombs.remove(&gid);
+            }
+            st.send_ctrl(env, ctrl::JOIN_FED, &uuid)
+        }
         Cmd::Delete(gid) => st.send_ctrl(env, ctrl::DELETE_GROUP, &payloads::enc_gid(gid)),
         Cmd::Rename(gid, name) => {
             st.send_ctrl(env, ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &name))
@@ -3960,6 +4109,9 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
     st.candidates.clear();
     st.udp_hellos = 0;
     st.udp_since = None;
+    // Федерация: подсказки о серверах старого сервера новому не нужны, ждём
+    // нового списка (при первом WELCOME уйдёт сразу).
+    st.last_hint = None;
     drop_tcp(env);
     *env.server.lock().unwrap() = addr;
     {
@@ -3974,6 +4126,7 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
         m.server = addr;
         m.server_label = label.clone();
         m.group_list.clear();
+        m.fed_groups.clear();
     }
     env.emit(Event::ServerSwitched { addr, label });
 }
@@ -4053,6 +4206,10 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 env.meta.lock().unwrap().group_list = items;
             }
         }
+        // T4: доступные федерированные группы. Метка «федерация» ставится
+        // известным группам по gid; событие — только при изменении списка
+        // (сервер шлёт кадр с каждым GROUP_LIST).
+        ctrl::FED_GROUPS => on_fed_groups(env, payload),
         ctrl::INVITE_RCVD => {
             if let Ok(inv) = payloads::dec_invite(payload) {
                 on_invite(env, st, inv);
@@ -4270,9 +4427,65 @@ fn reconcile(env: &Env, mine: &HashSet<u32>) {
 /// Запоздавшее (ревизия меньше принятой в этой же сессии) отбрасывается:
 /// иначе задержанный GET_GROUP-ответ вернул бы ключ, отозванный киком, и
 /// клиент шифровал бы им снова.
+/// `FED_GROUPS` (T4): список доступных федерированных групп (реплик с других
+/// серверов). Состав списка — по возрастанию локального gid; группам в
+/// состоянии ставится uuid (метка «федерация» в UI), а группам, которых в
+/// списке больше нет, метка снимается. Событие — только при изменении
+/// списка: сервер шлёт кадр с каждым `GROUP_LIST` (раз в 15 с).
+fn on_fed_groups(env: &Env, payload: &[u8]) {
+    let Ok(items) = payloads::dec_fed_groups(payload) else {
+        return;
+    };
+    let mut groups: Vec<FedGroupInfo> = items.iter().map(FedGroupInfo::from).collect();
+    groups.sort_by_key(|g| g.gid);
+    let changed = {
+        let mut m = env.meta.lock().unwrap();
+        if m.fed_groups == groups {
+            false
+        } else {
+            m.fed_groups = groups.clone();
+            true
+        }
+    };
+    let uuids: HashMap<u32, [u8; 16]> = groups.iter().map(|g| (g.gid, g.uuid)).collect();
+    {
+        let mut gs = env.groups.lock().unwrap();
+        for (gid, group) in gs.iter_mut() {
+            let was = group.fed_uuid;
+            group.fed_uuid = uuids.get(gid).copied();
+            if debug() && was != group.fed_uuid {
+                eprintln!(
+                    "[engine] группа {gid}: метка федерации {:?} -> {:?}",
+                    was.map(|u| proto::hex_of(&u)),
+                    group.fed_uuid.map(|u| proto::hex_of(&u))
+                );
+            }
+        }
+    }
+    if changed {
+        if debug() {
+            eprintln!("[engine] федерированных групп: {}", groups.len());
+        }
+        env.emit(Event::FedGroups { groups });
+    }
+}
+
 fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
     let my_pub = env.identity.ed_pub();
     if st.deleted {
+        // Копию федеративной группы удалил владелец: из списка доступных её
+        // убираем сами — пустой FED_GROUPS сервер не шлёт (старые клиенты
+        // кадра не знают), иначе мёртвая запись осталась бы в UI.
+        let changed = {
+            let mut m = env.meta.lock().unwrap();
+            let before = m.fed_groups.len();
+            m.fed_groups.retain(|f| f.gid != st.gid);
+            before != m.fed_groups.len()
+        };
+        if changed {
+            let groups = env.meta.lock().unwrap().fed_groups.clone();
+            env.emit(Event::FedGroups { groups });
+        }
         let removed = {
             env.groups
                 .lock()
@@ -4294,6 +4507,16 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
         return;
     }
     let now = Instant::now();
+    // uuid из FED_GROUPS — до блокировки групп (порядок блокировок везде
+    // state → fed/meta, обратный ему здесь не нужен).
+    let fed_uuid = env
+        .meta
+        .lock()
+        .unwrap()
+        .fed_groups
+        .iter()
+        .find(|f| f.gid == st.gid)
+        .map(|f| f.uuid);
     let mut events: Vec<Event> = Vec::new();
     let is_new = {
         let mut g = env.groups.lock().unwrap();
@@ -4313,6 +4536,12 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
         entry.owner = st.owner;
         entry.private = st.private;
         entry.my_ip = st.my_ip;
+        // Метка «федерация»: gid мог прийти в FED_GROUPS раньше состояния
+        // (или это ответ на JOIN_FED — список тоже уже был). Нет в списке —
+        // прежняя метка сохраняется до следующего FED_GROUPS.
+        if let Some(uuid) = fed_uuid {
+            entry.fed_uuid = Some(uuid);
+        }
         // Участники, которых в состоянии больше нет, — убрать; остальные —
         // обновить, сохранив прямые каналы и RTT.
         let present: HashSet<[u8; 32]> = st.members.iter().map(|m| m.pubkey).collect();
@@ -4990,6 +5219,9 @@ pub fn run(
             ),
             Event::InvitesSynced { .. } => {}
             Event::FriendGroups { .. } => {}
+            Event::FedGroups { groups } => {
+                eprintln!("[engine] доступно федерированных групп: {}", groups.len())
+            }
             Event::ServerPingResult { .. } => {}
             // Этап 9: путь доставки, пробы, релей. UI-часть — T2/T3/T5.
             Event::PathChanged { .. } | Event::PathLost { .. } => {}
@@ -5651,6 +5883,7 @@ mod tests {
             server,
             server_label: String::new(),
             group_list: Vec::new(),
+            fed_groups: Vec::new(),
             rx_hist: VecDeque::new(),
             tx_hist: VecDeque::new(),
             started: Instant::now(),
@@ -5906,5 +6139,62 @@ mod tests {
             }
         }
         assert_eq!(notices, 4);
+    }
+
+    /// T4b2: кандидаты `SERVER_HINT` — из `client.json.servers` и DHT-контактов
+    /// (ed + addr), без текущего сервера, повторов по адресу и битых строк;
+    /// батч не больше `MAX_SERVER_HINT`.
+    #[test]
+    fn подсказки_серверов_батч_без_повторов_и_своего_сервера() {
+        let server: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let (env, _ev) = test_env(server);
+        let hex = |b: u8| proto::hex_of(&[b; 32]);
+        let stored = |addr: &str, pk: String| crate::store::StoredServer {
+            addr: addr.into(),
+            pubkey: pk,
+            label: String::new(),
+        };
+        {
+            let mut c = env.cfg.lock().unwrap();
+            // Текущий сервер себе же не подсказываем.
+            c.servers.push(stored(&server.to_string(), hex(1)));
+            c.servers.push(stored("127.0.0.1:5101", hex(2)));
+            c.servers.push(stored("127.0.0.1:5102", hex(3)));
+            // Повтор адреса с другим ключом — один кандидат (первый).
+            c.servers.push(stored("127.0.0.1:5101", hex(4)));
+            // Битые строки — пропуск, кадр от них не растёт.
+            c.servers.push(stored("не адрес", hex(5)));
+            c.servers.push(stored("127.0.0.1:5103", "не hex".into()));
+            // DHT-контакты: новый адрес — кандидат, повтор — нет.
+            for (ed, addr) in [(6u8, "127.0.0.1:5102"), (7u8, "127.0.0.1:5104")] {
+                c.mesh.contacts.push(crate::store::StoredContact {
+                    ed: hex(ed),
+                    x: String::new(),
+                    addr: addr.into(),
+                    rtt_ms: 0,
+                    seen_s: 0,
+                    caps: 0,
+                });
+            }
+        }
+        let hints = hint_candidates(&env);
+        let addrs: Vec<&str> = hints.iter().map(|h| h.addr.as_str()).collect();
+        assert_eq!(
+            addrs,
+            ["127.0.0.1:5101", "127.0.0.1:5102", "127.0.0.1:5104"],
+            "порядок, дедупликация по адресу, пропуск битых"
+        );
+        assert_eq!(hints[0].ed_pub, [2; 32], "ключ первого кандидата адреса");
+
+        // Батч ограничен MAX_SERVER_HINT (лишние не едут).
+        {
+            let mut c = env.cfg.lock().unwrap();
+            c.servers.clear();
+            for i in 0..12u32 {
+                c.servers
+                    .push(stored(&format!("127.0.0.1:{}", 5200 + i), hex(8)));
+            }
+        }
+        assert_eq!(hint_candidates(&env).len(), payloads::MAX_SERVER_HINT);
     }
 }

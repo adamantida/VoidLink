@@ -15,7 +15,7 @@ use crate::api::{EngineApi, EngineMode};
 use crate::engine::{Cmd, Event};
 use crate::path::{self, PathKind};
 use crate::probe::KeyMatch;
-use crate::snapshot::{PathSnap, Snapshot};
+use crate::snapshot::{FedGroupSnap, PathSnap, Snapshot};
 use crate::store::{self, Config, StoredFriend, StoredServer};
 use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
 use crate::tui::badges::{ConnState, Transport};
@@ -435,6 +435,9 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub log: Vec<LogLine>,
     pub groups: Vec<GroupView>,
+    /// Доступные федерированные группы сервера (`FED_GROUPS`, T4): метка
+    /// «федерация» в списке групп и вход по uuid (`Cmd::JoinFed`).
+    pub fed_groups: Vec<FedGroupSnap>,
     pub friends: Vec<FriendView>,
     pub peers: Vec<PeerView>,
     /// Mesh включён (из снимка) — счётчик релея в статус-баре (этап 9).
@@ -526,6 +529,7 @@ impl App {
             toasts: Vec::new(),
             log: Vec::new(),
             groups: Vec::new(),
+            fed_groups: Vec::new(),
             friends: Vec::new(),
             peers: Vec::new(),
             mesh_enabled: cfg.mesh.enabled,
@@ -724,6 +728,7 @@ impl App {
                 .then_with(|| a.gid.cmp(&b.gid))
         });
         self.groups = groups;
+        self.fed_groups = snap.fed_groups.clone();
 
         {
             // «В сети» — только если друг онлайн хотя бы в одной общей группе:
@@ -1100,6 +1105,17 @@ impl App {
                 // Байты релея приходят и в снимке: обновляем счётчик сразу,
                 // чтобы статус-бар не отставал на тик.
                 E::RelayStats { bytes_total, .. } => self.relay_bytes = bytes_total,
+                // Доступные федеративные группы (T4): сам список — в снимке
+                // (`fed_groups`), здесь только строка лога: тост на каждое
+                // обновление списка был бы спамом.
+                E::FedGroups { groups } => {
+                    let msg = if groups.is_empty() {
+                        "федеративных групп больше нет".to_string()
+                    } else {
+                        format!("доступно федеративных групп: {}", groups.len())
+                    };
+                    self.log(MsgKind::Info, msg);
+                }
                 E::Error(e) => {
                     self.log(MsgKind::Error, e.clone());
                     self.toast(MsgKind::Error, e);
@@ -1485,6 +1501,20 @@ impl App {
     pub fn selected_group(&self) -> Option<&GroupView> {
         self.sel_group
             .and_then(|g| self.groups.iter().find(|x| x.gid == g))
+    }
+
+    /// Доступная федерированная группа по локальному gid (`FED_GROUPS`, T4).
+    pub fn fed_group(&self, gid: u32) -> Option<&FedGroupSnap> {
+        self.fed_groups.iter().find(|f| f.gid == gid)
+    }
+
+    /// Команда входа в группу: федерированную входим по uuid (`JOIN_FED`),
+    /// остальные — по gid.
+    pub fn join_cmd(&self, gid: u32) -> Cmd {
+        match self.fed_group(gid) {
+            Some(f) => Cmd::JoinFed { uuid: f.uuid },
+            None => Cmd::Join(gid),
+        }
     }
 
     pub fn selected_friend(&self) -> Option<&FriendView> {
@@ -1915,8 +1945,14 @@ impl App {
                     && !g.mine
                 {
                     let gid = g.gid;
-                    self.send(eng, Cmd::Join(gid));
-                    self.toast(MsgKind::Info, format!("входим в группу {gid}"));
+                    let fed = self.fed_group(gid).is_some();
+                    let cmd = self.join_cmd(gid);
+                    self.send(eng, cmd);
+                    if fed {
+                        self.toast(MsgKind::Info, format!("входим в федерацию {gid}"));
+                    } else {
+                        self.toast(MsgKind::Info, format!("входим в группу {gid}"));
+                    }
                 }
             }
             Focus::Peers => {
@@ -2685,8 +2721,14 @@ impl App {
         match self.selected_group() {
             Some(g) if !g.mine => {
                 let gid = g.gid;
-                self.send(eng, Cmd::Join(gid));
-                self.toast(MsgKind::Info, format!("входим в группу {gid}"));
+                let fed = self.fed_group(gid).is_some();
+                let cmd = self.join_cmd(gid);
+                self.send(eng, cmd);
+                if fed {
+                    self.toast(MsgKind::Info, format!("входим в федерацию {gid}"));
+                } else {
+                    self.toast(MsgKind::Info, format!("входим в группу {gid}"));
+                }
             }
             Some(_) => self.toast(MsgKind::Info, "уже в группе".into()),
             None => self.toast(MsgKind::Warn, "не выбрана группа".into()),
@@ -3126,6 +3168,26 @@ impl App {
             Command::Join(gid) => {
                 self.send(eng, Cmd::Join(gid));
             }
+            // Федеративная группа: uuid (32 hex) или локальный gid из списка
+            // доступных (`FED_GROUPS`).
+            Command::JoinFed(tok) => {
+                let uuid = match proto::hex_to_bytes(tok.trim()) {
+                    Ok(v) if v.len() == 16 => <[u8; 16]>::try_from(v).unwrap_or([0; 16]),
+                    _ => {
+                        let gid: u32 = tok
+                            .parse()
+                            .map_err(|_| anyhow!("нужен uuid (hex) или gid федеративной группы"))?;
+                        self.fed_group(gid)
+                            .map(|f| f.uuid)
+                            .ok_or_else(|| anyhow!("федеративная группа {gid} не найдена"))?
+                    }
+                };
+                self.send(eng, Cmd::JoinFed { uuid });
+                self.toast(
+                    MsgKind::Info,
+                    format!("входим в федерацию {}", &proto::hex_of(&uuid)[..8]),
+                );
+            }
             Command::Decline(gid) => {
                 if !self.connected {
                     return Err(anyhow!("нет связи с сервером — отказ не отправлен"));
@@ -3281,6 +3343,8 @@ pub enum Command {
     Admin(Option<u32>),
     /// Экран «Серверы».
     Servers,
+    /// Вход в федерированную группу (`:joinfed <uuid-hex|gid>`).
+    JoinFed(String),
     Invisible(bool),
     /// Переключиться на сервер из списка: номер, адрес или метка.
     Server(String),
@@ -3316,6 +3380,11 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "" => Command::Help,
         "help" | "?" => Command::Help,
         "join" => Command::Join(gid_of(0)?),
+        "joinfed" => Command::JoinFed(
+            rest.first()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("нужен uuid (hex) или gid федеративной группы"))?,
+        ),
         "decline" => Command::Decline(gid_of(0)?),
         "invites" => Command::Invites,
         "leave" => Command::Leave(gid_of(0)?),
