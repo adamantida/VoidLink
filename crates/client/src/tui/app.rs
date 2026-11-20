@@ -1,7 +1,7 @@
 //! Состояние TUI: фокус, списки, попапы, тосты, лог, обработка клавиш.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow};
@@ -13,8 +13,9 @@ use tunnel_protocol as proto;
 
 use crate::api::{EngineApi, EngineMode};
 use crate::engine::{Cmd, Event};
+use crate::path::{self, PathKind};
 use crate::probe::KeyMatch;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{PathSnap, Snapshot};
 use crate::store::{self, Config, StoredFriend, StoredServer};
 use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
 use crate::tui::badges::{ConnState, Transport};
@@ -112,6 +113,8 @@ pub struct PeerView {
     pub direct: bool,
     pub rtt_ms: Option<u64>,
     pub status: String,
+    /// Выбранный путь доставки (этап 9); `None` — ещё не пересчитан.
+    pub path: Option<PathSnap>,
 }
 
 #[derive(Clone)]
@@ -222,6 +225,23 @@ pub struct FriendCardPopup {
     pub loading: bool,
 }
 
+/// Карточка участника: путь доставки, закрепление, реле (этап 9).
+/// Открывается Enter по строке в таблице участников.
+pub struct PeerCardPopup {
+    pub pubkey: [u8; 32],
+}
+
+/// Окно выбора пути до участника (`p` при фокусе на участниках, этап 9):
+/// `0 авто`, `1 прямой`, `2 сервер`, `3 реле`.
+pub struct PathPinPopup {
+    pub pubkey: [u8; 32],
+    pub name: String,
+    pub ip: u32,
+    /// Ключ пира-реле для варианта «3 реле»; `None` — реле не известно
+    /// (вариант показывается, но команду не шлёт — «нет реле»).
+    pub relay: Option<[u8; 32]>,
+}
+
 pub struct ListItem {
     pub label: String,
     pub checked: bool,
@@ -291,6 +311,10 @@ pub enum Popup {
     Confirm(ConfirmPopup),
     PeerPick(PeerPickPopup),
     FriendCard(FriendCardPopup),
+    /// Карточка участника (Enter в таблице участников).
+    PeerCard(PeerCardPopup),
+    /// Выбор пути до участника (`p` в таблице участников, этап 9).
+    PathPin(PathPinPopup),
     ListPick(ListPickPopup),
     Settings(SettingsPopup),
     Profile,
@@ -413,6 +437,14 @@ pub struct App {
     pub groups: Vec<GroupView>,
     pub friends: Vec<FriendView>,
     pub peers: Vec<PeerView>,
+    /// Mesh включён (из снимка) — счётчик релея в статус-баре (этап 9).
+    pub mesh_enabled: bool,
+    /// Сколько байт этот клиент отрелеил через mesh (для статус-бара).
+    pub relay_bytes: u64,
+    /// Живых mesh-сессий (для статус-бара).
+    pub mesh_sessions: u32,
+    /// Закрепления путей из конфига: `"<ip>" → "direct"|"server"|"relay:<hex>"`.
+    pub pinned_paths: BTreeMap<String, String>,
     /// История скорости трафика (байт/с) для спарклайна.
     pub rx_hist: Vec<u64>,
     pub tx_hist: Vec<u64>,
@@ -496,6 +528,10 @@ impl App {
             groups: Vec::new(),
             friends: Vec::new(),
             peers: Vec::new(),
+            mesh_enabled: cfg.mesh.enabled,
+            relay_bytes: 0,
+            mesh_sessions: 0,
+            pinned_paths: cfg.pinned_paths.clone(),
             rx_hist: Vec::new(),
             tx_hist: Vec::new(),
             started: Instant::now(),
@@ -613,6 +649,10 @@ impl App {
         self.connected = meta.connected;
         self.server_addr = meta.server.clone();
         self.server_label = meta.server_label.clone();
+        // Mesh и релей (этап 9): счётчики статус-бара.
+        self.mesh_enabled = meta.mesh_enabled;
+        self.relay_bytes = meta.relay_bytes;
+        self.mesh_sessions = meta.mesh_sessions;
         // В снимке — целые секунды работы: момент старта переставляем, только
         // если он ушёл больше чем на секунду (иначе часы «в сети» дрожат).
         let now = Instant::now();
@@ -645,6 +685,7 @@ impl App {
                     direct: p.direct,
                     rtt_ms: p.rtt_ms,
                     status: p.status.clone(),
+                    path: p.path.clone(),
                 })
                 .collect();
             peers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -724,6 +765,8 @@ impl App {
             self.autojoin = cfg.autojoin.clone();
             // Тема — локальная настройка фронтенда, в снимке её нет.
             self.invisible = cfg.invisible;
+            // Закрепления путей (этап 9): источник правды — конфиг в движке.
+            self.pinned_paths = cfg.pinned_paths.clone();
         }
 
         // Выбор группы: держим актуальный gid, иначе — первая своя.
@@ -1017,8 +1060,46 @@ impl App {
                         }
                     }
                 }
-                // Колонка «путь» и счётчик релея — T5 (TUI этапа 9).
-                E::PathChanged { .. } | E::PathLost { .. } | E::RelayStats { .. } => {}
+                // Путь доставки выбран или потерян (этап 9): строка в логе,
+                // отметка в статусе и сразу в кэше участников — снимок догонит.
+                E::PathChanged {
+                    ip,
+                    name,
+                    path: kind,
+                    rtt_ms,
+                } => {
+                    self.set_peer_path(
+                        ip,
+                        Some(PathSnap {
+                            kind,
+                            rtt_ms: rtt_ms.map(u64::from),
+                        }),
+                    );
+                    let msg = format!("путь до {name}: {}", self.path_label(&kind));
+                    self.log(MsgKind::Info, msg.clone());
+                    self.status_msg = msg.clone();
+                    // В истории демона — только лог: тосты о давних сменах
+                    // пути всплывали бы пачкой при подключении.
+                    if !self.replaying {
+                        let level = match kind {
+                            PathKind::Direct => MsgKind::Ok,
+                            _ => MsgKind::Warn,
+                        };
+                        self.toast(level, msg);
+                    }
+                }
+                E::PathLost { ip, name } => {
+                    self.set_peer_path(ip, None);
+                    let msg = format!("путь до {name} потерян");
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.status_msg = msg.clone();
+                    if !self.replaying {
+                        self.toast(MsgKind::Warn, msg);
+                    }
+                }
+                // Байты релея приходят и в снимке: обновляем счётчик сразу,
+                // чтобы статус-бар не отставал на тик.
+                E::RelayStats { bytes_total, .. } => self.relay_bytes = bytes_total,
                 E::Error(e) => {
                     self.log(MsgKind::Error, e.clone());
                     self.toast(MsgKind::Error, e);
@@ -1474,7 +1555,7 @@ impl App {
             KeyCode::Char('a') => self.open_add_friend(),
             KeyCode::Char('d') => self.open_del_friend(),
             KeyCode::Char('c') => self.copy_context(),
-            KeyCode::Char('p') => self.stack.push(Popup::Profile),
+            KeyCode::Char('p') => self.open_profile_or_path(),
             KeyCode::Char('o') => self.reopen_invites(),
             KeyCode::Char('m') => {
                 if let Some(cmd) = self.open_admin() {
@@ -1838,7 +1919,113 @@ impl App {
                     self.toast(MsgKind::Info, format!("входим в группу {gid}"));
                 }
             }
-            Focus::Peers | Focus::Log => {}
+            Focus::Peers => {
+                // Карточка участника: путь доставки, закрепление, реле.
+                if let Some(p) = self.selected_peer() {
+                    let pubkey = p.pubkey;
+                    self.stack.push(Popup::PeerCard(PeerCardPopup { pubkey }));
+                }
+            }
+            Focus::Log => {}
+        }
+    }
+
+    // ---------- пути доставки (этап 9) ----------
+
+    /// Имя пира по ключу: текущая группа, другие группы, иначе — первые
+    /// 6 hex-символов ключа (реле может быть ещё не в списке участников).
+    pub fn peer_name_or_short(&self, pk: &[u8; 32]) -> String {
+        let named = self.peers.iter().find(|p| p.pubkey == *pk).or_else(|| {
+            self.groups
+                .iter()
+                .flat_map(|g| g.peers.iter())
+                .find(|p| p.pubkey == *pk)
+        });
+        match named {
+            Some(p) => p.name.clone(),
+            None => proto::hex_of(pk).chars().take(6).collect(),
+        }
+    }
+
+    /// Метка пути для лога/статуса: «прямой», «сервер», «через <реле>».
+    pub fn path_label(&self, kind: &PathKind) -> String {
+        match kind {
+            PathKind::Direct => "прямой".into(),
+            PathKind::Server => "сервер".into(),
+            PathKind::PeerRelay { via } => format!("через {}", self.peer_name_or_short(via)),
+        }
+    }
+
+    /// Путь до участника в кэше (таблица участников и группы) — чтобы
+    /// событие применилось, не дожидаясь снимка.
+    fn set_peer_path(&mut self, ip: u32, path: Option<PathSnap>) {
+        for p in self.peers.iter_mut().filter(|p| p.ip == ip) {
+            p.path = path.clone();
+        }
+        for p in self
+            .groups
+            .iter_mut()
+            .flat_map(|g| g.peers.iter_mut())
+            .filter(|p| p.ip == ip)
+        {
+            p.path = path.clone();
+        }
+    }
+
+    /// «p»: в таблице участников — выбор пути до выбранного пира, иначе профиль.
+    fn open_profile_or_path(&mut self) {
+        match self.sel_peer {
+            Some(pk) if self.focus == Focus::Peers && self.selected_peer().is_some() => {
+                self.open_path_pin(pk)
+            }
+            _ => self.stack.push(Popup::Profile),
+        }
+    }
+
+    /// Окно выбора пути до участника `pubkey` (из таблицы или из карточки).
+    /// Открывается, только если участник есть в текущей группе.
+    fn open_path_pin(&mut self, pubkey: [u8; 32]) {
+        let Some(p) = self.peers.iter().find(|p| p.pubkey == pubkey) else {
+            return;
+        };
+        let (name, ip) = (p.name.clone(), p.ip);
+        // Реле: выбранное сейчас в пути, иначе первый подходящий участник
+        // группы. Нет реле — вариант «3» только сообщит об этом.
+        let relay = match p.path.as_ref().map(|x| x.kind) {
+            Some(PathKind::PeerRelay { via }) => Some(via),
+            _ => self.relay_candidate(&pubkey),
+        };
+        self.stack.push(Popup::PathPin(PathPinPopup {
+            pubkey,
+            name,
+            ip,
+            relay,
+        }));
+    }
+
+    /// Первый участник текущей группы, годный в реле: не цель, онлайн — вперёд.
+    fn relay_candidate(&self, target: &[u8; 32]) -> Option<[u8; 32]> {
+        self.peers
+            .iter()
+            .find(|p| p.pubkey != *target && p.online)
+            .or_else(|| self.peers.iter().find(|p| p.pubkey != *target))
+            .map(|p| p.pubkey)
+    }
+
+    /// Закрепить путь до `ip`; закрепление запоминаем сразу — снимок догонит.
+    fn pin_path(&mut self, eng: &dyn EngineApi, ip: u32, kind: PathKind) {
+        let what = self.path_label(&kind);
+        if self.send(eng, Cmd::PinPath { ip, path: kind }) {
+            self.pinned_paths.insert(path::ip_key(ip), kind.to_config());
+            self.status_msg = format!("путь закреплён: {what}");
+        }
+    }
+
+    /// Снять закрепление (путь снова выбирает автоматика).
+    fn unpin_path(&mut self, eng: &dyn EngineApi, ip: u32) {
+        if self.send(eng, Cmd::UnpinPath { ip }) {
+            self.pinned_paths.remove(&path::ip_key(ip));
+            self.status_msg = "путь снова автоматический".into();
         }
     }
 
@@ -1933,6 +2120,35 @@ impl App {
                     self.stack.push(Popup::FriendCard(card));
                 }
             }
+            Popup::PeerCard(card) => {
+                // «p» из карточки — тоже выбор пути (Esc вернёт карточку).
+                if let KeyCode::Char('p') = key.code {
+                    let pubkey = card.pubkey;
+                    self.stack.push(Popup::PeerCard(card));
+                    self.open_path_pin(pubkey);
+                }
+            }
+            Popup::PathPin(p) => match key.code {
+                // «0 авто» — снять закрепление, путь снова выбирает движок.
+                KeyCode::Char('0') => self.unpin_path(eng, p.ip),
+                KeyCode::Char('1') => self.pin_path(eng, p.ip, PathKind::Direct),
+                KeyCode::Char('2') => self.pin_path(eng, p.ip, PathKind::Server),
+                KeyCode::Char('3') => match p.relay {
+                    Some(via) => self.pin_path(eng, p.ip, PathKind::PeerRelay { via }),
+                    None => {
+                        // Реле не знаем — команду не шлём, окно оставляем:
+                        // можно выбрать прямой или сервер.
+                        let msg = "нет реле: некому релеить".to_string();
+                        self.log(MsgKind::Warn, msg.clone());
+                        self.status_msg = msg.clone();
+                        self.toast(MsgKind::Warn, msg);
+                        self.stack.push(Popup::PathPin(p));
+                    }
+                },
+                // Esc (и клик мимо окна) — закрыть, ничего не меняя.
+                KeyCode::Esc => {}
+                _ => self.stack.push(Popup::PathPin(p)),
+            },
             Popup::ListPick(mut p) => match key.code {
                 KeyCode::Up => {
                     if !p.items.is_empty() {
@@ -3916,6 +4132,7 @@ mod tests {
                     direct: false,
                     rtt_ms: None,
                     status: String::new(),
+                    path: None,
                 }],
             },
             GroupView {
@@ -4601,6 +4818,189 @@ mod tests {
         assert_eq!(
             v.servers[0].probe.map(|p| p.key_match),
             Some(KeyMatch::Match)
+        );
+    }
+
+    /// Приложение с одной группой и одним участником в таблице; фокус —
+    /// на участниках, выбран bravo.
+    fn path_app() -> App {
+        let peer = PeerView {
+            pubkey: [2; 32],
+            name: "bravo".into(),
+            ip: 0x6442_0103,
+            online: true,
+            direct: true,
+            rtt_ms: Some(7),
+            status: "ok".into(),
+            path: Some(PathSnap {
+                kind: PathKind::Direct,
+                rtt_ms: Some(7),
+            }),
+        };
+        let mut a = app();
+        a.groups = vec![GroupView {
+            gid: 1,
+            name: "gamers".into(),
+            private: false,
+            mine: true,
+            online: 2,
+            total: 2,
+            my_ip: Some(0x6442_0102),
+            owner_is_me: true,
+            peers: vec![peer.clone()],
+        }];
+        a.sel_group = Some(1);
+        a.peers = vec![peer];
+        a.sel_peer = Some([2; 32]);
+        a.focus = Focus::Peers;
+        a
+    }
+
+    #[test]
+    fn путь_окно_по_p_и_закрепление_сервера() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        // «p» при фокусе на участниках — окно пути, а не профиль.
+        a.handle_key(ch('p'), &eng);
+        match a.stack.last() {
+            Some(Popup::PathPin(p)) => {
+                assert_eq!(p.name, "bravo");
+                assert_eq!(p.ip, 0x6442_0103);
+                // В группе только bravo — реле взять неоткуда.
+                assert_eq!(p.relay, None);
+            }
+            _ => panic!("нет окна выбора пути"),
+        }
+        // «2» — закрепить сервер и закрыть окно.
+        a.handle_key(ch('2'), &eng);
+        assert!(a.stack.is_empty(), "окно не закрылось");
+        assert!(matches!(
+            eng.sent().last(),
+            Some(Cmd::PinPath {
+                ip: 0x6442_0103,
+                path: PathKind::Server
+            })
+        ));
+        // Кэш закреплений обновился сразу — карточка покажет «сервер».
+        assert_eq!(
+            a.pinned_paths.get("100.66.1.3").map(String::as_str),
+            Some("server")
+        );
+    }
+
+    #[test]
+    fn путь_окно_ноль_снимает_закрепление() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        a.pinned_paths.insert("100.66.1.3".into(), "server".into());
+        a.handle_key(ch('p'), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
+        a.handle_key(ch('0'), &eng);
+        assert!(a.stack.is_empty(), "окно не закрылось");
+        assert!(matches!(
+            eng.sent().last(),
+            Some(Cmd::UnpinPath { ip: 0x6442_0103 })
+        ));
+        assert!(a.pinned_paths.is_empty(), "закрепление осталось в кэше");
+    }
+
+    #[test]
+    fn путь_окно_реле_шлёт_peerrelay() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        // Второй участник группы — кандидат в реле для bravo.
+        let mut relay_peer = a.peers[0].clone();
+        relay_peer.pubkey = [3; 32];
+        relay_peer.name = "charlie".into();
+        relay_peer.ip = 0x6442_0104;
+        a.peers.push(relay_peer);
+        a.groups[0].peers = a.peers.clone();
+        a.handle_key(ch('p'), &eng);
+        let Some(Popup::PathPin(p)) = a.stack.last() else {
+            panic!("нет окна выбора пути");
+        };
+        assert_eq!(p.relay, Some([3; 32]));
+        a.handle_key(ch('3'), &eng);
+        match eng.sent().last() {
+            Some(Cmd::PinPath {
+                ip,
+                path: PathKind::PeerRelay { via },
+            }) => {
+                assert_eq!(*ip, 0x6442_0103);
+                assert_eq!(*via, [3; 32]);
+            }
+            other => panic!("нет команды закрепления через реле: {other:?}"),
+        }
+        assert!(a.stack.is_empty(), "окно не закрылось");
+    }
+
+    #[test]
+    fn путь_окно_без_реле_не_шлёт_и_профиль_не_сломан() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('3'), &eng);
+        assert!(
+            eng.sent().is_empty(),
+            "без реле команда отправляться не должна"
+        );
+        assert!(
+            a.toasts.iter().any(|t| t.text.contains("нет реле")),
+            "нет сообщения «нет реле»"
+        );
+        // Окно остаётся открытым: можно выбрать прямой или сервер.
+        assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
+        a.handle_key(key(KeyCode::Esc), &eng);
+        assert!(a.stack.is_empty(), "Esc не закрыл окно");
+        assert!(eng.sent().is_empty(), "Esc ничего не шлёт");
+
+        // Фокус не на участниках — «p» по-прежнему открывает профиль.
+        a.focus = Focus::Groups;
+        a.handle_key(ch('p'), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
+        a.stack.clear();
+        // Участники, но никто не выбран — тоже профиль.
+        a.focus = Focus::Peers;
+        a.sel_peer = None;
+        a.handle_key(ch('p'), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
+    }
+
+    #[test]
+    fn событие_пути_обновляет_кэш_и_лог() {
+        let mut a = path_app();
+        a.apply_events(
+            vec![Event::PathChanged {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+                path: PathKind::Server,
+                rtt_ms: Some(48),
+            }],
+            &Snapshot::default(),
+        );
+        // Кэш участника (таблица и группы) — сразу, без ожидания снимка.
+        let path = a.peers[0].path.clone().expect("путь не обновился");
+        assert_eq!(path.kind, PathKind::Server);
+        assert_eq!(path.rtt_ms, Some(48));
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("путь до bravo: сервер")),
+            "нет строки лога о смене пути"
+        );
+        a.apply_events(
+            vec![Event::PathLost {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+            }],
+            &Snapshot::default(),
+        );
+        assert!(a.peers[0].path.is_none(), "потерянный путь остался в кэше");
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("путь до bravo потерян")),
+            "нет строки лога о потере пути"
         );
     }
 }

@@ -66,8 +66,10 @@ const PATHS_EVERY: Duration = Duration::from_secs(10);
 const MESH_EVERY: Duration = Duration::from_secs(1);
 /// `MESH_INFO` серверу: сразу после WELCOME и далее раз в 5 минут (§4.1).
 const MESH_INFO_EVERY: Duration = Duration::from_secs(5 * 60);
-/// Обслуживание DHT (устаревание, сохранение контактов) раз в минуту.
-const DHT_EVERY: Duration = Duration::from_secs(60);
+/// Обслуживание DHT (устаревание, сохранение контактов) раз в 10 секунд:
+/// контакты должны пережить рестарт и мёртвый сервер, но запись файла —
+/// только когда таблица реально изменилась.
+const DHT_EVERY: Duration = Duration::from_secs(10);
 /// Поиск `find_node` для меш-пира не чаще раза в 5 минут.
 const LOOKUP_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Сколько кандидатов-реле пробуем на один кадр (L2).
@@ -871,6 +873,9 @@ pub enum Cmd {
 /// Приёмник исходящих IP-пакетов (см. [`Engine::ip_sink`]).
 pub type IpSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
+/// Ответы `MESH_NODES` из потока приёма → поток движка: (id поиска, контакты).
+type MeshFinds = Arc<Mutex<Vec<(u64, Vec<dht::Contact>)>>>;
+
 /// Всё, что нужно UI от движка.
 pub struct Engine {
     pub groups: Groups,
@@ -1153,7 +1158,7 @@ struct Env {
     /// DHT-таблица контактов (T3).
     dht: Arc<Mutex<dht::Dht>>,
     /// Ответы MESH_NODES из потока приёма → поток движка (там поиски).
-    mesh_finds: Arc<Mutex<Vec<(u64, Vec<dht::Contact>)>>> ,
+    mesh_finds: MeshFinds,
     /// Выбор пути доставки (этап 9): измерения, гистерезис, закрепления.
     paths: Arc<PathTable>,
     /// Пробы серверов (T2).
@@ -2963,9 +2968,7 @@ fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
     let due = env.dht.lock().unwrap().ping_due(now_ms);
     if !due.is_empty() {
         let w = mesh_world(env);
-        let check = GroupCheck {
-            groups: &w.groups,
-        };
+        let check = GroupCheck { groups: &w.groups };
         let ctx = mesh::MeshCtx {
             me: &env.identity,
             my_caps: my_mesh_caps(env),
@@ -3044,9 +3047,7 @@ fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
     if now.duration_since(st.last_route_probe) >= PATHS_EVERY {
         st.last_route_probe = now;
         let w = mesh_world(env);
-        let check = GroupCheck {
-            groups: &w.groups,
-        };
+        let check = GroupCheck { groups: &w.groups };
         let ctx = mesh::MeshCtx {
             me: &env.identity,
             my_caps: my_mesh_caps(env),
@@ -3080,9 +3081,7 @@ fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
     }
     // 7. Сессии: рукопожатия, пинги, таймауты, повторы forward.
     let w = mesh_world(env);
-    let check = GroupCheck {
-        groups: &w.groups,
-    };
+    let check = GroupCheck { groups: &w.groups };
     let ctx = mesh::MeshCtx {
         me: &env.identity,
         my_caps: my_mesh_caps(env),
@@ -3115,15 +3114,9 @@ fn send_find_round(env: &Env, st: &mut State, id: u64) {
         st.lookups.remove(&id);
         return;
     }
-    let target = st
-        .lookups
-        .get(&id)
-        .map(|l| l.target)
-        .expect("поиск есть");
+    let target = st.lookups.get(&id).map(|l| l.target).expect("поиск есть");
     let w = mesh_world(env);
-    let check = GroupCheck {
-        groups: &w.groups,
-    };
+    let check = GroupCheck { groups: &w.groups };
     let ctx = mesh::MeshCtx {
         me: &env.identity,
         my_caps: my_mesh_caps(env),
@@ -3195,8 +3188,7 @@ fn relay_enabled(env: &Env) -> bool {
 /// Бюджет релея на пира за окно [`mesh::RELAY_WINDOW_MS`]: кбит/с → байт.
 fn relay_budget(env: &Env) -> u64 {
     let kbps = u64::from(env.cfg.lock().unwrap().mesh.relay_budget_kbps);
-    kbps
-        .saturating_mul(125)
+    kbps.saturating_mul(125)
         .saturating_mul(mesh::RELAY_WINDOW_MS / 1000)
 }
 
@@ -3289,9 +3281,7 @@ fn mesh_world(env: &Env) -> MeshWorld {
 /// исполнить результат (отправки, DHT, ACK/NACK, события).
 fn handle_mesh_frame(env: &Env, src: SocketAddr, typ: u8, body: &[u8]) {
     let w = mesh_world(env);
-    let check = GroupCheck {
-        groups: &w.groups,
-    };
+    let check = GroupCheck { groups: &w.groups };
     let ctx = mesh::MeshCtx {
         me: &env.identity,
         my_caps: my_mesh_caps(env),
@@ -3365,7 +3355,10 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
         match e {
             mesh::MeshEvent::Up { ed, addr, rtt_ms } => {
                 if debug() {
-                    eprintln!("[mesh] сессия с {} ({addr}): {rtt_ms:?} мс", proto::hex_of(&ed));
+                    eprintln!(
+                        "[mesh] сессия с {} ({addr}): {rtt_ms:?} мс",
+                        proto::hex_of(&ed)
+                    );
                 }
             }
             mesh::MeshEvent::Down { ed, reason } => {
@@ -3429,6 +3422,15 @@ fn ip_of_ed(env: &Env, ed: &[u8; 32]) -> Option<u32> {
         .map(|p| p.ip)
 }
 
+/// Пересчитать путь одного получателя и разослать изменения событиями
+/// (сразу после ручного закрепления/открепления, §3.6).
+fn recalc_path_now(env: &Env, ip: u32) {
+    let connected = env.meta.lock().unwrap().connected;
+    for change in env.paths.recalc_one(ip, uptime_ms(env), connected) {
+        emit_path_change(env, change);
+    }
+}
+
 /// Событие смены пути — из [`path::PathChange`].
 fn emit_path_change(env: &Env, change: path::PathChange) {
     match change {
@@ -3469,19 +3471,16 @@ fn try_relay(env: &Env, dst: u32, dst_ed: [u8; 32], inner: &[u8]) -> bool {
     if let Some(via) = env.paths.current(dst).and_then(|k| match k {
         PathKind::PeerRelay { via } => Some(via),
         _ => None,
-    }) {
-        if let Some(c) = w.contacts.iter().find(|c| c.ed == via) {
-            cands.push(c.clone());
-        }
+    }) && let Some(c) = w.contacts.iter().find(|c| c.ed == via)
+    {
+        cands.push(c.clone());
     }
     for c in mesh::relay_candidates(&env.dht.lock().unwrap(), &dst_ed, RELAY_TRIES) {
         if !cands.iter().any(|x| x.ed == c.ed) && c.ed != dst_ed {
             cands.push(c);
         }
     }
-    let check = GroupCheck {
-        groups: &w.groups,
-    };
+    let check = GroupCheck { groups: &w.groups };
     let ctx = mesh::MeshCtx {
         me: &env.identity,
         my_caps: my_mesh_caps(env),
@@ -3859,6 +3858,9 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
                 c.pinned_paths.insert(path::ip_key(ip), path.to_config());
             });
             env.paths.set_pin(ip, Some(path));
+            // Пересчёт сразу: закрепление сильнее автоматики и не ждёт
+            // десятисекундного тика (пользователь ждёт эффекта от нажатия).
+            recalc_path_now(env, ip);
             env.emit(Event::Notice(format!(
                 "путь до {} закреплён: {}",
                 proto::ip_str(ip),
@@ -3870,6 +3872,7 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
                 c.pinned_paths.remove(&path::ip_key(ip));
             });
             env.paths.set_pin(ip, None);
+            recalc_path_now(env, ip);
             env.emit(Event::Notice(format!(
                 "закрепление пути до {} снято",
                 proto::ip_str(ip)
@@ -3878,6 +3881,11 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         Cmd::SetRelayEnabled(on) => {
             env.update_cfg(|c| c.mesh.relay_enabled = on);
             env.paths.set_relay_enabled(on);
+            // Снятие/включение L2 меняет набор путей — пересчитать сразу.
+            let connected = env.meta.lock().unwrap().connected;
+            for change in env.paths.recalc(uptime_ms(env), connected) {
+                emit_path_change(env, change);
+            }
             env.emit(Event::Notice(if on {
                 "релей через пиров включён".into()
             } else {
@@ -4430,12 +4438,7 @@ enum FrameVerdict {
 /// Приём фрейма группы (раздел 7, правила 1–6). `relayed` — кадр пришёл
 /// через пира-релея (`MESH_FORWARD`): прямой адрес при этом не записывается,
 /// PING/PUNCH не отвечаются (L2 — только данные).
-fn handle_group_frame(
-    env: &Env,
-    src: SocketAddr,
-    datagram: &[u8],
-    relayed: bool,
-) -> FrameVerdict {
+fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool) -> FrameVerdict {
     env.stats.rx_pkts.fetch_add(1, Ordering::Relaxed);
     env.stats
         .rx_bytes

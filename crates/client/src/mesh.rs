@@ -90,8 +90,12 @@ pub struct MeshSess {
     pub addr: SocketAddr,
     /// Статический x-ключ пира (для DHT/контактов).
     pub x: [u8; 32],
+    /// Наш эфемерный ключ этой сессии (tie-break одновременных рукопожатий).
+    my_eph: [u8; 32],
     /// Эфемерный ключ пира (для отсева повторного HELLO).
     pub peer_eph: [u8; 32],
+    /// Когда сессия установлена (мс): свежая сессия не заменяется гонкой.
+    since_ms: u64,
     keys: MeshKeys,
     initiator: bool,
     tx: u64,
@@ -107,10 +111,12 @@ pub struct MeshSess {
 }
 
 impl MeshSess {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ed: [u8; 32],
         addr: SocketAddr,
         x: [u8; 32],
+        my_eph: [u8; 32],
         peer_eph: [u8; 32],
         shared: &[u8; 32],
         initiator: bool,
@@ -121,7 +127,9 @@ impl MeshSess {
             ed,
             addr,
             x,
+            my_eph,
             peer_eph,
+            since_ms: now_ms,
             keys: mesh::mesh_keys(shared),
             initiator,
             tx: 0,
@@ -463,11 +471,7 @@ impl MeshState {
 
     /// Начать рукопожатие с контактом (только `caps::MESH`). `None` — уже
     /// есть сессия, ждём ответа или недавно пробовали (анти-спам).
-    pub fn handshake(
-        &mut self,
-        ctx: &MeshCtx,
-        peer: &Contact,
-    ) -> Option<(SocketAddr, Vec<u8>)> {
+    pub fn handshake(&mut self, ctx: &MeshCtx, peer: &Contact) -> Option<(SocketAddr, Vec<u8>)> {
         if !self.enabled() || !caps::has(peer.caps, caps::MESH) || !ctx.member(&peer.ed) {
             return None;
         }
@@ -501,7 +505,12 @@ impl MeshState {
 
     /// Обработать `MESH_HELLO`: проверить якорь/свежесть/подпись, ответить
     /// ACK и поставить сессию. `None` — кадр отвергнут.
-    fn on_hello(&mut self, ctx: &MeshCtx, src: SocketAddr, body: &[u8]) -> Option<(SocketAddr, Vec<u8>)> {
+    fn on_hello(
+        &mut self,
+        ctx: &MeshCtx,
+        src: SocketAddr,
+        body: &[u8],
+    ) -> Option<(SocketAddr, Vec<u8>)> {
         if !self.enabled() {
             return None;
         }
@@ -521,12 +530,19 @@ impl MeshState {
         // «случайный» (иначе запоздавший ACK прошлой попытки не отличить).
         let ack = MeshHello::new(ctx.me, eph.public(), hello.nonce, ctx.now_ms, ctx.my_caps);
         let peer_addr = src;
-        let x = ctx
-            .contact(&hello.ed)
-            .map(|c| c.x)
-            .unwrap_or([0u8; 32]);
+        let x = ctx.contact(&hello.ed).map(|c| c.x).unwrap_or([0u8; 32]);
         let caps = hello.flags;
-        self.install(hello.ed, peer_addr, x, hello.eph_x, &shared, false, caps, ctx.now_ms);
+        self.install(
+            hello.ed,
+            peer_addr,
+            x,
+            eph.public(),
+            hello.eph_x,
+            &shared,
+            false,
+            caps,
+            ctx.now_ms,
+        );
         // Повторный HELLO с тем же eph_x — потерянный ACK: отвечаем ещё раз,
         // но только что установленной сессией (ключи уже выведены).
         Some((peer_addr, ack.to_frame(mesh::MESH_HELLO_ACK)))
@@ -556,10 +572,13 @@ impl MeshState {
             return false;
         };
         let rtt = ctx.now_ms.saturating_sub(pending.at_ms) as u32;
+        let my_eph = pending.eph.public();
         self.pending_hs.remove(&ack.ed);
         let x = ctx.contact(&ack.ed).map(|c| c.x).unwrap_or([0u8; 32]);
         let caps = ack.flags;
-        self.install(ack.ed, src, x, ack.eph_x, &shared, true, caps, ctx.now_ms);
+        self.install(
+            ack.ed, src, x, my_eph, ack.eph_x, &shared, true, caps, ctx.now_ms,
+        );
         if let Some(s) = self.sessions.get_mut(&ack.ed) {
             s.rtt_ms = Some(rtt);
         }
@@ -572,17 +591,31 @@ impl MeshState {
         ed: [u8; 32],
         addr: SocketAddr,
         x: [u8; 32],
+        my_eph: [u8; 32],
         peer_eph: [u8; 32],
         shared: &[u8; 32],
         initiator: bool,
         caps: u8,
         now_ms: u64,
     ) {
+        // Одновременное рукопожатие (оба начали): сессии несовместимы.
+        // Оставляем одну и ту же с обеих сторон — по лексикографическому
+        // максимуму пары «мой eph, eph пира»: сравнение одинаково у обоих.
+        if let Some(old) = self.sessions.get(&ed)
+            && now_ms.saturating_sub(old.since_ms) < HANDSHAKE_TTL_MS
+        {
+            let old_pair = pair(old.my_eph, old.peer_eph);
+            let new_pair = pair(my_eph, peer_eph);
+            if old_pair >= new_pair {
+                return;
+            }
+        }
         self.sessions.insert(
             ed,
-            MeshSess::new(ed, addr, x, peer_eph, shared, initiator, caps, now_ms),
+            MeshSess::new(
+                ed, addr, x, my_eph, peer_eph, shared, initiator, caps, now_ms,
+            ),
         );
-        self.pending_hs.remove(&ed);
     }
 
     // ---------- приём кадров ----------
@@ -637,7 +670,12 @@ impl MeshState {
                 };
                 self.send_rpc(out, &ed, &pong, ctx.now_ms);
             }
-            Rpc::Pong { id, ts_ms, load: _, caps: c } => {
+            Rpc::Pong {
+                id,
+                ts_ms,
+                load: _,
+                caps: c,
+            } => {
                 self.pings.remove(&id);
                 let rtt = ctx.now_ms.saturating_sub(ts_ms).min(u32::MAX as u64) as u32;
                 if let Some(s) = self.sessions.get_mut(&ed) {
@@ -659,7 +697,7 @@ impl MeshState {
                         rtt_ms: 0,
                     })
                 } else {
-                    ctx.contact(&target).map(|c| node_of(c))
+                    ctx.contact(&target).map(node_of)
                 };
                 let reply = Rpc::Contact { target, node };
                 self.send_rpc(out, &ed, &reply, ctx.now_ms);
@@ -788,10 +826,7 @@ impl MeshState {
             }
             Rpc::Bye => {
                 self.sessions.remove(&ed);
-                out.events.push(MeshEvent::Down {
-                    ed,
-                    reason: "bye",
-                });
+                out.events.push(MeshEvent::Down { ed, reason: "bye" });
             }
         }
     }
@@ -874,10 +909,7 @@ impl MeshState {
             .err()
             .unwrap_or(0);
         if refused != 0 {
-            let nack = Rpc::ForwardNack {
-                seq,
-                code: refused,
-            };
+            let nack = Rpc::ForwardNack { seq, code: refused };
             self.send_rpc(out, &from_ed, &nack, now);
         }
     }
@@ -1089,9 +1121,7 @@ impl MeshState {
                 if now_ms.saturating_sub(at) >= PING_TIMEOUT_MS {
                     dead.push((*ed, "нет PONG"));
                 }
-            } else if now_ms.saturating_sub(s.last_tx_ms) >= PING_EVERY_MS
-                || s.rtt_ms.is_none()
-            {
+            } else if now_ms.saturating_sub(s.last_tx_ms) >= PING_EVERY_MS || s.rtt_ms.is_none() {
                 ping_now.push(*ed);
             }
         }
@@ -1103,10 +1133,7 @@ impl MeshState {
             let Some(s) = self.sessions.get_mut(&ed) else {
                 continue;
             };
-            let rpc = Rpc::Ping {
-                id,
-                ts_ms: now_ms,
-            };
+            let rpc = Rpc::Ping { id, ts_ms: now_ms };
             let frame = s.seal(&rpc, now_ms);
             let addr = s.addr;
             s.ping = Some((id, now_ms));
@@ -1115,7 +1142,8 @@ impl MeshState {
         }
         for (ed, reason) in dead {
             self.sessions.remove(&ed);
-            self.forwards.retain(|_, f| f.to != ed && f.prev != Some(ed));
+            self.forwards
+                .retain(|_, f| f.to != ed && f.prev != Some(ed));
             out.events.push(MeshEvent::Down { ed, reason });
         }
         // Просроченные ожидания RPC — не копим.
@@ -1144,7 +1172,8 @@ impl MeshState {
                     let nack = Rpc::ForwardNack { seq, code: c };
                     self.send_rpc(&mut out, &prev, &nack, now);
                 }
-                out.events.push(MeshEvent::ForwardFailed { dst_ed, code: c });
+                out.events
+                    .push(MeshEvent::ForwardFailed { dst_ed, code: c });
             }
         }
         out
@@ -1180,7 +1209,10 @@ impl MeshState {
             return None;
         }
         let id = self.next_id();
-        let rpc = Rpc::Route { id, target: target_ed };
+        let rpc = Rpc::Route {
+            id,
+            target: target_ed,
+        };
         let s = self.sessions.get_mut(via)?;
         let frame = s.seal(&rpc, ctx.now_ms);
         let to = s.addr;
@@ -1192,11 +1224,7 @@ impl MeshState {
     }
 
     /// PING конкретному пиру (например, при смене адреса).
-    pub fn ping_peer(
-        &mut self,
-        ctx: &MeshCtx,
-        ed: &[u8; 32],
-    ) -> Option<(SocketAddr, Vec<u8>)> {
+    pub fn ping_peer(&mut self, ctx: &MeshCtx, ed: &[u8; 32]) -> Option<(SocketAddr, Vec<u8>)> {
         let id = self.next_id();
         let rpc = Rpc::Ping {
             id,
@@ -1264,7 +1292,6 @@ impl MeshState {
             dht.add_group_peer(s.ed, s.x, s.addr, s.caps | caps::MESH, seen);
         }
     }
-
 }
 
 /// `MESH_SEED` от сервера: убрать свой и нулевой ed (в таблицу они не годятся).
@@ -1294,6 +1321,11 @@ pub fn forward_seq(inner: &[u8]) -> u64 {
     u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
 }
 
+/// Упорядоченная пара эфемерных ключей сессии (tie-break рукопожатий).
+fn pair(a: [u8; 32], b: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
 fn random_nonce() -> [u8; mesh::MESH_NONCE_LEN] {
     use rand::Rng;
     let mut n = [0u8; mesh::MESH_NONCE_LEN];
@@ -1320,8 +1352,6 @@ pub fn relay_candidates(dht: &Dht, dst_ed: &[u8; 32], n: usize) -> Vec<Contact> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const IP: u32 = 0x6442_0002;
 
     struct Peer {
         id: proto::Identity,
@@ -1441,6 +1471,48 @@ mod tests {
     }
 
     #[test]
+    fn одновременное_рукопожатие_даёт_совместимые_сессии() {
+        // Оба пира начинают рукопожатие в один тик (типичный случай: mesh
+        // поднимается сразу после GROUP_STATE с обеих сторон). Пары
+        // эфемерных ключей разные, и без детерминированного выбора сессии
+        // стороны остались бы с несовместимыми ключами (PING без PONG).
+        let mut a = peer(4020);
+        let mut b = peer(4021);
+        let ca = [contact(&b)];
+        let ma = [b.id.ed_pub()];
+        let cb = [contact(&a)];
+        let mb = [a.id.ed_pub()];
+        let now = 1_000;
+        let a_ctx = ctx(&a.id, &ca, &ma, now);
+        let b_ctx = ctx(&b.id, &cb, &mb, now);
+        let (_, ha) = a.st.handshake(&a_ctx, &contact(&b)).expect("a начал");
+        let (_, hb) = b.st.handshake(&b_ctx, &contact(&a)).expect("b начал");
+        // Перекрёстный обмен: b получает HELLO_a, a получает HELLO_b.
+        let (typ, body) = proto::split_frame(&ha).unwrap();
+        let out_b = b.st.on_frame(&b_ctx, a.addr, typ, body);
+        assert_eq!(out_b.sends.len(), 1, "b ответил ACK на HELLO_a");
+        let (typ, body) = proto::split_frame(&hb).unwrap();
+        let out_a = a.st.on_frame(&a_ctx, b.addr, typ, body);
+        assert_eq!(out_a.sends.len(), 1, "a ответил ACK на HELLO_b");
+        // Теперь каждый получает ACK на свою попытку.
+        let (typ, body) = proto::split_frame(&out_b.sends[0].1).unwrap();
+        a.st.on_frame(&a_ctx, b.addr, typ, body);
+        let (typ, body) = proto::split_frame(&out_a.sends[0].1).unwrap();
+        b.st.on_frame(&b_ctx, a.addr, typ, body);
+        assert!(a.st.session(&b.id.ed_pub()).is_some());
+        assert!(b.st.session(&a.id.ed_pub()).is_some());
+        // Ключи совместимы: PING доходит и получает PONG.
+        let (to, ping) = a.st.ping_peer(&a_ctx, &b.id.ed_pub()).expect("ping");
+        assert_eq!(to, b.addr);
+        let (typ, body) = proto::split_frame(&ping).unwrap();
+        let out = b.st.on_frame(&b_ctx, a.addr, typ, body);
+        assert_eq!(out.sends.len(), 1, "PONG: ключи сессии совпали");
+        let (typ, body) = proto::split_frame(&out.sends[0].1).unwrap();
+        let out = a.st.on_frame(&a_ctx, b.addr, typ, body);
+        assert!(matches!(out.events.first(), Some(MeshEvent::Rtt { .. })));
+    }
+
+    #[test]
     fn чужой_ed_и_подпись_отвергаются() {
         let mut a = peer(4001);
         let b = peer(4002);
@@ -1459,7 +1531,11 @@ mod tests {
         );
         let frame = hello.to_frame(mesh::MESH_HELLO);
         let (typ, body) = proto::split_frame(&frame).unwrap();
-        assert!(a.st.on_frame(&a_ctx, stranger.addr, typ, body).sends.is_empty());
+        assert!(
+            a.st.on_frame(&a_ctx, stranger.addr, typ, body)
+                .sends
+                .is_empty()
+        );
         assert!(a.st.session(&stranger.id.ed_pub()).is_none());
         // Свой ed, но битая подпись.
         let mut bad = hello;
@@ -1498,14 +1574,25 @@ mod tests {
         assert!(a.st.session(&b.id.ed_pub()).is_some());
         // ACK с чужим nonce (не эхо нашей попытки) — отказ.
         let mut a2 = peer(4005);
-        let (_, frame) = a2.st.handshake(&ctx(&a2.id, &ca, &ma, now), &contact(&b)).unwrap();
+        let (_, frame) = a2
+            .st
+            .handshake(&ctx(&a2.id, &ca, &ma, now), &contact(&b))
+            .unwrap();
         let (typ, body) = proto::split_frame(&frame).unwrap();
         b.st.on_frame(&b_ctx, a.addr, typ, body);
         let eph = EphemeralKey::generate();
-        let wrong = MeshHello::new(&b.id, eph.public(), [0xAA; mesh::MESH_NONCE_LEN], now, caps::MESH);
+        let wrong = MeshHello::new(
+            &b.id,
+            eph.public(),
+            [0xAA; mesh::MESH_NONCE_LEN],
+            now,
+            caps::MESH,
+        );
         let fr1 = wrong.to_frame(mesh::MESH_HELLO_ACK);
         let (typ, body) = proto::split_frame(&fr1).unwrap();
-        let out = a2.st.on_frame(&ctx(&a2.id, &ca, &ma, now), b.addr, typ, body);
+        let out = a2
+            .st
+            .on_frame(&ctx(&a2.id, &ca, &ma, now), b.addr, typ, body);
         assert!(out.sends.is_empty());
         assert!(a2.st.session(&b.id.ed_pub()).is_none());
     }
@@ -1551,10 +1638,9 @@ mod tests {
         let cb = [contact(&b), contact(&c)];
         let ma = [b.id.ed_pub(), c.id.ed_pub()];
         let a_ctx = ctx(&a.id, &cb, &ma, now + 10);
-        let (to, frame) = a
-            .st
-            .start_forward(&a_ctx, c.id.ed_pub(), &contact(&b), &inner)
-            .expect("forward");
+        let (to, frame) =
+            a.st.start_forward(&a_ctx, c.id.ed_pub(), &contact(&b), &inner)
+                .expect("forward");
         assert_eq!(to, b.addr);
         // b принимает: реле — пересылает c, ставит pending.
         let ca = [contact(&a), contact(&c)];
@@ -1578,7 +1664,8 @@ mod tests {
         let (to, ack) = c.st.delivery_result(now + 30, &r, true, 0).expect("ack");
         assert_eq!(to, b.addr);
         let (typ, body) = proto::split_frame(&ack).unwrap();
-        let out = b.st.on_frame(&ctx(&b.id, &ca, &mb, now + 40), c.addr, typ, body);
+        let out =
+            b.st.on_frame(&ctx(&b.id, &ca, &mb, now + 40), c.addr, typ, body);
         assert_eq!(out.sends.len(), 1, "ACK дальше источнику");
         let (typ, body) = proto::split_frame(&out.sends[0].1).unwrap();
         let out = a.st.on_frame(&a_ctx, b.addr, typ, body);
@@ -1625,7 +1712,7 @@ mod tests {
         let out = a.st.on_frame(&ctx_a, b.addr, typ, body);
         assert!(out.deliver.is_empty());
         assert_eq!(out.sends.len(), 1, "NACK источнику");
-        let (typ, body) = proto::split_frame(&out.sends[0].1).unwrap();
+        let (typ, _body) = proto::split_frame(&out.sends[0].1).unwrap();
         assert_eq!(typ, mesh::MESH_FORWARD_NACK);
         // Петля: мы уже в visited.
         let mut f2 = f.clone();
@@ -1635,7 +1722,7 @@ mod tests {
         let (typ, body) = proto::split_frame(&fr101).unwrap();
         let out = a.st.on_frame(&ctx_a, b.addr, typ, body);
         assert_eq!(out.sends.len(), 1);
-        let (typ, body) = proto::split_frame(&out.sends[0].1).unwrap();
+        let (typ, _body) = proto::split_frame(&out.sends[0].1).unwrap();
         assert_eq!(typ, mesh::MESH_FORWARD_NACK);
         // Нет маршрута до цели (цель неизвестна реле) — NACK с NO_ROUTE.
         let unknown = [0x77u8; 32];
@@ -1676,7 +1763,6 @@ mod tests {
         handshake(&mut a, &mut b, now);
         let ca = [contact(&b)];
         let ma = [b.id.ed_pub()];
-        let a_ctx = ctx(&a.id, &ca, &ma, now + 10);
         // inner — не кадр TNL2: кодирование forward не пройдёт, а разбор
         // отбросит кадр целиком.
         let f = MeshForward {
@@ -1688,27 +1774,30 @@ mod tests {
         };
         assert!(f.to_frame().is_err());
         // Битый inner в уже готовом кадре — MeshForward::decode откажет.
-        let frame = proto::plain_frame(
-            mesh::MESH_FORWARD,
-            &{
-                let mut v = Vec::new();
-                proto::put_pub(&mut v, &b.id.ed_pub());
-                proto::put_pub(&mut v, &a.id.ed_pub());
-                v.push(0);
-                v.push(0);
-                proto::put_u16(&mut v, 4);
-                v.extend_from_slice(b"junk");
-                v
-            },
-        );
+        let frame = proto::plain_frame(mesh::MESH_FORWARD, &{
+            let mut v = Vec::new();
+            proto::put_pub(&mut v, &b.id.ed_pub());
+            proto::put_pub(&mut v, &a.id.ed_pub());
+            v.push(0);
+            v.push(0);
+            proto::put_u16(&mut v, 4);
+            v.extend_from_slice(b"junk");
+            v
+        });
         let (typ, body) = proto::split_frame(&frame).unwrap();
-        let out = b.st.on_frame(&ctx(&b.id, &ca, &ma, now + 20), a.addr, typ, body);
+        let out =
+            b.st.on_frame(&ctx(&b.id, &ca, &ma, now + 20), a.addr, typ, body);
         assert!(out.deliver.is_empty());
         assert_eq!(b.st.stats().dropped, 1);
         // Слишком длинный inner — отказ на отправке (код BAD).
         let big = vec![0u8; MAX_FORWARD_INNER + 1];
         assert_eq!(
-            b.st.start_forward(&ctx(&b.id, &ca, &ma, now), a.id.ed_pub(), &contact(&a), &big),
+            b.st.start_forward(
+                &ctx(&b.id, &ca, &ma, now),
+                a.id.ed_pub(),
+                &contact(&a),
+                &big
+            ),
             Err(code::BAD)
         );
     }
@@ -1750,6 +1839,35 @@ mod tests {
     }
 
     #[test]
+    fn лимит_восьми_реле_пиров() {
+        let me = proto::Identity::generate();
+        let peer = peer(4010);
+        let ca = [contact(&peer)];
+        let ma = [peer.id.ed_pub()];
+        let c1 = ctx(&me, &ca, &ma, 1_000);
+        let mut st = MeshState::new(true);
+        // Восемь разных пиров — окна заняты.
+        for i in 0..RELAY_PEERS_MAX {
+            let ed = [i as u8 + 1; 32];
+            st.charge(&ed, 1, &c1, 1_000).expect("окно свободно");
+        }
+        assert_eq!(st.stats().relay_peers as usize, RELAY_PEERS_MAX);
+        // Девятый — отказ BUDGET, лимит не растёт.
+        let ninth = [0x99u8; 32];
+        assert_eq!(st.charge(&ninth, 1, &c1, 1_000), Err(code::BUDGET));
+        assert_eq!(st.stats().relay_peers as usize, RELAY_PEERS_MAX);
+        // Через окно старые окна освобождаются — девятый проходит.
+        assert!(
+            st.charge(&ninth, 1, &c1, 1_000 + RELAY_WINDOW_MS * 2 + 1)
+                .is_ok()
+        );
+        // Релей выключен — отказ на входе.
+        let mut off = ctx(&me, &ca, &ma, 1_000);
+        off.relay_enabled = false;
+        assert_eq!(st.charge(&[0xAA; 32], 1, &off, 1_000), Err(code::REJECTED));
+    }
+
+    #[test]
     fn bye_и_таймаут_сессии() {
         let mut a = peer(4001);
         let mut b = peer(4002);
@@ -1769,10 +1887,17 @@ mod tests {
         // не раньше HANDSHAKE_GAP_MS от прошлой попытки.
         handshake(&mut a, &mut b, now + HANDSHAKE_GAP_MS);
         assert!(a.st.session(&b.id.ed_pub()).is_some());
-        let late = ctx(&a.id, &ca, &ma, now + HANDSHAKE_GAP_MS + SESSION_IDLE_MS + 1);
+        let late = ctx(
+            &a.id,
+            &ca,
+            &ma,
+            now + HANDSHAKE_GAP_MS + SESSION_IDLE_MS + 1,
+        );
         let out = a.st.tick(&late);
         assert!(matches!(
-            out.events.iter().find(|e| matches!(e, MeshEvent::Down { .. })),
+            out.events
+                .iter()
+                .find(|e| matches!(e, MeshEvent::Down { .. })),
             Some(MeshEvent::Down { .. })
         ));
     }
@@ -1780,7 +1905,7 @@ mod tests {
     #[test]
     fn отказ_рукопожатия_не_member_и_без_caps() {
         let mut a = peer(4001);
-        let mut b = peer(4002);
+        let b = peer(4002);
         let ca = [Contact {
             caps: caps::RELAY, // без MESH
             ..contact(&b)
@@ -1840,10 +1965,9 @@ mod tests {
         assert_eq!(out.finds[0].0, id);
         assert_eq!(out.finds[0].1[0].ed, contact_c.ed);
         // ROUTE: b знает маршрут к contact_c (по контакту).
-        let (to, frame) = a
-            .st
-            .route_probe(&a_ctx, &b.id.ed_pub(), contact_c.ed, b.addr)
-            .expect("route");
+        let (to, frame) =
+            a.st.route_probe(&a_ctx, &b.id.ed_pub(), contact_c.ed, b.addr)
+                .expect("route");
         assert_eq!(to, b.addr);
         let (typ, body) = proto::split_frame(&frame).unwrap();
         let out = b.st.on_frame(&b_ctx, a.addr, typ, body);
@@ -1856,10 +1980,9 @@ mod tests {
         ));
         // ROUTE к неизвестной цели — RouteFail.
         let unknown = [0x99u8; 32];
-        let (_, frame) = a
-            .st
-            .route_probe(&a_ctx, &b.id.ed_pub(), unknown, b.addr)
-            .unwrap();
+        let (_, frame) =
+            a.st.route_probe(&a_ctx, &b.id.ed_pub(), unknown, b.addr)
+                .unwrap();
         let (typ, body) = proto::split_frame(&frame).unwrap();
         let out = b.st.on_frame(&b_ctx, a.addr, typ, body);
         assert!(out.sends.len() == 1);
@@ -1883,7 +2006,8 @@ mod tests {
         // Кадры в выключенном состоянии не обрабатываются.
         let ca = [contact(&b)];
         let ma = [b.id.ed_pub()];
-        let out = a.st.on_frame(&ctx(&a.id, &ca, &ma, 2_000), b.addr, mesh::MESH_PING, &[]);
+        let out =
+            a.st.on_frame(&ctx(&a.id, &ca, &ma, 2_000), b.addr, mesh::MESH_PING, &[]);
         assert!(out.sends.is_empty() && out.deliver.is_empty());
     }
 

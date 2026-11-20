@@ -590,7 +590,8 @@ struct Session {
     x_pub: Option<[u8; 32]>,
     /// Возможности mesh (`mesh::caps::*`) из MESH_INFO.
     caps: u8,
-    /// Когда приходил MESH_INFO, мс от старта сервера (0 — ни разу).
+    /// Когда приходил MESH_INFO, unix мс (0 — ни разу). По TTL публикация
+    /// перестаёт попадать в MESH_SEED и mesh-секцию GROUP_STATE.
     mesh_last_seen: u64,
 }
 
@@ -1638,6 +1639,16 @@ fn member_info(s: &State, pk: &[u8; 32], m: &Member, viewer: &[u8; 32]) -> Membe
     }
 }
 
+/// Сколько живёт публикация mesh-контакта (`MESH_INFO`) без повтора: клиент
+/// шлёт её раз в 5 минут, а если mesh выключил — сервер перестаёт отдавать
+/// его x-ключ/caps через 15 минут (§3.2: контакт без подтверждения — мёртв).
+const MESH_TTL_MS: u64 = 15 * 60 * 1000;
+
+/// Публикация mesh-контакта сессии жива (MESH_INFO не старше `MESH_TTL_MS`).
+fn mesh_fresh(ses: &Session) -> bool {
+    ses.x_pub.is_some() && unix_ms().saturating_sub(ses.mesh_last_seen) < MESH_TTL_MS
+}
+
 fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
     let mut members: Vec<MemberInfo> = g
         .members
@@ -1653,6 +1664,9 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
         .iter()
         .filter_map(|(pk, m)| {
             let (_, ses) = s.session_of(pk)?;
+            if !mesh_fresh(ses) {
+                return None;
+            }
             let x_pub = ses.x_pub?;
             Some(pl::MeshEntry {
                 ip: m.ip,
@@ -1688,7 +1702,7 @@ fn mesh_seed(s: &State, me: &[u8; 32], limit: usize) -> Vec<pl::MeshSeed> {
         .sessions
         .iter()
         .filter_map(|(addr, ses)| {
-            if ses.ed_pub == *me || ses.invisible {
+            if ses.ed_pub == *me || ses.invisible || !mesh_fresh(ses) {
                 return None;
             }
             let x_pub = ses.x_pub?;
@@ -2534,7 +2548,7 @@ fn handle_mutation(
                 let changed = ses.x_pub != Some(x_pub) || ses.caps != caps;
                 ses.x_pub = Some(x_pub);
                 ses.caps = caps;
-                ses.mesh_last_seen = sh.now_ms();
+                ses.mesh_last_seen = unix_ms();
                 changed
             };
             // Изменился видимый состав (mesh-секция GROUP_STATE) — дельта
@@ -5669,6 +5683,72 @@ mod tests {
         assert_eq!(b.state().members.len(), 2);
         // MESH_SEED — до 16 записей; больше сессий в тесте нет.
         assert!(seed.len() <= payloads::MAX_MESH_SEED);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mesh_ttl_перестаёт_отдавать_контакт() {
+        let (server, dir) = test_server("mesh-ttl");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let st = a.create("ttl", false);
+        let gid = st.gid;
+        let b = Raw::connect(srv, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        // Оба публикуют mesh-контакт.
+        let (ax, bx) = ([0xAAu8; 32], [0xBBu8; 32]);
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.expect(ctrl::MESH_SEED);
+        a.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&ax, proto::mesh::caps::MESH),
+        );
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(seeds.iter().any(|s| s.ed_pub == b.pk && s.x_pub == bx));
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert!(a.state().mesh.iter().any(|e| e.x_pub == bx));
+        // Состарить публикацию B: MESH_INFO не повторялся дольше TTL.
+        {
+            let mut st = server.shared.state.write().unwrap();
+            let ses = st
+                .sessions
+                .values_mut()
+                .find(|s| s.ed_pub == b.pk)
+                .expect("сессия B жива");
+            ses.mesh_last_seen = unix_ms().saturating_sub(MESH_TTL_MS + 1);
+        }
+        // В семени B больше нет, а в mesh-секции его запись пропала.
+        a.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&ax, proto::mesh::caps::MESH),
+        );
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.ed_pub == b.pk),
+            "просроченный контакт остался в MESH_SEED: {seeds:?}"
+        );
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        let mesh = a.state().mesh;
+        assert!(!mesh.iter().any(|e| e.x_pub == bx), "хвост: {mesh:?}");
+        // Своя (A) публикация свежая — остаётся.
+        assert!(mesh.iter().any(|e| e.x_pub == ax));
+        // Новая публикация B оживляет контакт.
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.expect(ctrl::MESH_SEED);
+        a.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&ax, proto::mesh::caps::MESH),
+        );
+        let seeds = payloads::dec_mesh_seed(&a.expect(ctrl::MESH_SEED)).unwrap();
+        assert!(seeds.iter().any(|s| s.ed_pub == b.pk), "контакт не ожил");
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

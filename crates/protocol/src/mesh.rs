@@ -492,9 +492,10 @@ fn read_node(r: &mut Reader) -> Result<Node> {
     let x = r.pub_key()?;
     let caps = r.u8()?;
     let rtt_ms = r.u16()?;
-    let addr = r.str()?.parse().map_err(|_| {
-        anyhow::anyhow!("mesh rpc: адрес контакта не разбирается")
-    })?;
+    let addr = r
+        .str()?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("mesh rpc: адрес контакта не разбирается"))?;
     Ok(Node {
         ed,
         x,
@@ -543,11 +544,7 @@ pub enum Rpc {
         load: u8,
     },
     /// Пути нет: `id u64 | target 32 | code u8`.
-    RouteFail {
-        id: u64,
-        target: [u8; 32],
-        code: u8,
-    },
+    RouteFail { id: u64, target: [u8; 32], code: u8 },
     /// Релей принял кадр: `seq u64`.
     ForwardAck { seq: u64 },
     /// Релей отказал: `seq u64 | code u8`.
@@ -687,7 +684,10 @@ impl Rpc {
             MESH_NODES => {
                 let id = r.u64()?;
                 let n = r.u8()? as usize;
-                ensure!(n <= MAX_RPC_NODES, "mesh rpc: контактов {n} > {MAX_RPC_NODES}");
+                ensure!(
+                    n <= MAX_RPC_NODES,
+                    "mesh rpc: контактов {n} > {MAX_RPC_NODES}"
+                );
                 let mut nodes = Vec::with_capacity(r.capacity_for(n, NODE_MIN));
                 for _ in 0..n {
                     nodes.push(read_node(&mut r)?);
@@ -975,7 +975,13 @@ mod tests {
             },
             Rpc::Nodes {
                 id: 9,
-                nodes: vec![node.clone(), Node { rtt_ms: 0, ..node.clone() }],
+                nodes: vec![
+                    node.clone(),
+                    Node {
+                        rtt_ms: 0,
+                        ..node.clone()
+                    },
+                ],
             },
             Rpc::Route {
                 id: 11,
@@ -1009,7 +1015,10 @@ mod tests {
             );
             // Любая обрезка — ошибка, не паника.
             for n in 0..body.len() {
-                assert!(Rpc::decode(rpc.typ(), &body[..n]).is_err(), "{rpc:?} обрезка {n}");
+                assert!(
+                    Rpc::decode(rpc.typ(), &body[..n]).is_err(),
+                    "{rpc:?} обрезка {n}"
+                );
             }
             // Хвост — ошибка: формат фиксирован.
             let mut tail = body.clone();

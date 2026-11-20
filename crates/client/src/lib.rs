@@ -15,6 +15,8 @@ pub mod ipv6;
 pub mod mesh;
 /// Офлайн-TUI: движка нет — конфиг правится локально, очередь `ui-pending`.
 pub mod offline;
+#[cfg(test)]
+mod mesh_e2e;
 pub mod path;
 /// Проба сервера (PROBE_REQ/RESP) — каркас T2.
 pub mod probe;

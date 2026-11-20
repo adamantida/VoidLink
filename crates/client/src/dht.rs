@@ -268,8 +268,9 @@ impl Dht {
     pub fn set_addr(&mut self, ed: &[u8; 32], addr: SocketAddr, now_ms: u64) -> bool {
         match self.get_mut(ed) {
             Some(c) => {
+                // Тот же адрес — это не «новость»: не обновляем last_seen,
+                // иначе сохранение client.json дёргалось бы каждую секунду.
                 if c.addr == addr {
-                    c.last_seen_ms = c.last_seen_ms.max(now_ms);
                     return false;
                 }
                 c.addr = addr;
@@ -335,7 +336,9 @@ impl Dht {
             let (fa, fb) = (a.fresh(now_ms), b.fresh(now_ms));
             (!fa)
                 .cmp(&!fb)
-                .then_with(|| mesh::x25519_distance(target, &a.ed).cmp(&mesh::x25519_distance(target, &b.ed)))
+                .then_with(|| {
+                    mesh::x25519_distance(target, &a.ed).cmp(&mesh::x25519_distance(target, &b.ed))
+                })
                 .then_with(|| a.ed.cmp(&b.ed))
         });
         v.truncate(n);
@@ -482,11 +485,7 @@ mod tests {
             d.insert(contact(key(k), "203.0.113.1:1", 0));
         }
         // Цель 0x01: ближе всех ed=0x01 (расстояние 0), затем 0x02, 0x10, 0x80.
-        let close: Vec<u8> = d
-            .closest(&key(0x01), 4)
-            .iter()
-            .map(|c| c.ed[0])
-            .collect();
+        let close: Vec<u8> = d.closest(&key(0x01), 4).iter().map(|c| c.ed[0]).collect();
         assert_eq!(close, vec![0x01, 0x02, 0x10, 0x80]);
         // Ограничение n.
         assert_eq!(d.closest(&key(0x01), 2)[0].ed[0], 0x01);
@@ -560,7 +559,11 @@ mod tests {
     fn персистенция_туда_обратно() {
         let me = key(0);
         let mut d = Dht::new(me);
-        let mut c = contact(key(0x40), "203.0.113.4:4000", mesh::caps::MESH | mesh::caps::RELAY);
+        let mut c = contact(
+            key(0x40),
+            "203.0.113.4:4000",
+            mesh::caps::MESH | mesh::caps::RELAY,
+        );
         c.rtt_ms = 33;
         c.last_seen_ms = 1_700_000_000_000;
         d.insert(c.clone());
@@ -606,8 +609,16 @@ mod tests {
         let target = key(0x80);
         // Ближе всех к цели — без RELAY, дальше — с RELAY.
         d.insert(contact(key(0x81), "203.0.113.1:1", mesh::caps::MESH));
-        d.insert(contact(key(0x90), "203.0.113.2:1", mesh::caps::MESH | mesh::caps::RELAY));
-        d.insert(contact(key(0xA0), "203.0.113.3:1", mesh::caps::MESH | mesh::caps::RELAY));
+        d.insert(contact(
+            key(0x90),
+            "203.0.113.2:1",
+            mesh::caps::MESH | mesh::caps::RELAY,
+        ));
+        d.insert(contact(
+            key(0xA0),
+            "203.0.113.3:1",
+            mesh::caps::MESH | mesh::caps::RELAY,
+        ));
         let cand = d.relay_candidates(&target, 3);
         assert_eq!(cand.len(), 2, "без RELAY не кандидат");
         assert_eq!(cand[0].ed[0], 0x90, "сначала ближайший реле");
@@ -615,10 +626,7 @@ mod tests {
         let ed = key(0x90);
         assert!(!d.set_addr(&ed, "203.0.113.2:1".parse().unwrap(), 10));
         assert!(d.set_addr(&ed, "198.51.100.7:1".parse().unwrap(), 10));
-        assert_eq!(
-            d.get(&ed).unwrap().addr,
-            "198.51.100.7:1".parse().unwrap()
-        );
+        assert_eq!(d.get(&ed).unwrap().addr, "198.51.100.7:1".parse().unwrap());
         // Неизвестный контакт — false (таблица не растёт от смены адреса).
         assert!(!d.set_addr(&key(0xEE), "198.51.100.9:1".parse().unwrap(), 10));
         // mark_seen по неизвестному — false, по известному — обновление.
