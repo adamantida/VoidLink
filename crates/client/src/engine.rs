@@ -3408,9 +3408,20 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
 /// Байты релея и число сессий — в снимок состояния (§3.4).
 fn sync_mesh_stats(env: &Env) {
     let st = env.mesh.lock().unwrap().stats();
-    let mut m = env.meta.lock().unwrap();
-    m.relay_bytes = st.relay_bytes;
-    m.mesh_sessions = st.sessions;
+    let changed = {
+        let mut m = env.meta.lock().unwrap();
+        let changed = m.relay_bytes != st.relay_bytes;
+        m.relay_bytes = st.relay_bytes;
+        m.mesh_sessions = st.sessions;
+        changed
+    };
+    // Счётчик изменился — событием (UI показывает «реле N КБ» без опроса).
+    if changed {
+        env.emit(Event::RelayStats {
+            bytes_total: st.relay_bytes,
+            peers: st.relay_peers,
+        });
+    }
 }
 
 /// Адрес оверлея участника по ed-ключу.

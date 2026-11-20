@@ -248,6 +248,8 @@ fn deliver(from: &Node, to: &Node, gid: u32, tag: &str, within: Duration) {
 const T: Duration = Duration::from_secs(10);
 /// Mesh-таймеры движка: шаг 1 с, маршрут через реле — раз в 10 с.
 const MESH_T: Duration = Duration::from_secs(45);
+/// Пересчёт путей — раз в 10 с: ждать выбора надо с запасом на тик.
+const PATHS_T: Duration = Duration::from_secs(25);
 
 /// Три участника одной группы: (a, b, c, gid).
 fn three(server: &tunnel_server::Server) -> (Node, Node, Node, u32) {
@@ -404,7 +406,7 @@ fn e2e_переключение_пути_закреплением() {
     let b_ip = b.my_ip(gid);
     // Прямой канал устанавливается RTT-раундом/трафиком.
     deliver(&a, &b, gid, "pin-warmup", T);
-    wait_until("прямой путь", T, || {
+    wait_until("прямой путь", PATHS_T, || {
         a.eng.paths.current(b_ip) == Some(PathKind::Direct)
     });
     // Закрепление сервера: пин сильнее автоматики.
