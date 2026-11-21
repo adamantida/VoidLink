@@ -2055,10 +2055,7 @@ mod tests {
                     direct: true,
                     rtt_ms: Some(7),
                     status: "ok".into(),
-                    path: Some(PathSnap {
-                        kind: PathKind::Direct,
-                        rtt_ms: Some(7),
-                    }),
+                    path: Some(PathSnap::new(PathKind::Direct, Some(7))),
                 }],
             },
             GroupView {
@@ -2081,10 +2078,7 @@ mod tests {
             direct: true,
             rtt_ms: Some(7),
             status: "ok".into(),
-            path: Some(PathSnap {
-                kind: PathKind::Direct,
-                rtt_ms: Some(7),
-            }),
+            path: Some(PathSnap::new(PathKind::Direct, Some(7))),
         }];
         app.friends = vec![FriendView {
             alias: "bravo".into(),
@@ -2677,18 +2671,12 @@ mod tests {
                 // (ключ реле в списке участников отсутствует — имя по hex).
                 path: match i % 4 {
                     0 => None,
-                    1 => Some(PathSnap {
-                        kind: PathKind::Direct,
-                        rtt_ms: Some(i as u64 * 7),
-                    }),
-                    2 => Some(PathSnap {
-                        kind: PathKind::Server,
-                        rtt_ms: Some(48),
-                    }),
-                    _ => Some(PathSnap {
-                        kind: PathKind::PeerRelay { via: [200 + i; 32] },
-                        rtt_ms: Some(33),
-                    }),
+                    1 => Some(PathSnap::new(PathKind::Direct, Some(i as u64 * 7))),
+                    2 => Some(PathSnap::new(PathKind::Server, Some(48))),
+                    _ => Some(PathSnap::new(
+                        PathKind::PeerRelay { via: [200 + i; 32] },
+                        Some(33),
+                    )),
                 },
             })
             .collect();

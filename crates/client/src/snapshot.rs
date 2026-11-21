@@ -59,17 +59,48 @@ pub struct PeerSnap {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathSnap {
     pub kind: PathKind,
-    /// Измеренный RTT выбранного пути (у сервера может быть неизвестен).
+    /// Измеренный **end-to-end** RTT выбранного пути (issue #15): для
+    /// `server` — полный маршрут мы→сервер→пир, а не плечо до сервера.
+    /// `None` — путь выбран, но ещё не измерен.
     #[serde(default)]
     pub rtt_ms: Option<u64>,
+    /// Плечо «мы→сервер» отдельно от полного RTT (issue #15): только для
+    /// `kind == Server`, чтобы UI мог показать, из чего сложилась цифра.
+    #[serde(default)]
+    pub leg_ms: Option<u64>,
+    /// Джиттер текущего пути (среднее |ΔRTT|), мс (issue #26).
+    #[serde(default)]
+    pub jitter_ms: Option<u32>,
+    /// Потери на текущем пути, промилле (issue #26): 0 — ни одной пробы
+    /// без ответа, 1000 — ни одна не ответила.
+    #[serde(default)]
+    pub loss_pm: Option<u16>,
+    /// Последние замеры RTT текущего пути (спарклайн, issue #26): не больше
+    /// [`crate::path::RTT_HIST_LEN`] значений, старые первыми.
+    #[serde(default)]
+    pub hist: Vec<u16>,
+}
+
+impl PathSnap {
+    /// Путь с известным RTT; метрики jitter/loss/hist (issue #15/#26)
+    /// заполняет движок отдельно, здесь — пустые значения.
+    pub fn new(kind: PathKind, rtt_ms: Option<u64>) -> Self {
+        Self {
+            kind,
+            rtt_ms,
+            leg_ms: None,
+            jitter_ms: None,
+            loss_pm: None,
+            hist: Vec::new(),
+        }
+    }
 }
 
 impl PeerSnap {
     pub fn from_sess(p: &PeerSess, paths: &PathTable, now: Instant) -> Self {
-        let path = paths.current(p.ip).map(|kind| PathSnap {
-            kind,
-            rtt_ms: paths.current_rtt(p.ip).map(u64::from),
-        });
+        let path = paths
+            .current(p.ip)
+            .map(|kind| PathSnap::new(kind, paths.current_rtt(p.ip).map(u64::from)));
         Self {
             pubkey: p.pubkey,
             name: p.name.clone(),
@@ -260,6 +291,12 @@ pub struct StatsSnap {
     pub tx_bytes: u64,
     pub rx_pkts: u64,
     pub tx_pkts: u64,
+    /// Дублированных копий отправлено сверх первой (issue #25).
+    #[serde(default)]
+    pub dup_sent: u64,
+    /// Дубликатов отброшено на выходе (issue #25).
+    #[serde(default)]
+    pub dup_dropped: u64,
 }
 
 impl StatsSnap {
@@ -269,6 +306,8 @@ impl StatsSnap {
             tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
             rx_pkts: s.rx_pkts.load(Ordering::Relaxed),
             tx_pkts: s.tx_pkts.load(Ordering::Relaxed),
+            dup_sent: s.dup_sent.load(Ordering::Relaxed),
+            dup_dropped: s.dup_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -288,6 +327,13 @@ pub struct CfgFriend {
     /// hex pubkey.
     pub pubkey: String,
     pub alias: String,
+    /// Ник с сервера (issue #24): кэш имени из `FRIEND_LIST`; показывается,
+    /// когда ручного алиаса нет.
+    #[serde(default)]
+    pub nick: String,
+    /// Состояние дружбы (issue #24).
+    #[serde(default)]
+    pub state: crate::store::FriendState,
 }
 
 /// Конфиг без identity: имя, статус, серверы, друзья, автовход.
@@ -337,6 +383,8 @@ impl CfgView {
                 .map(|f| CfgFriend {
                     pubkey: f.pubkey.clone(),
                     alias: f.alias.clone(),
+                    nick: f.nick.clone(),
+                    state: f.state,
                 })
                 .collect(),
             autojoin: c.autojoin.clone(),
@@ -370,6 +418,8 @@ impl CfgView {
                 .map(|f| crate::store::StoredFriend {
                     pubkey: f.pubkey.clone(),
                     alias: f.alias.clone(),
+                    nick: f.nick.clone(),
+                    state: f.state,
                 })
                 .collect(),
             autojoin: self.autojoin.clone(),
@@ -417,10 +467,7 @@ mod tests {
                     last_rx_ms_ago: 120,
                     last_direct_ms_ago: None,
                     rtt_ms: Some(33),
-                    path: Some(PathSnap {
-                        kind: PathKind::Direct,
-                        rtt_ms: Some(33),
-                    }),
+                    path: Some(PathSnap::new(PathKind::Direct, Some(33))),
                 }],
             }],
             meta: MetaSnap {
@@ -449,6 +496,8 @@ mod tests {
                 tx_bytes: 20,
                 rx_pkts: 1,
                 tx_pkts: 2,
+                dup_sent: 0,
+                dup_dropped: 0,
             },
             cfg: CfgView {
                 name: "alpha".into(),
@@ -461,6 +510,8 @@ mod tests {
                 friends: vec![CfgFriend {
                     pubkey: "cd".repeat(32),
                     alias: "bravo".into(),
+                    nick: String::new(),
+                    state: crate::store::FriendState::Legacy,
                 }],
                 autojoin: vec![7],
                 invisible: true,
@@ -519,6 +570,7 @@ mod tests {
             friends: vec![StoredFriend {
                 pubkey: "fp".into(),
                 alias: "f".into(),
+                ..Default::default()
             }],
             autojoin: vec![1, 2],
             theme: "dark".into(),

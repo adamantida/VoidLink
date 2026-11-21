@@ -15,12 +15,37 @@ pub const DEFAULT_MTU: usize = 1400;
 pub const MTU_MIN: usize = 576;
 pub const MTU_MAX: usize = 1500;
 
+/// Интервал RTT-проб по умолчанию: 5 с — в пределах 5–10 с из issue #16.
+pub const DEFAULT_RTT_INTERVAL_MS: u64 = 5_000;
+/// Клэмп интервала проб: чаще 2 с — «чаттер», реже 20 с — NAT-маппинг
+/// прямого канала успевает протухнуть (сервер держит сессию 30 с).
+pub const RTT_INTERVAL_MIN_MS: u64 = 2_000;
+pub const RTT_INTERVAL_MAX_MS: u64 = 20_000;
+/// Гистерезис выбора пути: абсолютный выигрыш, мс (issue #17).
+pub const DEFAULT_PATH_HYSTERESIS_MS: u32 = 15;
+pub const PATH_HYSTERESIS_MAX_MS: u32 = 200;
+/// Минимальное время удержания выбранного пути, мс (issue #17).
+pub const DEFAULT_PATH_DWELL_MS: u64 = 10_000;
+pub const PATH_DWELL_MAX_MS: u64 = 120_000;
+
 fn default_true() -> bool {
     true
 }
 
 fn default_mtu() -> usize {
     DEFAULT_MTU
+}
+
+fn default_rtt_interval() -> u64 {
+    DEFAULT_RTT_INTERVAL_MS
+}
+
+fn default_path_hysteresis() -> u32 {
+    DEFAULT_PATH_HYSTERESIS_MS
+}
+
+fn default_path_dwell() -> u64 {
+    DEFAULT_PATH_DWELL_MS
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,6 +107,24 @@ pub struct Config {
     /// "relay:<hex ed25519>"` (§3.6). Сильнее автоматического выбора.
     #[serde(default)]
     pub pinned_paths: BTreeMap<String, String>,
+    /// Интервал RTT-проб пирам, мс (issue #16): 2 с давали постоянный обмен
+    /// 300–600 Б/с при трёх участниках. Читать через [`Config::rtt_interval`].
+    #[serde(default = "default_rtt_interval")]
+    pub rtt_interval_ms: u64,
+    /// Гистерезис выбора пути: насколько новый путь должен быть дешевле
+    /// текущего **в миллисекундах** (issue #17). Читать через
+    /// [`Config::path_hysteresis`].
+    #[serde(default = "default_path_hysteresis")]
+    pub path_hysteresis_ms: u32,
+    /// Сколько держать выбранный путь, прежде чем разрешить переключение
+    /// (issue #17). Читать через [`Config::path_dwell`].
+    #[serde(default = "default_path_dwell")]
+    pub path_dwell_ms: u64,
+    /// Выходы из групп, которые сервер ещё не подтвердил (issue #20):
+    /// повторяются после рестарта, иначе приватная группа пустила бы обратно
+    /// без нового приглашения.
+    #[serde(default)]
+    pub pending_leave: Vec<u32>,
 }
 
 /// Настройки mesh-оверлея (`client.json` → `mesh`). Все поля с `serde(default)`:
@@ -97,6 +140,15 @@ pub struct MeshConfig {
     pub relay_budget_kbps: u32,
     /// Сохранённые DHT-контакты (переживают рестарт при мёртвом сервере).
     pub contacts: Vec<StoredContact>,
+    /// Дублирование маленького latency-sensitive трафика по нескольким путям
+    /// сразу (issue #25). По умолчанию выключено: полоса тратится вдвое.
+    pub duplicate: bool,
+    /// Потолок скорости цели, при которой пакет ещё дублируется, кбит/с.
+    pub duplicate_max_kbps: u32,
+    /// Потолок размера пакета для дублирования, байт.
+    pub duplicate_max_pkt: u16,
+    /// Сколько путей копировать (2 или 3): больше — только хуже для полосы.
+    pub duplicate_paths: u8,
 }
 
 impl Default for MeshConfig {
@@ -106,12 +158,42 @@ impl Default for MeshConfig {
             relay_enabled: true,
             relay_budget_kbps: DEFAULT_RELAY_KBPS,
             contacts: Vec::new(),
+            duplicate: false,
+            duplicate_max_kbps: DEFAULT_DUPLICATE_KBPS,
+            duplicate_max_pkt: DEFAULT_DUPLICATE_PKT,
+            duplicate_paths: DEFAULT_DUPLICATE_PATHS,
         }
     }
 }
 
 /// Лимит реле по умолчанию: 2 МБ/с (§3.4).
 pub const DEFAULT_RELAY_KBPS: u32 = 16_384;
+/// Дублирование (issue #25): потолок скорости цели по умолчанию, кбит/с.
+pub const DEFAULT_DUPLICATE_KBPS: u32 = 256;
+/// Дублирование: потолок размера пакета по умолчанию, байт.
+pub const DEFAULT_DUPLICATE_PKT: u16 = 512;
+/// Дублирование: сколько путей копировать по умолчанию.
+pub const DEFAULT_DUPLICATE_PATHS: u8 = 2;
+/// Дублирование: допустимый диапазон числа путей.
+pub const DUPLICATE_PATHS_MIN: u8 = 2;
+pub const DUPLICATE_PATHS_MAX: u8 = 3;
+
+/// Состояние друга (issue #24): дружба существует только после принятия
+/// заявки, старая односторонняя запись — `Legacy`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FriendState {
+    /// Запись из конфига до появления заявок: живёт локально, пока сервер не
+    /// подтвердит дружбу (`Accepted`).
+    #[default]
+    Legacy,
+    /// Заявка отправлена, ответа ещё нет.
+    PendingOut,
+    /// Заявка пришла от второй стороны.
+    PendingIn,
+    /// Дружба подтверждена взаимно.
+    Accepted,
+}
 
 /// Сохранённый контакт mesh/DHT (`mesh.contacts`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,11 +251,41 @@ impl Default for Config {
             dll: String::new(),
             mesh: MeshConfig::default(),
             pinned_paths: BTreeMap::new(),
+            rtt_interval_ms: DEFAULT_RTT_INTERVAL_MS,
+            path_hysteresis_ms: DEFAULT_PATH_HYSTERESIS_MS,
+            path_dwell_ms: DEFAULT_PATH_DWELL_MS,
+            pending_leave: Vec::new(),
         }
     }
 }
 
 impl Config {
+    /// Интервал RTT-проб пирам (issue #16) в разумных пределах: 2 с — уже
+    /// «чаттер», 20 с — NAT-маппинг прямого канала успевает протухнуть.
+    pub fn rtt_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.rtt_interval_ms
+                .clamp(RTT_INTERVAL_MIN_MS, RTT_INTERVAL_MAX_MS),
+        )
+    }
+
+    /// Абсолютный гистерезис выбора пути, мс (issue #17).
+    pub fn path_hysteresis(&self) -> u32 {
+        self.path_hysteresis_ms.min(PATH_HYSTERESIS_MAX_MS)
+    }
+
+    /// Время удержания выбранного пути, мс (issue #17).
+    pub fn path_dwell(&self) -> u64 {
+        self.path_dwell_ms.min(PATH_DWELL_MAX_MS)
+    }
+
+    /// Число путей для дублирования (issue #25) в допустимых пределах.
+    pub fn duplicate_paths(&self) -> u8 {
+        self.mesh
+            .duplicate_paths
+            .clamp(DUPLICATE_PATHS_MIN, DUPLICATE_PATHS_MAX)
+    }
+
     /// MTU адаптера в разумных пределах (руками вписанный 0 или 9000 не
     /// ломают туннель).
     pub fn mtu(&self) -> usize {
@@ -232,10 +344,19 @@ pub struct StoredServer {
     pub label: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct StoredFriend {
     pub pubkey: String, // hex
+    /// Ручное переопределение имени: перекрывает ник с сервера.
+    #[serde(default)]
     pub alias: String,
+    /// Ник с сервера (issue #24): кэш имени из `FRIEND_LIST`, чтобы в списке
+    /// был ник, а не код.
+    #[serde(default)]
+    pub nick: String,
+    /// Состояние дружбы; отсутствует в старом конфиге — `Legacy`.
+    #[serde(default)]
+    pub state: FriendState,
 }
 
 pub struct Store {

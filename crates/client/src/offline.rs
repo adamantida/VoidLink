@@ -448,7 +448,11 @@ pub fn apply_cfg_cmd(c: &mut Config, cmd: Cmd) {
             let hex = proto::hex_of(&pubkey);
             match c.friends.iter_mut().find(|f| f.pubkey == hex) {
                 Some(f) => f.alias = alias,
-                None => c.friends.push(store::StoredFriend { pubkey: hex, alias }),
+                None => c.friends.push(store::StoredFriend {
+                    pubkey: hex,
+                    alias,
+                    ..Default::default()
+                }),
             }
         }
         Cmd::DelFriend(pubkey) => {

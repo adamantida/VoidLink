@@ -593,6 +593,11 @@ pub struct Stats {
     pub tx_bytes: AtomicU64,
     pub rx_pkts: AtomicU64,
     pub tx_pkts: AtomicU64,
+    /// Отправлено дублированных копий сверх первой (issue #25).
+    pub dup_sent: AtomicU64,
+    /// Отброшено дубликатов на выходе (issue #25): пришёл второй экземпляр
+    /// кадра, который уже доставлен.
+    pub dup_dropped: AtomicU64,
 }
 
 impl Stats {
@@ -602,6 +607,8 @@ impl Stats {
             tx_bytes: AtomicU64::new(0),
             rx_pkts: AtomicU64::new(0),
             tx_pkts: AtomicU64::new(0),
+            dup_sent: AtomicU64::new(0),
+            dup_dropped: AtomicU64::new(0),
         }
     }
 }
@@ -3937,6 +3944,7 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
                 None => c.friends.push(crate::store::StoredFriend {
                     pubkey: hex,
                     alias: a,
+                    ..Default::default()
                 }),
             });
             env.emit(Event::Notice(format!("друг добавлен: {alias}")));

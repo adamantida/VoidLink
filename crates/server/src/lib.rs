@@ -148,6 +148,22 @@ pub struct Limits {
     /// Живых приглашений на одну цель по всем группам: иначе владельцы
     /// множества групп заваливали бы одну identity окнами приглашений.
     pub max_invites_per_target: usize,
+    /// Аренда адреса оверлея без активности столько — адрес возвращается в
+    /// пул, а identity выселяется из групп (issue #21). `ZERO` — не истекает
+    /// (поведение до исправления).
+    pub lease_ttl: Duration,
+    /// Надгробие удалённой группы живёт столько (issue #20): gid не
+    /// переиспользуется, вход по нему даёт «группа не существует».
+    pub tomb_ttl: Duration,
+    /// Недавний выход из группы помнится столько (issue #20): приватная
+    /// группа после выхода пускает только по новому приглашению.
+    pub left_ttl: Duration,
+    /// Срок жизни заявки в друзья (issue #24).
+    pub friend_req_ttl: Duration,
+    /// Друзей на одну identity и живых заявок на одну цель (issue #24):
+    /// server.json переписывается раз в 3 с, без предела он бы раздувался.
+    pub max_friends: usize,
+    pub max_friend_reqs_per_target: usize,
 }
 
 impl Default for Limits {
@@ -169,6 +185,12 @@ impl Default for Limits {
             max_invites_per_group: 256,
             max_bans_per_group: 1024,
             max_invites_per_target: 64,
+            lease_ttl: Duration::from_secs(30 * 24 * 3600),
+            tomb_ttl: Duration::from_secs(7 * 24 * 3600),
+            left_ttl: Duration::from_secs(10 * 60),
+            friend_req_ttl: Duration::from_secs(7 * 24 * 3600),
+            max_friends: 512,
+            max_friend_reqs_per_target: 64,
         }
     }
 }
@@ -1480,6 +1502,9 @@ fn snapshot(
                     .collect(),
             })
             .collect(),
+        // Поля issue #20/#21/#24 заполняют свои ветки: пока — пустые значения
+        // (файл без них читается как «ничего не удалялось, не выходили, дружб нет»).
+        ..Default::default()
     }
 }
 

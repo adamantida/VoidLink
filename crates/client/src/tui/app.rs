@@ -1073,13 +1073,7 @@ impl App {
                     path: kind,
                     rtt_ms,
                 } => {
-                    self.set_peer_path(
-                        ip,
-                        Some(PathSnap {
-                            kind,
-                            rtt_ms: rtt_ms.map(u64::from),
-                        }),
-                    );
+                    self.set_peer_path(ip, Some(PathSnap::new(kind, rtt_ms.map(u64::from))));
                     let msg = format!("путь до {name}: {}", self.path_label(&kind));
                     self.log(MsgKind::Info, msg.clone());
                     self.status_msg = msg.clone();
@@ -2696,6 +2690,7 @@ impl App {
                 .map(|f| StoredFriend {
                     pubkey: proto::hex_of(&f.pubkey),
                     alias: f.alias.clone(),
+                    ..Default::default()
                 })
                 .collect(),
             autojoin: self.autojoin.clone(),
@@ -4498,10 +4493,12 @@ mod tests {
                 StoredFriend {
                     pubkey: proto::hex_of(&[2; 32]),
                     alias: "bob".into(),
+                    ..Default::default()
                 },
                 StoredFriend {
                     pubkey: proto::hex_of(&[3; 32]),
                     alias: "eve".into(),
+                    ..Default::default()
                 },
             ],
             ..Config::default()
@@ -4901,10 +4898,7 @@ mod tests {
             direct: true,
             rtt_ms: Some(7),
             status: "ok".into(),
-            path: Some(PathSnap {
-                kind: PathKind::Direct,
-                rtt_ms: Some(7),
-            }),
+            path: Some(PathSnap::new(PathKind::Direct, Some(7))),
         };
         let mut a = app();
         a.groups = vec![GroupView {

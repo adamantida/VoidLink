@@ -815,6 +815,7 @@ fn main() -> Result<()> {
             cfg.friends.push(StoredFriend {
                 pubkey: proto::hex_of(&pk),
                 alias: alias.clone(),
+                ..Default::default()
             });
             save(&cfg)?;
             println!("друг добавлен: {} ({})", alias.clone(), proto::hex_of(&pk));

@@ -50,6 +50,8 @@ pub const DIRECT_FRESH_MS: u64 = 12_000;
 pub const SERVER_FRESH_MS: u64 = 30_000;
 /// Замер маршрута через пира актуален столько.
 pub const PEER_FRESH_MS: u64 = 30_000;
+/// Сколько последних замеров RTT держать для спарклайна (issue #26).
+pub const RTT_HIST_LEN: usize = 60;
 
 /// Куда (через кого) идёт трафик до участника.
 ///
