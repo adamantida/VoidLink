@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Уязвимость
+    url: https://github.com/adamantida/VoidLink/security/policy
+    about: Не открывайте публичный issue — напишите мейнтейнеру напрямую (SECURITY.md).
+  - name: 📚 Документация и FAQ
+    url: https://github.com/adamantida/VoidLink/tree/master/docs
+    about: Возможно, ответ уже есть — FAQ, решение проблем, сеть и NAT.
