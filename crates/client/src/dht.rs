@@ -6,6 +6,12 @@
 //! сервера, кэш контактов из состава групп (`MemberInfo.endpoint` + mesh-секция
 //! `GROUP_STATE`), сохранённая таблица (`client.json` → `mesh.contacts`).
 //!
+//! Сохранённая таблица грузится при старте движка ([`Dht::load_at`]) и служит
+//! подсказкой до первого `MESH_SEED`: сервер знает свежие адреса и состав
+//! групп, поэтому его данные перебивают загруженные. Входа в сеть без сервера
+//! кэш не даёт — ключи групп, состав и свой `my_ip` выдаёт только сервер
+//! (issue #27).
+//!
 //! Здесь только таблица и её арифметика: поиск (`find_node`, α = 3 раунда по
 //! 2) отдаёт движку список контактов, которые надо спросить, а сами кадры
 //! шлёт `mesh.rs`. Время — миллисекунды (`now_ms`), чтобы тесты были
@@ -13,7 +19,10 @@
 //!
 //! Контакт устаревает за [`TTL_MS`] (15 мин) без ответа; ближайшие к нам
 //! [`PING_COUNT`] контактов движок пингует раз в [`PING_EVERY_MS`] (5 мин).
-//! Таблица переживает рестарт: [`Dht::to_stored`] / [`Dht::load`].
+//! Таблица переживает рестарт процесса: [`Dht::to_stored_pruned`] пишет её в
+//! `client.json`, [`Dht::load_at`] загружает обратно при старте. Живые
+//! mesh-сессии и прямые каналы после рестарта не восстанавливаются — их
+//! поднимает заново движок по данным сервера.
 
 use std::net::SocketAddr;
 
@@ -34,6 +43,9 @@ pub const BUCKETS: usize = 32;
 pub const K: usize = 8;
 /// Контакт без ответа столько — забывается (15 мин).
 pub const TTL_MS: u64 = 15 * 60 * 1000;
+/// Предельный возраст записи в кэше `mesh.contacts` (7 суток): адрес, который
+/// не подтверждался неделю, — уже не подсказка для бутстрапа.
+pub const CACHE_MAX_AGE_S: u64 = 7 * 24 * 60 * 60;
 /// Период пинга ближайших контактов (5 мин).
 pub const PING_EVERY_MS: u64 = 5 * 60 * 1000;
 /// Сколько ближайших к нам контактов пингуется.
@@ -145,8 +157,9 @@ impl Dht {
         self.len() == 0
     }
 
-    /// Наполнить таблицу контактами (MESH_SEED, кэш групп, сохранённая
-    /// таблица). Чужие для нас ключи (мы сами, нулевой ed) отбрасываются.
+    /// Наполнить таблицу контактами (`MESH_SEED`, кэш групп). Сохранённая
+    /// таблица грузится отдельно — [`Dht::load_at`]: у неё своя арифметика
+    /// времени. Чужие для нас ключи (мы сами, нулевой ed) отбрасываются.
     pub fn bootstrap(&mut self, seeds: &[MeshSeed], now_ms: u64) -> usize {
         let mut added = 0;
         for s in seeds {
@@ -168,23 +181,58 @@ impl Dht {
     /// Загрузить сохранённые контакты (`client.json` → `mesh.contacts`).
     /// Бит `MESH` ставится всегда (контакт попал в таблицу только через mesh),
     /// `RELAY` — из сохранённого `caps`.
+    ///
+    /// Время берётся из файла как есть: «сейчас» — самая свежая запись, поэтому
+    /// часы не нужны и давние записи не выбрасываются. Продакшн-путь —
+    /// [`Dht::load_at`] с реальным `now_ms` (там есть полу-TTL для старых
+    /// записей).
     pub fn load(&mut self, saved: &[StoredContact]) -> usize {
+        let now_ms = saved
+            .iter()
+            .map(|c| c.seen_s.saturating_mul(1000))
+            .max()
+            .unwrap_or(0);
+        self.load_at(saved, now_ms)
+    }
+
+    /// Загрузить кэш `mesh.contacts` при старте движка (issue #27).
+    ///
+    /// Записи сортируются по `seen_s` **по убыванию**: файл отсортирован по
+    /// `ed`, и без этого старые записи заняли бы корзины раньше свежих, а
+    /// полная корзина живых чужих не вытесняет. Время не «из будущего»
+    /// (`min(seen_s * 1000, now_ms)`) — часы могли сдвинуться. Запись старше
+    /// [`TTL_MS`] не выбрасывается, а получает «полу-TTL»: иначе первый же
+    /// [`Dht::expire`] (не позже `DHT_EVERY` = 10 с после старта) вычистил бы
+    /// весь кэш, и он не успел бы пригодиться. Мусор (невалидный hex/адрес,
+    /// свой или нулевой ключ) пропускается, в таблицу входит не больше
+    /// [`BUCKETS`] × [`K`] записей.
+    pub fn load_at(&mut self, saved: &[StoredContact], now_ms: u64) -> usize {
+        let mut sorted: Vec<&StoredContact> = saved.iter().collect();
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.seen_s));
+        let limit = BUCKETS * K;
         let mut added = 0;
-        for c in saved {
+        for c in sorted {
+            if added >= limit {
+                break;
+            }
             let (Some(ed), Some(x)) = (hex_pub(&c.ed), hex_pub(&c.x)) else {
                 continue;
             };
             let Ok(addr) = c.addr.parse::<SocketAddr>() else {
                 continue;
             };
+            let mut last_seen_ms = c.seen_s.saturating_mul(1000).min(now_ms);
+            if now_ms.saturating_sub(last_seen_ms) > TTL_MS {
+                // Кэш пережил TTL: даём половину TTL, чтобы первый `expire`
+                // не стёр всё до того, как контакты успели пригодиться.
+                last_seen_ms = now_ms.saturating_sub(TTL_MS / 2);
+            }
             if self.insert(Contact {
                 ed,
                 x,
                 addr,
                 rtt_ms: c.rtt_ms,
-                // Время — из сохранённого, но не «из будущего»: часы могли
-                // сдвинуться; свежесть всё равно проверит `expire`.
-                last_seen_ms: c.seen_s.saturating_mul(1000),
+                last_seen_ms,
                 caps: c.caps | mesh::caps::MESH,
             }) {
                 added += 1;
@@ -207,6 +255,23 @@ impl Dht {
                 caps: c.caps,
             })
             .collect();
+        out.sort_by(|a, b| a.ed.cmp(&b.ed));
+        out
+    }
+
+    /// Сохраняемая копия с прунингом для `client.json` (issue #27): записи не
+    /// старше [`CACHE_MAX_AGE_S`] и не больше [`BUCKETS`] × [`K`] — свежие
+    /// первыми. Итог снова сортируется по `ed`, чтобы файл не менялся от
+    /// перестановок и `client.json` не переписывался зря.
+    pub fn to_stored_pruned(&self, now_ms: u64) -> Vec<StoredContact> {
+        let max_ms = CACHE_MAX_AGE_S.saturating_mul(1000);
+        let mut out: Vec<StoredContact> = self
+            .to_stored()
+            .into_iter()
+            .filter(|c| now_ms.saturating_sub(c.seen_s.saturating_mul(1000)) <= max_ms)
+            .collect();
+        out.sort_by(|a, b| b.seen_s.cmp(&a.seen_s).then_with(|| a.ed.cmp(&b.ed)));
+        out.truncate(BUCKETS * K);
         out.sort_by(|a, b| a.ed.cmp(&b.ed));
         out
     }
@@ -453,6 +518,18 @@ mod tests {
         }
     }
 
+    /// Запись кэша `mesh.contacts` для тестов загрузки.
+    fn stored(ed: [u8; 32], addr: &str, seen_s: u64) -> StoredContact {
+        StoredContact {
+            ed: tunnel_protocol::hex_of(&ed),
+            x: tunnel_protocol::hex_of(&[7u8; 32]),
+            addr: addr.into(),
+            rtt_ms: 4,
+            seen_s,
+            caps: mesh::caps::MESH,
+        }
+    }
+
     #[test]
     fn корзины_и_расстояние() {
         let me = key(0);
@@ -580,8 +657,14 @@ mod tests {
         assert_eq!(got.rtt_ms, 33);
         assert_eq!(got.last_seen_ms, 1_700_000_000_000);
         assert!(got.can_relay());
-        // Мусор в сохранённом не ломает загрузку.
+    }
+
+    #[test]
+    fn мусор_в_кэше_пропускается() {
+        let me = key(0);
+        let now_ms = 1_700_000_000_000u64;
         let junk = vec![
+            // Не hex.
             StoredContact {
                 ed: "не hex".into(),
                 x: String::new(),
@@ -590,6 +673,7 @@ mod tests {
                 seen_s: 0,
                 caps: 0,
             },
+            // Hex верный, адрес — нет.
             StoredContact {
                 ed: tunnel_protocol::hex_of(&key(0x44)),
                 x: tunnel_protocol::hex_of(&[1u8; 32]),
@@ -598,8 +682,161 @@ mod tests {
                 seen_s: 0,
                 caps: 0,
             },
+            // Ключ не той длины.
+            StoredContact {
+                ed: "abcd".into(),
+                x: tunnel_protocol::hex_of(&[1u8; 32]),
+                addr: "203.0.113.5:4000".into(),
+                rtt_ms: 0,
+                seen_s: 0,
+                caps: 0,
+            },
+            // Нет x-ключа (старый конфиг): контакт бесполезен.
+            StoredContact {
+                ed: tunnel_protocol::hex_of(&key(0x45)),
+                x: String::new(),
+                addr: "203.0.113.6:4000".into(),
+                rtt_ms: 0,
+                seen_s: 0,
+                caps: 0,
+            },
+            // Свой ключ — не контакт.
+            StoredContact {
+                ed: tunnel_protocol::hex_of(&me),
+                x: tunnel_protocol::hex_of(&[1u8; 32]),
+                addr: "203.0.113.7:4000".into(),
+                rtt_ms: 0,
+                seen_s: 0,
+                caps: 0,
+            },
         ];
-        assert_eq!(d2.load(&junk), 0);
+        let mut d = Dht::new(me);
+        assert_eq!(d.load(&junk), 0, "мусор не попадает в таблицу");
+        assert_eq!(d.load_at(&junk, now_ms), 0);
+        assert!(d.is_empty());
+        // Мусор вперемешку с годной записью: годная загружается, остальное — нет.
+        let mut mixed = junk;
+        mixed.push(stored(key(0x10), "203.0.113.10:4000", now_ms / 1000));
+        assert_eq!(d.load_at(&mixed, now_ms), 1);
+        assert!(d.get(&key(0x10)).is_some());
+    }
+
+    #[test]
+    fn загруженный_кэш_живёт_половину_ttl() {
+        let me = key(0);
+        let now_ms = 1_700_000_000_000u64;
+        // Запись трёхчасовой давности: старше TTL, но кэш не выбрасываем.
+        let saved = vec![stored(
+            key(0x10),
+            "203.0.113.1:4000",
+            now_ms / 1000 - 3 * 3600,
+        )];
+        let mut d = Dht::new(me);
+        assert_eq!(d.load_at(&saved, now_ms), 1);
+        let c = d.get(&key(0x10)).unwrap();
+        assert_eq!(
+            c.last_seen_ms,
+            now_ms - TTL_MS / 2,
+            "старая запись получает полу-TTL, а не текущее время"
+        );
+        assert!(c.fresh(now_ms));
+        // Первый `expire` (не позже 10 с после старта) кэш не вычищает.
+        assert_eq!(d.expire(now_ms), 0, "кэш вычищен первым expire");
+        // Дальше живёт ровно половину TTL, как обычный контакт.
+        assert_eq!(d.expire(now_ms + TTL_MS / 2), 0);
+        assert_eq!(d.expire(now_ms + TTL_MS / 2 + 1), 1);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn кэш_не_вытесняет_свежий_контакт() {
+        let me = key(0);
+        let now_ms = 1_700_000_000_000u64;
+        // Все ключи в корзине 0 (ed[0] = 0, различаются последним байтом).
+        let ed_of = |k: u8| {
+            let mut e = [0u8; 32];
+            e[31] = k;
+            e
+        };
+        // Файл отсортирован по `ed`: свежая запись — последняя. Без сортировки
+        // по `seen_s` она бы не влезла в уже заполненную старыми корзину.
+        let mut saved: Vec<StoredContact> = (1..=8u8)
+            .map(|k| stored(ed_of(k), &format!("203.0.113.{k}:4000"), 0))
+            .collect();
+        saved.push(stored(ed_of(9), "203.0.113.9:4000", now_ms / 1000));
+        assert_eq!(saved.last().unwrap().ed, tunnel_protocol::hex_of(&ed_of(9)));
+        let mut d = Dht::new(me);
+        assert_eq!(d.load_at(&saved, now_ms), K, "в корзину входит K");
+        assert_eq!(d.len(), K);
+        assert!(
+            d.get(&ed_of(9)).is_some(),
+            "свежий контакт вытеснен старыми записями кэша"
+        );
+        assert_eq!(d.get(&ed_of(9)).unwrap().last_seen_ms, now_ms);
+        assert!(
+            d.get(&ed_of(8)).is_none(),
+            "лишняя старая запись не должна влезать в полную корзину"
+        );
+    }
+
+    #[test]
+    fn кэш_ограничен_двумя_ста_пятьюдесятью_шестью() {
+        let me = key(0);
+        let now_ms = 1_700_000_000_000u64;
+        // 32 корзины по 10 записей: в корзину входит K = 8, итог — BUCKETS × K.
+        let mut saved = Vec::new();
+        for b in 0..BUCKETS as u8 {
+            for j in 0..10u8 {
+                let mut ed = [0u8; 32];
+                ed[0] = (b << 3) | (j & 0x07);
+                // Второй десяток в корзине отличается последним байтом; +1 —
+                // чтобы нулевой ключ не совпал с `me` и не считался мусором.
+                ed[31] = j / 8 + 1;
+                saved.push(stored(ed, "203.0.113.1:4000", now_ms / 1000));
+            }
+        }
+        assert!(saved.len() > BUCKETS * K);
+        let mut d = Dht::new(me);
+        assert_eq!(d.load_at(&saved, now_ms), BUCKETS * K);
+        assert_eq!(d.len(), BUCKETS * K);
+        // В каждой корзине — не больше K.
+        assert!(d.buckets.iter().all(|b| b.len() <= K));
+    }
+
+    #[test]
+    fn время_из_будущего_не_ломает_кэш() {
+        let me = key(0);
+        let now_ms = 1_700_000_000_000u64;
+        // Часы сдвинулись назад: запись «из будущего» на час.
+        let saved = vec![stored(key(0x10), "203.0.113.1:4000", now_ms / 1000 + 3600)];
+        let mut d = Dht::new(me);
+        assert_eq!(d.load_at(&saved, now_ms), 1);
+        let c = d.get(&key(0x10)).unwrap();
+        assert_eq!(c.last_seen_ms, now_ms, "время из будущего обрезано до now");
+        assert!(c.fresh(now_ms));
+        assert_eq!(d.expire(now_ms), 0);
+        // В файл пишется уже нормализованное время.
+        assert_eq!(d.to_stored()[0].seen_s, now_ms / 1000);
+    }
+
+    #[test]
+    fn прунинг_при_сохранении() {
+        let me = key(0);
+        let now_ms = 1_700_000_000_000u64;
+        let mut d = Dht::new(me);
+        // Живой контакт и «ископаемое» семидневной давности.
+        let mut old = contact(key(0x10), "203.0.113.1:4000", mesh::caps::MESH);
+        old.last_seen_ms = now_ms - (CACHE_MAX_AGE_S + 1) * 1000;
+        d.insert(old);
+        let mut fresh = contact(key(0x20), "203.0.113.2:4000", mesh::caps::MESH);
+        fresh.last_seen_ms = now_ms;
+        d.insert(fresh);
+        assert_eq!(d.to_stored().len(), 2);
+        let pruned = d.to_stored_pruned(now_ms);
+        assert_eq!(pruned.len(), 1, "запись старше CACHE_MAX_AGE отброшена");
+        assert_eq!(pruned[0].ed, tunnel_protocol::hex_of(&key(0x20)));
+        // Прунинг не портит саму таблицу — только копию для файла.
+        assert_eq!(d.len(), 2);
     }
 
     #[test]
