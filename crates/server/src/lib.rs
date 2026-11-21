@@ -33,6 +33,7 @@
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
 pub mod federation;
+pub mod friends;
 pub mod leases;
 pub mod metrics;
 pub mod persist;
@@ -281,6 +282,8 @@ impl Server {
                 leases: loaded.leases,
                 next_gid: loaded.next_gid,
                 invite_ttl_ms: duration_ms(cfg.limits.invite_ttl),
+                friend_ttl_ms: duration_ms(cfg.limits.friend_req_ttl),
+                friends: friends::Friends::load(&loaded.friends),
                 retired_eph: HashMap::new(),
                 fed_dirty: HashSet::new(),
                 fed_deleted: Vec::new(),
@@ -800,6 +803,11 @@ struct State {
     next_gid: u32,
     /// `Limits::invite_ttl` в мс (нужен почти всем спискам приглашений).
     invite_ttl_ms: u64,
+    /// `Limits::friend_req_ttl` в мс (issue #24): срок заявки в друзья.
+    friend_ttl_ms: u64,
+    /// Заявки в друзья и принятые пары (issue #24): сервер хранит их, иначе
+    /// взаимность для офлайн-цели недостижима.
+    friends: friends::Friends,
     /// `(ed_pub, eph_pub)` закрытых сессий → когда закрыта. HELLO3 с таким
     /// ключом (старая попытка клиента, повторённая в пределах срока cookie)
     /// игнорируется: иначе он пересоздавал бы живую сессию.
@@ -1204,6 +1212,8 @@ struct Loaded {
     fed_groups: Vec<persist::PFedGroup>,
     /// Заявки на адреса общего пула (`federation.addr_claims`, T4b1).
     fed_claims: Vec<persist::PAddrClaim>,
+    /// Дружбы и заявки (`friends`, issue #24).
+    friends: persist::PFriends,
 }
 
 /// uuid группы федерации (hex 16 байт).
@@ -1298,6 +1308,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             fed_pins: Vec::new(),
             fed_groups: Vec::new(),
             fed_claims: Vec::new(),
+            friends: persist::PFriends::default(),
         });
     };
     let links = p
@@ -1414,6 +1425,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         fed_pins: federation::load_pins(&p.federation.peers),
         fed_groups: p.federation.groups,
         fed_claims: p.federation.addr_claims,
+        friends: p.friends,
     })
 }
 
@@ -1502,8 +1514,10 @@ fn snapshot(
                     .collect(),
             })
             .collect(),
-        // Поля issue #20/#21/#24 заполняют свои ветки: пока — пустые значения
-        // (файл без них читается как «ничего не удалялось, не выходили, дружб нет»).
+        // Поля issue #20/#21 заполняют свои ветки: пока — пустые значения
+        // (файл без них читается как «ничего не удалялось, не выходили»).
+        // Дружбы (issue #24) — состояние `State::friends`.
+        friends: s.friends.persisted(),
         ..Default::default()
     }
 }
@@ -1607,6 +1621,7 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        expire_friend_requests(&sh);
         // Федерация: переотправка SRV_HELLO, таймауты попыток и сессий.
         federation::tick(&sh);
         refresh_gauges(&sh);
@@ -1716,6 +1731,39 @@ fn expire_invites(sh: &Shared) {
             sh.log(format!("invite expired: {gid} → {}", short(&pk)));
             if let Some((addr, ses)) = s.session_of(&pk) {
                 push_invite_list(&s, addr, ses, &mut out, invite_window(&s, &pk, gid));
+            }
+        }
+    }
+    sh.dirty.store(true, Ordering::Relaxed);
+    sh.flush(out);
+}
+
+/// Истёкшие заявки в друзья удаляются; обеим сторонам — свежий список
+/// (инициатор перестанет ждать ответа, цель закроет окно заявки).
+fn expire_friend_requests(sh: &Shared) {
+    let now = unix_ms();
+    // Дешёвая проверка под чтением: у большинства серверов заявок нет вовсе,
+    // и брать блокировку на запись каждый тик незачем.
+    if !{
+        let s = sh.state.read().unwrap();
+        s.friends.has_expired(now, s.friend_ttl_ms)
+    } {
+        return;
+    }
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let ttl = s.friend_ttl_ms;
+        for r in s.friends.expire(now, ttl) {
+            sh.log(format!(
+                "friend req expired: {} → {}",
+                short(&r.from),
+                short(&r.to)
+            ));
+            for pk in [r.from, r.to] {
+                if let Some((addr, ses)) = s.session_of(&pk) {
+                    push_friend_list(&s, addr, ses, &mut out, [0; 32]);
+                }
             }
         }
     }
@@ -2904,6 +2952,38 @@ fn push_invite_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox
     );
 }
 
+/// FRIEND_LIST identity `ses` — окно списка друзей с pubkey ≥ `from`, не
+/// больше [`friends::FRIENDS_PER_LIST`]. Неполное окно помечается
+/// `complete == false` (обрезан хвост по ключу), клиент дочитывает его
+/// LIST_FRIENDS с последнего ключа окна.
+fn push_friend_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox, from: [u8; 32]) {
+    let (mut items, complete) = s.friends.window(&ses.ed_pub, &from);
+    // Ник — последнее известное серверу имя (сессия, группы). Пусто —
+    // клиент оставит кэш из `client.json`: сервер ников не хранит.
+    for i in &mut items {
+        i.name = known_name(s, &i.pk);
+    }
+    let list = pl::FriendList {
+        from,
+        items,
+        complete,
+    };
+    push_ctrl(
+        out,
+        addr,
+        ses,
+        ctrl::FRIEND_LIST,
+        &pl::enc_friend_list(&list),
+    );
+}
+
+/// Свежий FRIEND_LIST себе — подтверждение команды (клиент не ждёт таймера).
+fn push_friends_self(s: &State, src: SocketAddr, out: &mut Outbox) {
+    if let Some(ses) = s.sessions.get(&src) {
+        push_friend_list(s, src, ses, out, [0; 32]);
+    }
+}
+
 /// Начало окна INVITE_LIST, которое покрывает `gid`: с начала, если до него
 /// меньше [`INVITES_PER_LIST`] неотвеченных (первое окно — то, что клиент
 /// видит после HELLO3), иначе с самого `gid`.
@@ -3212,6 +3292,10 @@ fn install_session(
     // Неотвеченные приглашения — заново при каждом HELLO3: по полному
     // списку клиент снимает приглашения, отозванные, пока он был офлайн.
     push_invite_list(s, src, ses, out, 0);
+    // Дружбы и заявки (issue #24) — тоже заново: по полному списку клиент
+    // снимает пары, снятые второй стороной, пока он был офлайн, и узнаёт о
+    // заявке, пришедшей в его отсутствие.
+    push_friend_list(s, src, ses, out, [0; 32]);
 }
 
 // ---------- остальные команды ----------
@@ -3224,6 +3308,7 @@ fn is_query(typ: u8) -> bool {
             | ctrl::LIST_GROUPS
             | ctrl::FRIEND_GROUPS
             | ctrl::LIST_INVITES
+            | ctrl::LIST_FRIENDS
             | ctrl::GET_GROUP
             | ctrl::GROUP_ADMIN
     )
@@ -3251,6 +3336,11 @@ fn is_mutation(typ: u8) -> bool {
             | ctrl::MESH_INFO
             | ctrl::SERVER_HINT
             | ctrl::JOIN_FED
+            // Issue #24: друзья меняют `State::friends` (заявки и пары).
+            | ctrl::FRIEND_REQ
+            | ctrl::FRIEND_ACCEPT
+            | ctrl::FRIEND_DECLINE
+            | ctrl::FRIEND_REMOVE
     )
 }
 
@@ -3267,6 +3357,11 @@ fn is_urgent(typ: u8) -> bool {
             | ctrl::DELETE_GROUP
             | ctrl::TRANSFER_OWNER
             | ctrl::CREATE_GROUP
+            // Issue #24: принятая дружба и снятие не должны воскресать после
+            // падения сервера в окне `SAVE_EVERY` — иначе удалённая дружба
+            // вернулась бы из server.json.
+            | ctrl::FRIEND_ACCEPT
+            | ctrl::FRIEND_REMOVE
     )
 }
 
@@ -3377,6 +3472,10 @@ fn handle_query(
         ctrl::LIST_INVITES => {
             let from = pl::dec_u32(payload)?;
             push_invite_list(s, src, ses, out, from);
+        }
+        ctrl::LIST_FRIENDS => {
+            let from = pl::dec_pubkey(payload)?;
+            push_friend_list(s, src, ses, out, from);
         }
         ctrl::FRIEND_GROUPS => {
             let target = pl::dec_pubkey(payload)?;
@@ -3788,6 +3887,152 @@ fn handle_mutation(
             // обрезанного окна после HELLO3.
             push_invite_list(s, src, &s.sessions[&src], out, invite_window(s, &me, gid));
         }
+        // ---------- друзья (issue #24) ----------
+        //
+        // Сервер хранит заявки и принятые пары: иначе взаимность для
+        // офлайн-цели недостижима (вторая сторона узнаёт о заявке только
+        // при следующем HELLO). Ников и групп здесь нет — только ключи.
+        ctrl::FRIEND_REQ => {
+            let target = pl::dec_pubkey(payload)?;
+            let ttl_secs = s.friend_ttl_ms.div_ceil(1000).min(u32::MAX as u64) as u32;
+            let max_per_target = sh.limits.max_friend_reqs_per_target;
+            let outcome = s.friends.request(
+                me,
+                target,
+                uname.clone(),
+                unix_ms(),
+                max_per_target,
+                sh.limits.max_friends,
+            )?;
+            match outcome {
+                friends::RequestOutcome::Created(req) | friends::RequestOutcome::Extended(req) => {
+                    sh.log(format!("friend req: {} → {}", short(&me), short(&target)));
+                    // Цель: заявка (повтор — окно заново: прошлое она могла
+                    // закрыть, а заявка ещё жива) и свежий список, где у неё
+                    // «заявка пришла».
+                    if let Some((addr, ses)) = s.session_of(&target) {
+                        let note = pl::FriendReqRcvd {
+                            from: me,
+                            from_name: req.from_name,
+                            expires_in: ttl_secs,
+                        };
+                        push_ctrl(
+                            out,
+                            addr,
+                            ses,
+                            ctrl::FRIEND_REQ_RCVD,
+                            &pl::enc_friend_req_rcvd(&note),
+                        );
+                        push_friend_list(s, addr, ses, out, [0; 32]);
+                    }
+                }
+                friends::RequestOutcome::Accepted(edge) => {
+                    // Встречная заявка — дружба сразу, обе стороны узнают.
+                    sh.log(format!("friend: {} + {}", short(&edge.a), short(&edge.b)));
+                    let to_initiator = pl::FriendVerdict {
+                        by: target,
+                        by_name: known_name(s, &target),
+                    };
+                    let to_acceptor = pl::FriendVerdict {
+                        by: me,
+                        by_name: uname.clone(),
+                    };
+                    for (pk, v) in [(me, to_initiator), (target, to_acceptor)] {
+                        if let Some((addr, ses)) = s.session_of(&pk) {
+                            push_ctrl(
+                                out,
+                                addr,
+                                ses,
+                                ctrl::FRIEND_REQ_ACCEPTED,
+                                &pl::enc_friend_accepted(&v),
+                            );
+                            push_friend_list(s, addr, ses, out, [0; 32]);
+                        }
+                    }
+                }
+                // Уже друзья — идемпотентно: подтверждаем списком.
+                friends::RequestOutcome::AlreadyFriends => {}
+            }
+            push_friends_self(s, src, out);
+        }
+        ctrl::FRIEND_ACCEPT => {
+            let target = pl::dec_pubkey(payload)?;
+            // Принять можно только входящую заявку: `from` — тот, кто просил.
+            let already = s.friends.is_friend(&me, &target);
+            let edge = s
+                .friends
+                .accept(&target, &me, unix_ms(), sh.limits.max_friends)?;
+            if !already {
+                sh.log(format!("friend: {} + {}", short(&edge.a), short(&edge.b)));
+                // Инициатору — «приняли»: он перестанет ждать ответа.
+                if let Some((addr, ses)) = s.session_of(&target) {
+                    let v = pl::FriendVerdict {
+                        by: me,
+                        by_name: uname.clone(),
+                    };
+                    push_ctrl(
+                        out,
+                        addr,
+                        ses,
+                        ctrl::FRIEND_REQ_ACCEPTED,
+                        &pl::enc_friend_accepted(&v),
+                    );
+                    push_friend_list(s, addr, ses, out, [0; 32]);
+                }
+            }
+            push_friends_self(s, src, out);
+        }
+        ctrl::FRIEND_DECLINE => {
+            let target = pl::dec_pubkey(payload)?;
+            // Идемпотентно: заявки уже нет — не ошибка (повтор, ответ с
+            // другого устройства, заявка истекла).
+            if s.friends.decline(&target, &me).is_some() {
+                sh.log(format!(
+                    "friend decline: {} ✗ {}",
+                    short(&me),
+                    short(&target)
+                ));
+                if let Some((addr, ses)) = s.session_of(&target) {
+                    let v = pl::FriendVerdict {
+                        by: me,
+                        by_name: uname.clone(),
+                    };
+                    push_ctrl(
+                        out,
+                        addr,
+                        ses,
+                        ctrl::FRIEND_REQ_DECLINED,
+                        &pl::enc_friend_declined(&v),
+                    );
+                    push_friend_list(s, addr, ses, out, [0; 32]);
+                }
+            }
+            push_friends_self(s, src, out);
+        }
+        ctrl::FRIEND_REMOVE => {
+            let target = pl::dec_pubkey(payload)?;
+            // Снять можно с любой стороны; повтор — не ошибка.
+            if let Some(edge) = s.friends.remove(&me, &target) {
+                sh.log(format!(
+                    "friend removed: {} − {}",
+                    short(&edge.a),
+                    short(&edge.b)
+                ));
+                // Вторая сторона убирает запись сразу, а не при следующем
+                // HELLO: иначе она продолжала бы показывать дружбу.
+                if let Some((addr, ses)) = s.session_of(&target) {
+                    push_ctrl(
+                        out,
+                        addr,
+                        ses,
+                        ctrl::FRIEND_REMOVED,
+                        &pl::enc_friend_removed(&me),
+                    );
+                    push_friend_list(s, addr, ses, out, [0; 32]);
+                }
+            }
+            push_friends_self(s, src, out);
+        }
         ctrl::KICK | ctrl::BAN => {
             let (gid, target) = pl::dec_gid_target(payload)?;
             let banned = typ == ctrl::BAN;
@@ -3975,6 +4220,8 @@ mod tests {
             leases: leases::Leases::default(),
             next_gid: GID_MIN,
             invite_ttl_ms: duration_ms(Limits::default().invite_ttl),
+            friend_ttl_ms: duration_ms(Limits::default().friend_req_ttl),
+            friends: friends::Friends::default(),
             retired_eph: HashMap::new(),
             fed_dirty: HashSet::new(),
             fed_deleted: Vec::new(),
@@ -4956,6 +5203,79 @@ mod tests {
             assert!(Instant::now() < end, "не дождались за {within:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Запись друга `other` в FRIEND_LIST этого клиента: кадры списка идут
+    /// пачками (после HELLO и после каждой команды), поэтому берём первый, где
+    /// запись уже есть.
+    fn friend_of(r: &Raw, other: &[u8; 32]) -> Option<payloads::FriendInfo> {
+        let end = Instant::now() + Duration::from_secs(5);
+        while let Some((typ, p)) = r.next_ctrl(end) {
+            if typ != ctrl::FRIEND_LIST {
+                continue;
+            }
+            let l = payloads::dec_friend_list(&p).unwrap();
+            if let Some(i) = l.items.into_iter().find(|i| i.pk == *other) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn заявка_в_друзья_уведомляет_обе_стороны() {
+        let (server, _dir) = test_server("friend-req");
+        let a = Raw::connect(server.addr, "alpha");
+        let b = Raw::connect(server.addr, "bravo");
+        // У b в очереди HELLO-кадры: заявка должна прийти поверх них.
+        a.send(ctrl::FRIEND_REQ, &payloads::enc_pubkey(&b.pk));
+        let note = payloads::dec_friend_req_rcvd(&b.expect(ctrl::FRIEND_REQ_RCVD)).unwrap();
+        assert_eq!(note.from, a.pk, "заявка пришла от того, кто её отправил");
+        assert_eq!(note.from_name, "alpha", "цель видит ник, а не код");
+        assert!(note.expires_in > 0, "срок заявки должен быть объявлен");
+        // Инициатор видит своё состояние: «ждёт ответа», а не дружбу.
+        let mine = friend_of(&a, &b.pk).expect("заявки нет в списке инициатора");
+        assert_eq!(mine.state, payloads::friend_state::PENDING_OUT);
+        assert_eq!(mine.name, "bravo", "ник цели — с сервера");
+        // До принятия у b — «пришла заявка».
+        let theirs = friend_of(&b, &a.pk).expect("заявки нет в списке цели");
+        assert_eq!(theirs.state, payloads::friend_state::PENDING_IN);
+    }
+
+    #[test]
+    fn дружбы_переживают_рестарт() {
+        let (server, dir) = test_server("friends-restart");
+        let a = Raw::connect(server.addr, "alpha");
+        let b = Raw::connect(server.addr, "bravo");
+        a.send(ctrl::FRIEND_REQ, &payloads::enc_pubkey(&b.pk));
+        b.expect(ctrl::FRIEND_REQ_RCVD);
+        b.send(ctrl::FRIEND_ACCEPT, &payloads::enc_pubkey(&a.pk));
+        // Принятие — срочное сохранение: ждём запись на диск, а не shutdown.
+        let store = persist::Store::new(&dir);
+        wait_until_srv(Duration::from_secs(5), || {
+            store
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|p| !p.friends.edges.is_empty())
+        });
+        // «Падение» — загрузка того, что сейчас на диске.
+        let c = temp_dir("friends-restart-copy");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::copy(dir.join("server.json"), c.join("server.json")).unwrap();
+        let loaded = load_state(&persist::Store::new(&c)).unwrap();
+        let _ = std::fs::remove_dir_all(&c);
+        let f = friends::Friends::load(&loaded.friends);
+        assert!(
+            f.is_friend(&a.pk, &b.pk),
+            "дружба не пережила рестарт сервера"
+        );
+        assert_eq!(f.friend_count(&a.pk), 1);
+        assert_eq!(f.friend_count(&b.pk), 1, "пара хранится одна на двоих");
+        assert!(
+            f.request_between(&a.pk, &b.pk).is_none(),
+            "заявка не должна пережить принятие"
+        );
     }
 
     #[test]
