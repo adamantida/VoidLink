@@ -1,0 +1,97 @@
+name: 🐞 Баг
+description: Что-то работает не так — сеть, TUI, демон, сервер
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **Уязвимости — не сюда.** Пишите мейнтейнеру напрямую, см. SECURITY.md.
+  - type: textarea
+    id: actual
+    attributes:
+      label: Что произошло
+      description: Фактическое поведение. Скриншот TUI приветствуется.
+      placeholder: "Клиент офлайн, но отображается путь server с RTT 1 мс"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое поведение
+      placeholder: "Офлайн = нет активного пути, RTT = «—»"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      description: Сколько участников, группы pub/prv, какой транспорт.
+      placeholder: |
+        1. Сервер 4.1.0, три клиента
+        2. Все в приватной группе, путь direct
+        3. Уводим одного в офлайн → …
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Компонент
+      multiple: true
+      options:
+        - protocol
+        - server
+        - client (движок / TUN / DNS)
+        - TUI
+        - CLI
+        - daemon / IPC
+        - tray
+        - winsvc (служба Windows)
+        - docs
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: Тип пути (для сетевых багов)
+      options:
+        - direct (p2p)
+        - server (релей)
+        - peer (mesh-релей, этап 9)
+        - TCP-фолбэк
+        - не знаю / не относится
+  - type: dropdown
+    id: os
+    attributes:
+      label: ОС
+      multiple: true
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Версия и режим запуска
+      description: Релиз или коммит; служба / console / TUI --remote / --embedded.
+      placeholder: "4.1.0 (8e5c3d5), демон-служба + TUI --remote"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: Демон / клиент / сервер. С RUST_LOG=debug полезнее.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Проверки
+      options:
+        - label: Это не уязвимость
+          required: true
+        - label: Дубля среди открытых issues нет
+          required: true
+        - label: Сервер и клиенты одной версии протокола (v4 несовместим с v3)
