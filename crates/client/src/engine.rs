@@ -36,9 +36,9 @@ use proto::payloads;
 use tunnel_protocol as proto;
 
 use crate::path::{self, PathKind, PathTable};
-use crate::store::{Config, TransportMode};
+use crate::store::{self, Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
-use crate::{dht, federation, mesh, probe};
+use crate::{dht, federation, friends, mesh, probe};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
@@ -776,6 +776,36 @@ pub enum Event {
         pubkey: [u8; 32],
         items: Vec<payloads::FriendGroup>,
     },
+    /// Входящая заявка в друзья (`FRIEND_REQ_RCVD`, issue #24). Повторная
+    /// доставка (после HELLO, продление срока) — тоже это событие: UI убирает
+    /// дубликаты по `pubkey`, `expires_in` — секунд до истечения.
+    FriendRequest {
+        pubkey: [u8; 32],
+        name: String,
+        expires_in: u32,
+    },
+    /// Заявку приняли: `pubkey` теперь друг (сервер подтвердил пару).
+    FriendAccepted {
+        pubkey: [u8; 32],
+        name: String,
+    },
+    /// Нашу заявку отклонили.
+    FriendDeclined {
+        pubkey: [u8; 32],
+        name: String,
+    },
+    /// Дружбу сняла вторая сторона — запись у нас тоже уходит.
+    FriendRemoved {
+        pubkey: [u8; 32],
+    },
+    /// Сервер прислал окно списка друзей: состояния сняты/обновлены по нему.
+    /// `count` — сколько записей было в окне (для лога), `complete` —
+    /// покрывает ли окно список целиком (иначе движок дочитывает сам).
+    FriendsSynced {
+        from: [u8; 32],
+        complete: bool,
+        count: usize,
+    },
     /// Доступные федерированные группы сервера (`FED_GROUPS`, T4) — снимок
     /// списка целиком; пустой список — реплик больше нет. `Cmd::JoinFed`
     /// входит в группу по `uuid`.
@@ -877,12 +907,24 @@ pub enum Cmd {
     /// Переключить автовход в группу (локальная настройка).
     ToggleAutojoin(u32),
     FriendGroups([u8; 32]),
-    /// Друг в конфиг (PLAN.md 7.1): тот же pubkey — обновить alias.
+    /// Заявка в друзья (issue #24): сетевой кадр `FRIEND_REQ`, вторая сторона
+    /// узнаёт о ней от сервера (в т.ч. когда её нет в сети). `alias` — ручное
+    /// имя, пусто — не задавать. Требует связи: без сервера заявку доставить
+    /// некому, поэтому локальная запись тут больше не делается.
     AddFriend {
         pubkey: [u8; 32],
         alias: String,
     },
-    /// Удалить друга из конфига.
+    /// Принять входящую заявку (`FRIEND_ACCEPT`).
+    AcceptFriend([u8; 32]),
+    /// Отклонить входящую заявку (`FRIEND_DECLINE`).
+    DeclineFriend([u8; 32]),
+    /// Снять дружбу (`FRIEND_REMOVE`); вторая сторона получает
+    /// `FRIEND_REMOVED` и тоже убирает запись.
+    RemoveFriend([u8; 32]),
+    /// Убрать друга из списка: локальная запись (`Legacy`) снимается сразу, а
+    /// подтверждённая сервером дружба — через `FRIEND_REMOVE`, иначе следующий
+    /// список вернёт её обратно.
     DelFriend([u8; 32]),
     /// Alias друга (переименование; друга нет — `Event::Error`).
     SetAlias {
@@ -2142,6 +2184,10 @@ pub fn start_with_tun(
     }
     // Первое подключение — синхронно, чтобы ошибка была видна сразу.
     let mut st = State::new(server_pub);
+    // Друзья (issue #24): до первого FRIEND_LIST источник — `client.json`.
+    // Записи `Legacy` (добавленные до заявок) живут локально, пока сервер не
+    // пришлёт пару; подтверждённые сервером сверка снимет, если пары нет.
+    st.friends = crate::friends::Friends::from_cfg(&cfg.lock().unwrap(), Instant::now());
     st.rx_ctx = Some((env.clone(), in_tx));
     if let Err(e) = first_connect(&env, &in_rx, &mut st) {
         env.quit.store(true, Ordering::Relaxed);
@@ -2379,6 +2425,16 @@ struct State {
     /// Последний отправленный `SERVER_HINT` (T4): `None` — ещё не слали
     /// этому серверу (сразу после WELCOME, не чаще `SERVER_HINT_EVERY`).
     last_hint: Option<Instant>,
+    /// Друзья и заявки (issue #24): состояния ведёт модель, `client.json` —
+    /// её кэш (см. `crate::friends`).
+    friends: crate::friends::Friends,
+    /// Ожидаемое окно списка друзей: (`from`, с какого момента ждём) — сервер
+    /// шлёт не больше [`tunnel_protocol::payloads::FriendList`]-окна за раз.
+    friend_sync: Option<([u8; 32], Instant)>,
+    last_friend_req: Instant,
+    /// Отклонённые заявки в друзья, отказ ещё не подтверждён окном.
+    declining_friends: HashMap<[u8; 32], Instant>,
+    last_friend_decline: Instant,
 }
 
 impl State {
@@ -2425,11 +2481,37 @@ impl State {
             last_route_probe: now,
             lookup_seq: 1,
             last_hint: None,
+            friends: crate::friends::Friends::new(),
+            friend_sync: None,
+            last_friend_req: now,
+            declining_friends: HashMap::new(),
+            last_friend_decline: now,
         }
     }
 
     fn connected(&self) -> bool {
         self.sess.is_some()
+    }
+
+    /// Перенести состояния друзей из модели в `client.json` (алиасы модель не
+    /// трогает — это локальные имена, см. [`crate::friends::Friends::apply`]).
+    /// Файл не переписывается, если ничего не изменилось: `save` — запись на
+    /// диск, а список друзей обновляется на каждый `FRIEND_LIST`.
+    fn sync_friends_cfg(&self, env: &Env) {
+        let mut cfg = env.cfg.lock().unwrap();
+        let mut next = cfg.clone();
+        self.friends.apply(&mut next);
+        let changed = next.friends.len() != cfg.friends.len()
+            || next
+                .friends
+                .iter()
+                .zip(&cfg.friends)
+                .any(|(a, b)| a.pubkey != b.pubkey || a.state != b.state || a.nick != b.nick);
+        if !changed {
+            return;
+        }
+        cfg.friends = next.friends;
+        (env.save)(&cfg);
     }
 
     /// Новая попытка рукопожатия (новый эфемерный ключ), HELLO3 — сразу.
@@ -2889,6 +2971,29 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
             let gids: Vec<u32> = st.declining.keys().copied().collect();
             for gid in gids {
                 st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
+            }
+        }
+        // Друзья (issue #24): отказ повторяется, пока окно списка не
+        // подтвердит, а неполное окно — дочитывается (сервер шлёт по 16).
+        if !st.declining_friends.is_empty()
+            && now.duration_since(st.last_friend_decline) >= DECLINE_RETRY
+        {
+            st.last_friend_decline = now;
+            st.declining_friends
+                .retain(|_, started| now.duration_since(*started) < DECLINE_GIVE_UP);
+            let pks: Vec<[u8; 32]> = st.declining_friends.keys().copied().collect();
+            for pk in pks {
+                st.send_ctrl(env, ctrl::FRIEND_DECLINE, &payloads::enc_pubkey(&pk));
+            }
+        }
+        if let Some((from, since)) = st.friend_sync
+            && now.duration_since(st.last_friend_req) >= INVITE_SYNC_RETRY
+        {
+            st.last_friend_req = now;
+            if now.duration_since(since) < INVITE_SYNC_GIVE_UP {
+                st.send_ctrl(env, ctrl::LIST_FRIENDS, &payloads::enc_pubkey(&from));
+            } else {
+                st.friend_sync = None;
             }
         }
         if !st.want_group.is_empty() {
@@ -3771,9 +3876,56 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             }
             return;
         }
-        Cmd::AddFriend { .. }
-        | Cmd::DelFriend(_)
-        | Cmd::SetAlias { .. }
+        Cmd::DelFriend(pk) => {
+            // Что снимаем: локальную запись — сразу, подтверждённую сервером
+            // — только через FRIEND_REMOVE (иначе следующий список вернёт её
+            // обратно). Отменить отправленную заявку протокол не умеет:
+            // честнее сказать это, чем показать «удалено» и вернуть запись.
+            match st.friends.state_of(&pk) {
+                Some(store::FriendState::Accepted) => {
+                    if !st.connected() {
+                        env.emit(Event::Error(
+                            "нет связи с сервером — дружбу снять нельзя: сервер о ней знает".into(),
+                        ));
+                        return;
+                    }
+                    remove_friend(env, st, pk);
+                }
+                Some(store::FriendState::PendingIn) => {
+                    if !st.connected() {
+                        env.emit(Event::Error(
+                            "нет связи с сервером — заявку не отклонить".into(),
+                        ));
+                        return;
+                    }
+                    decline_friend(env, st, pk);
+                }
+                Some(store::FriendState::PendingOut) => {
+                    env.emit(Event::Error(
+                        "заявка уже отправлена — отменить её нельзя, она истечёт сама".into(),
+                    ));
+                }
+                // Локальная запись (или её уже нет) — снимаем у себя.
+                _ => {
+                    if st.friends.on_removed(&pk).is_none()
+                        && !env
+                            .cfg
+                            .lock()
+                            .unwrap()
+                            .friends
+                            .iter()
+                            .any(|f| proto::hex_to_bytes(&f.pubkey).ok() == Some(pk.to_vec()))
+                    {
+                        env.emit(Event::Error("такого друга нет".into()));
+                        return;
+                    }
+                    st.sync_friends_cfg(env);
+                    env.emit(Event::Notice("друг удалён".into()));
+                }
+            }
+            return;
+        }
+        Cmd::SetAlias { .. }
         | Cmd::AddServer { .. }
         | Cmd::DelServer { .. }
         | Cmd::SetPrimaryServer { .. }
@@ -3781,6 +3933,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::UnpinPath { .. }
         | Cmd::SetRelayEnabled(_)
         | Cmd::SetMeshEnabled(_) => {
+            // Правки конфига, которым сервер не нужен. Друзья-заявки — не
+            // здесь: они сетевые (см. ниже), иначе вторая сторона о них не
+            // узнала бы.
             cfg_cmd(env, st, cmd);
             return;
         }
@@ -3852,6 +4007,36 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         Cmd::FriendGroups(pk) => {
             st.send_ctrl(env, ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&pk));
         }
+        // ---------- друзья (issue #24) ----------
+        //
+        // Заявка — сетевой кадр: вторая сторона узнаёт о ней от сервера, в том
+        // числе когда её нет в сети. Локально сразу помечаем «ждёт ответа»,
+        // чтобы панель не ждала списка.
+        Cmd::AddFriend { pubkey, alias } => {
+            if !alias.trim().is_empty() {
+                let hex = proto::hex_of(&pubkey);
+                let a = alias.clone();
+                env.update_cfg(|c| match c.friends.iter_mut().find(|f| f.pubkey == hex) {
+                    Some(f) => f.alias = a,
+                    None => c.friends.push(store::StoredFriend {
+                        pubkey: hex,
+                        alias: a,
+                        ..Default::default()
+                    }),
+                });
+            }
+            st.friends.request_sent(pubkey, Instant::now());
+            st.sync_friends_cfg(env);
+            st.send_ctrl(env, ctrl::FRIEND_REQ, &payloads::enc_pubkey(&pubkey));
+        }
+        Cmd::AcceptFriend(pk) => {
+            // Оптимистично: дружба появится в панели сразу, список подтвердит.
+            st.friends.on_accepted(pk, String::new(), Instant::now());
+            st.sync_friends_cfg(env);
+            st.send_ctrl(env, ctrl::FRIEND_ACCEPT, &payloads::enc_pubkey(&pk));
+        }
+        Cmd::DeclineFriend(pk) => decline_friend(env, st, pk),
+        Cmd::RemoveFriend(pk) => remove_friend(env, st, pk),
         Cmd::Quit
         | Cmd::ToggleAutojoin(_)
         | Cmd::SetName(_)
@@ -3859,7 +4044,6 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::SetInvisible(_)
         | Cmd::SwitchServer { .. }
         | Cmd::Reconnect
-        | Cmd::AddFriend { .. }
         | Cmd::DelFriend(_)
         | Cmd::SetAlias { .. }
         | Cmd::AddServer { .. }
@@ -3873,6 +4057,30 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::SetMeshEnabled(_)
         | Cmd::ProbeServer { .. } => {}
     }
+}
+
+/// Отказ от заявки в друзья: убрать у себя сразу и повторять `FRIEND_DECLINE`,
+/// пока окно списка не подтвердит (потерянный кадр оставил бы заявку на
+/// сервере, а инициатор не узнал бы об отказе).
+fn decline_friend(env: &Env, st: &mut State, pk: [u8; 32]) {
+    let now = Instant::now();
+    st.friends.on_decline_sent(pk, now);
+    st.declining_friends.insert(pk, now);
+    st.last_friend_decline = now;
+    st.sync_friends_cfg(env);
+    st.send_ctrl(env, ctrl::FRIEND_DECLINE, &payloads::enc_pubkey(&pk));
+    env.emit(Event::Notice("заявка отклонена".into()));
+}
+
+/// Снятие дружбы: запись уходит у обоих (сервер уведомит вторую сторону).
+fn remove_friend(env: &Env, st: &mut State, pk: [u8; 32]) {
+    if st.friends.on_removed(&pk).is_none() {
+        env.emit(Event::Error("такого друга нет".into()));
+        return;
+    }
+    st.sync_friends_cfg(env);
+    st.send_ctrl(env, ctrl::FRIEND_REMOVE, &payloads::enc_pubkey(&pk));
+    env.emit(Event::Notice("друг удалён".into()));
 }
 
 /// Проверка команды правки конфига до отправки движку (демон отвечает
@@ -3936,19 +4144,6 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         return;
     }
     match cmd {
-        Cmd::AddFriend { pubkey, alias } => {
-            let hex = proto::hex_of(&pubkey);
-            let a = alias.clone();
-            env.update_cfg(|c| match c.friends.iter_mut().find(|f| f.pubkey == hex) {
-                Some(f) => f.alias = a,
-                None => c.friends.push(crate::store::StoredFriend {
-                    pubkey: hex,
-                    alias: a,
-                    ..Default::default()
-                }),
-            });
-            env.emit(Event::Notice(format!("друг добавлен: {alias}")));
-        }
         Cmd::DelFriend(pubkey) => {
             let hex = proto::hex_of(&pubkey);
             env.update_cfg(|c| c.friends.retain(|f| f.pubkey != hex));
@@ -4150,6 +4345,7 @@ impl State {
 }
 
 fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
+    let now = Instant::now();
     match typ {
         ctrl::GROUP_STATE => {
             if let Ok(gs) = payloads::dec_group_state(payload) {
@@ -4335,6 +4531,99 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                     pubkey: f.target,
                     items: f.groups,
                 });
+            }
+        }
+        // ---------- друзья (issue #24) ----------
+        //
+        // Состояния ведёт модель `st.friends`, `client.json` — её кэш; UI
+        // получает и события (окно заявки, тосты), и снимок конфига.
+        ctrl::FRIEND_REQ_RCVD => {
+            if let Ok(n) = payloads::dec_friend_req_rcvd(payload) {
+                match st
+                    .friends
+                    .on_request(n.from, n.from_name.clone(), Some(n.expires_in), now)
+                {
+                    friends::RequestOutcome::New => {
+                        st.sync_friends_cfg(env);
+                        env.emit(Event::FriendRequest {
+                            pubkey: n.from,
+                            name: n.from_name,
+                            expires_in: n.expires_in,
+                        });
+                    }
+                    friends::RequestOutcome::Accepted => {
+                        // Встречная заявка: сервер уже считает пару принятой.
+                        st.sync_friends_cfg(env);
+                        env.emit(Event::FriendAccepted {
+                            pubkey: n.from,
+                            name: n.from_name,
+                        });
+                    }
+                    // Повтор — только данные; запоздавший список после отказа
+                    // — игнор (память отказа).
+                    friends::RequestOutcome::Updated | friends::RequestOutcome::Declined => {
+                        st.sync_friends_cfg(env);
+                    }
+                }
+            }
+        }
+        ctrl::FRIEND_LIST => {
+            if let Ok(list) = payloads::dec_friend_list(payload) {
+                // Неполное окно — дочитать следующее: сервер шлёт не больше
+                // 16 за раз, а показать нужно все. Ключи растут, цепочка
+                // конечна (последний ключ окна повторяется первым).
+                let next = list.next_from();
+                let (from, complete, count) = (list.from, list.complete, list.items.len());
+                // Отказ подтверждён: окно покрывает ключ, а заявки в нём нет.
+                st.declining_friends
+                    .retain(|pk, _| !list.covers(pk) || list.items.iter().any(|i| i.pk == *pk));
+                let removed = st.friends.on_synced(&list.items, &from, complete, now);
+                for f in &removed {
+                    env.emit(Event::FriendRemoved { pubkey: f.pk });
+                }
+                st.sync_friends_cfg(env);
+                if let Some(n) = next {
+                    st.send_ctrl(env, ctrl::LIST_FRIENDS, &payloads::enc_pubkey(&n));
+                    st.friend_sync = Some((n, now));
+                    st.last_friend_req = now;
+                } else {
+                    st.friend_sync = None;
+                }
+                env.emit(Event::FriendsSynced {
+                    from,
+                    complete,
+                    count,
+                });
+            }
+        }
+        ctrl::FRIEND_REQ_ACCEPTED => {
+            if let Ok(v) = payloads::dec_friend_accepted(payload) {
+                st.friends.on_accepted(v.by, v.by_name.clone(), now);
+                st.declining_friends.remove(&v.by);
+                st.sync_friends_cfg(env);
+                env.emit(Event::FriendAccepted {
+                    pubkey: v.by,
+                    name: v.by_name,
+                });
+            }
+        }
+        ctrl::FRIEND_REQ_DECLINED => {
+            if let Ok(v) = payloads::dec_friend_declined(payload) {
+                st.friends.on_declined(v.by, now);
+                st.sync_friends_cfg(env);
+                env.emit(Event::FriendDeclined {
+                    pubkey: v.by,
+                    name: v.by_name,
+                });
+            }
+        }
+        ctrl::FRIEND_REMOVED => {
+            if let Ok(by) = payloads::dec_friend_removed(payload) {
+                // Уже снят нами — не повод для второго тоста.
+                if st.friends.on_removed(&by).is_some() {
+                    st.sync_friends_cfg(env);
+                    env.emit(Event::FriendRemoved { pubkey: by });
+                }
             }
         }
         ctrl::CTRL_PONG => {
@@ -5213,6 +5502,36 @@ pub fn run(
             ),
             Event::InviteRevoked { gid } => {
                 eprintln!("[engine] приглашение в группу {gid} больше недействительно")
+            }
+            // Друзья (issue #24): в `run` ответить на месте нельзя по той же
+            // причине, что и на приглашение, — командой после остановки run
+            // (`accept-friend` / `decline-friend`) или в TUI.
+            Event::FriendRequest {
+                pubkey,
+                name,
+                expires_in,
+            } => eprintln!(
+                "[engine] заявка в друзья от {name} ({}): истекает через {}; ответить — accept-friend / decline-friend после остановки run или в TUI",
+                friends::short_code(&pubkey),
+                fmt_secs(expires_in)
+            ),
+            Event::FriendAccepted { pubkey, name } => eprintln!(
+                "[engine] заявка принята: {name} ({}) теперь друг",
+                friends::short_code(&pubkey)
+            ),
+            Event::FriendDeclined { pubkey, name } => eprintln!(
+                "[engine] {name} ({}) отклонил заявку в друзья",
+                friends::short_code(&pubkey)
+            ),
+            Event::FriendRemoved { pubkey } => {
+                eprintln!("[engine] дружба с {} снята", friends::short_code(&pubkey))
+            }
+            Event::FriendsSynced {
+                count, complete, ..
+            } => {
+                if debug() {
+                    eprintln!("[engine] список друзей: {count} записей, полный: {complete}");
+                }
             }
             Event::ServerKeyRotated { addr, new_code } => eprintln!(
                 "[engine] ключ сервера {addr} сменён по цепочке ротации, закреплён новый: {new_code}"

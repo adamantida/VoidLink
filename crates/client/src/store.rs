@@ -384,7 +384,11 @@ impl Store {
 
     pub fn load(&self) -> Result<Config> {
         match std::fs::read(&self.path) {
-            Ok(raw) => Ok(serde_json::from_slice(&raw).context("client.json parse")?),
+            Ok(raw) => {
+                let mut cfg: Config = serde_json::from_slice(&raw).context("client.json parse")?;
+                migrate_friends(&mut cfg);
+                Ok(cfg)
+            }
             Err(_) => Ok(Config::default()),
         }
     }
@@ -394,6 +398,29 @@ impl Store {
         std::fs::write(&tmp, serde_json::to_vec_pretty(cfg)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+/// Миграция списка друзей при загрузке `client.json` (issue #24).
+///
+/// До появления заявок друг добавлялся локально, а `alias` по умолчанию
+/// подставлялся равным friend code. Такой «алиас» — не имя: в панели друзей
+/// он занимал всю строку и скрывал ник с сервера. Поэтому алиас, который
+/// парсится как friend code этого же pubkey, очищается; отсутствующий
+/// `state` serde подставляет как [`FriendState::Legacy`] — запись живёт
+/// локально, пока сервер не подтвердит пару.
+pub fn migrate_friends(cfg: &mut Config) {
+    for f in cfg.friends.iter_mut() {
+        let Ok(pk) = crate::friends::parse_pk(&f.pubkey) else {
+            continue;
+        };
+        let alias = f.alias.trim();
+        if alias.is_empty() {
+            continue;
+        }
+        if proto::parse_friend_code(alias).ok() == Some(pk) {
+            f.alias.clear();
+        }
     }
 }
 
@@ -424,7 +451,11 @@ pub fn ensure_identity(cfg: &mut Config) -> proto::Identity {
     id
 }
 
-/// Токен пира → pubkey: friend code, hex или alias из списка друзей.
+/// Токен пира → pubkey: friend code, hex или имя друга (алиас либо ник).
+///
+/// Имена не уникальны: если под токен подходит несколько друзей, это ошибка
+/// со списком кандидатов, а не «первый в списке» — иначе `say`/`friend-groups`
+/// уходили бы случайному тёзке.
 pub fn resolve_peer(cfg: &Config, token: &str) -> Result<[u8; 32]> {
     if let Ok(pk) = proto::Identity::parse_friend_code(token) {
         return Ok(pk);
@@ -435,12 +466,49 @@ pub fn resolve_peer(cfg: &Config, token: &str) -> Result<[u8; 32]> {
     {
         return Ok(v.try_into().unwrap());
     }
-    if let Some(f) = cfg.friends.iter().find(|f| f.alias.to_lowercase() == t) {
-        let v = proto::hex_to_bytes(&f.pubkey)?;
-        anyhow::ensure!(v.len() == 32, "bad stored pubkey");
-        return Ok(v.try_into().unwrap());
+    // Один друг может подойти и алиасом, и ником — считаем его один раз.
+    // Сравниваем с тем именем, которое видно: алиас перекрывает ник, иначе
+    // «второй» в списке не находился бы, а скрытый ник — находился.
+    let mut hits: Vec<[u8; 32]> = Vec::new();
+    for f in &cfg.friends {
+        let Ok(pk) = crate::friends::parse_pk(&f.pubkey) else {
+            continue;
+        };
+        let shown = crate::friends::display_name(&f.alias, &f.nick, &pk);
+        if shown.to_lowercase() == t && !hits.contains(&pk) {
+            hits.push(pk);
+        }
     }
-    anyhow::bail!("не найден peer по токену {token:?} (ни friend code, ни hex, ни alias)")
+    match hits.len() {
+        0 => anyhow::bail!(
+            "не найден peer по токену {token:?} (ни friend code, ни hex, ни алиас/ник)"
+        ),
+        1 => Ok(hits[0]),
+        _ => {
+            let names: Vec<String> = hits
+                .iter()
+                .map(|pk| {
+                    let f = cfg
+                        .friends
+                        .iter()
+                        .find(|f| crate::friends::parse_pk(&f.pubkey).ok() == Some(*pk));
+                    let (alias, nick) = f
+                        .map(|f| (f.alias.as_str(), f.nick.as_str()))
+                        .unwrap_or(("", ""));
+                    format!(
+                        "{} ({})",
+                        crate::friends::display_name(alias, nick, pk),
+                        proto::hex_of(&pk[..4])
+                    )
+                })
+                .collect();
+            anyhow::bail!(
+                "«{token}» — неоднозначно: подходит {} друга — {}; уточните friend code",
+                hits.len(),
+                names.join(", ")
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -512,6 +580,96 @@ mod tests {
         assert_eq!(cfg.autojoin, vec![1, 2]);
         assert!(cfg.activate_server(b));
         assert_eq!(cfg.autojoin, vec![7]);
+    }
+
+    fn friend(pk: [u8; 32], alias: &str, nick: &str, state: FriendState) -> StoredFriend {
+        StoredFriend {
+            pubkey: proto::hex_of(&pk),
+            alias: alias.into(),
+            nick: nick.into(),
+            state,
+        }
+    }
+
+    #[test]
+    fn старый_друг_без_состояния_читается_как_локальный() {
+        // Конфиг до issue #24: ни `state`, ни `nick` в записи нет.
+        let pk = [7u8; 32];
+        let json = format!(
+            r#"{{"name":"a","friends":[{{"pubkey":"{}","alias":"старый"}}]}}"#,
+            proto::hex_of(&pk)
+        );
+        let cfg: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.friends.len(), 1);
+        assert_eq!(cfg.friends[0].state, FriendState::Legacy);
+        assert!(cfg.friends[0].nick.is_empty());
+        assert_eq!(cfg.friends[0].alias, "старый");
+        // Состояние пишется и читается обратно.
+        let mut cfg = Config::default();
+        cfg.friends
+            .push(friend(pk, "имя", "ник", FriendState::Accepted));
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.friends[0].state, FriendState::Accepted);
+        assert_eq!(back.friends[0].nick, "ник");
+    }
+
+    #[test]
+    fn алиас_равный_коду_при_загрузке_очищается() {
+        let pk = [9u8; 32];
+        let code = proto::friend_code_of(&pk);
+        let mut cfg = Config::default();
+        cfg.friends.push(friend(pk, &code, "", FriendState::Legacy));
+        // Имя, не совпадающее с кодом, и код чужого ключа не трогаем.
+        cfg.friends
+            .push(friend([8u8; 32], "нормальное имя", "", FriendState::Legacy));
+        cfg.friends
+            .push(friend([3u8; 32], &code, "", FriendState::Legacy));
+        migrate_friends(&mut cfg);
+        assert!(
+            cfg.friends[0].alias.is_empty(),
+            "friend code в алиасе — это код, а не имя"
+        );
+        assert_eq!(cfg.friends[1].alias, "нормальное имя");
+        assert_eq!(
+            cfg.friends[2].alias, code,
+            "код другого ключа — тоже код, но по контракту чистим только совпадающий"
+        );
+        // Повторная миграция идемпотентна.
+        migrate_friends(&mut cfg);
+        assert!(cfg.friends[0].alias.is_empty());
+    }
+
+    #[test]
+    fn несколько_друзей_с_одним_ником_не_разрешаются_молча() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let mut cfg = Config::default();
+        cfg.friends
+            .push(friend(a, "", "тёзка", FriendState::Accepted));
+        cfg.friends
+            .push(friend(b, "", "тёзка", FriendState::Accepted));
+        // Один тёзка — разрешается.
+        let err = resolve_peer(&cfg, "тёзка").unwrap_err().to_string();
+        assert!(err.contains("неоднозначно"), "{err}");
+        assert!(err.contains("тёзка"), "в ошибке есть список: {err}");
+        assert!(err.contains("2"), "и число кандидатов: {err}");
+        // Алиас перекрывает ник и снимает неоднозначность.
+        cfg.friends[1].alias = "второй".into();
+        assert_eq!(resolve_peer(&cfg, "тёзка").unwrap(), a);
+        assert_eq!(resolve_peer(&cfg, "второй").unwrap(), b);
+        // Точный ключ разрешается всегда — это не имя.
+        assert_eq!(resolve_peer(&cfg, &proto::hex_of(&b)).unwrap(), b);
+        assert_eq!(resolve_peer(&cfg, &proto::friend_code_of(&a)).unwrap(), a);
+        // Друг, подходящий и алиасом, и ником, считается один раз.
+        cfg.friends[0].alias = "тёзка".into();
+        cfg.friends[1].alias.clear();
+        assert_eq!(
+            resolve_peer(&cfg, "тёзка")
+                .unwrap_err()
+                .to_string()
+                .contains("2"),
+            true
+        );
     }
 
     #[test]

@@ -471,9 +471,14 @@ fn draw_friends(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             };
             let mut spans = vec![Span::styled(format!("{mark} "), style)];
             spans.push(Span::styled(
-                fr.alias.clone(),
+                fr.display(),
                 if fr.online { th.base } else { th.dim },
             ));
+            // Маркер состояния (issue #24): заявка отправлена/пришла,
+            // локальная запись. Обычная дружба маркера не имеет — это норма.
+            if let Some(badge) = fr.badge() {
+                spans.push(Span::styled(format!("  {badge}"), th.warn));
+            }
             if fr.shared_groups > 0 {
                 spans.push(Span::styled(
                     format!("  {} общих", fr.shared_groups),
@@ -1213,6 +1218,11 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
             open_popup(f, app, rect);
             draw_invite(f, app, th, inv, rect);
         }
+        Popup::FriendReq(req) => {
+            let rect = centered(area, 66, 8);
+            open_popup(f, app, rect);
+            draw_friend_req(f, app, th, req, rect);
+        }
         // Свои рамка и геометрия для мыши — в самих модулях.
         Popup::Admin(v) => crate::tui::admin::draw(f, th, v, area),
         Popup::Servers(v) => v.draw(f, th, area),
@@ -1890,8 +1900,73 @@ fn draw_invite(f: &mut Frame, app: &App, th: &Theme, inv: &InvitePopup, area: Re
     );
 }
 
-// ---------------------------------------------------------------- справка
+/// Окно входящей заявки в друзья (issue #24): кто и сколько ждать ответа.
+/// Ника и алиас берём из своего списка — в кадре сервера ник мог быть пустым.
+fn draw_friend_req(
+    f: &mut Frame,
+    app: &App,
+    th: &Theme,
+    req: &crate::tui::app::FriendReqPopup,
+    area: Rect,
+) {
+    let title = vec![Span::styled(" ☆ Заявка в друзья ", th.title)];
+    let who = app
+        .friends
+        .iter()
+        .find(|x| x.pubkey == req.pubkey)
+        .map(|x| x.display())
+        .unwrap_or_else(|| req.name.clone());
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("от:      ", th.dim),
+            Span::styled(who, th.base.add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("ключ:    ", th.dim),
+            Span::styled(crate::friends::short_code(&req.pubkey), th.dim),
+        ]),
+        Line::from(vec![
+            Span::styled("пришло:  ", th.dim),
+            Span::styled(ago(req.received_at), th.dim),
+            Span::styled(
+                req.expires_at
+                    .map(|t| format!(" · {}", left_until(t)))
+                    .unwrap_or_default(),
+                th.warn,
+            ),
+        ]),
+        Line::from(""),
+    ];
+    let buttons_at = lines.len() as u16;
+    let block = popup_block(
+        th,
+        Line::from(title),
+        Style::default()
+            .fg(th.c.accent_alt)
+            .add_modifier(Modifier::BOLD),
+    )
+    .title_bottom(Line::from(Span::styled(
+        " Enter/y — принять · n — отклонить · Esc — закрыть (заявка останется) ",
+        th.dim,
+    )))
+    .padding(ratatui::widgets::Padding::horizontal(1));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    draw_buttons(
+        f,
+        th,
+        &app.hits.popup_buttons,
+        button_row(area, buttons_at),
+        &[
+            ("Принять (Enter)", Btn::Primary, key(KeyCode::Enter)),
+            ("Отклонить (n)", Btn::Danger, key(KeyCode::Char('n'))),
+            ("Позже (Esc)", Btn::Normal, key(KeyCode::Esc)),
+        ],
+        2,
+        false,
+    );
+}
 
+// ---------------------------------------------------------------- справка
 fn help_lines(th: &Theme) -> Vec<Line<'static>> {
     let kv = |k: &str, v: &str| {
         Line::from(vec![
@@ -2082,6 +2157,8 @@ mod tests {
         }];
         app.friends = vec![FriendView {
             alias: "bravo".into(),
+            nick: String::new(),
+            state: crate::store::FriendState::Accepted,
             pubkey: [2; 32],
             online: true,
             shared_groups: 1,
@@ -2686,6 +2763,8 @@ mod tests {
         for i in 0..20u8 {
             app.friends.push(FriendView {
                 alias: format!("f{i:02}"),
+                nick: String::new(),
+                state: crate::store::FriendState::Accepted,
                 pubkey: [200 + i; 32],
                 online: i.is_multiple_of(2),
                 shared_groups: 0,
