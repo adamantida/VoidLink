@@ -98,9 +98,31 @@ impl PathSnap {
 
 impl PeerSnap {
     pub fn from_sess(p: &PeerSess, paths: &PathTable, now: Instant) -> Self {
-        let path = paths
-            .current(p.ip)
-            .map(|kind| PathSnap::new(kind, paths.current_rtt(p.ip).map(u64::from)));
+        // Офлайн-участник пути не имеет (issue #14): ни пути, ни RTT, ни
+        // метрик — в UI «—». Иначе таблица показывала бы «server» и плечо
+        // сервера как RTT до человека, которого нет в сети.
+        let path = p
+            .online
+            .then_some(p.ip)
+            .and_then(|ip| paths.current(ip))
+            .map(|kind| {
+                let m = paths.metrics(p.ip).unwrap_or_default();
+                PathSnap {
+                    kind,
+                    // Честный end-to-end RTT выбранного пути (issue #15):
+                    // для server — полный маршрут, а не плечо до сервера.
+                    rtt_ms: paths.current_rtt(p.ip).map(u64::from),
+                    // Плечо «мы→сервер» — отдельным полем и только для
+                    // серверного пути (issue #15).
+                    leg_ms: (kind == PathKind::Server)
+                        .then(|| paths.server_rtt())
+                        .flatten()
+                        .map(u64::from),
+                    jitter_ms: Some(m.jitter_ms),
+                    loss_pm: Some(m.loss_pm),
+                    hist: m.hist,
+                }
+            });
         Self {
             pubkey: p.pubkey,
             name: p.name.clone(),
@@ -603,6 +625,8 @@ mod tests {
             rtt_ms: None,
             mesh_x: None,
             mesh_caps: 0,
+            punch_fails: 0,
+            punch_at: None,
         };
         let paths = PathTable::empty();
         let p = PeerSnap::from_sess(&peer, &paths, now);
@@ -611,5 +635,73 @@ mod tests {
         assert_eq!(p.endpoint.as_deref(), Some("1.2.3.4:5"));
         // Момент в будущем (гонка часов) — ноль, а не паника.
         assert_eq!(ms_ago(now + Duration::from_secs(1), now), 0);
+    }
+
+    /// Участник для тестов снимка (все необязательные поля — пустые).
+    fn peer(online: bool, ip: u32) -> PeerSess {
+        PeerSess {
+            pubkey: [1; 32],
+            name: "bravo".into(),
+            status: String::new(),
+            online,
+            ip,
+            endpoint: None,
+            candidates: Vec::new(),
+            direct_addr: None,
+            last_rx: Instant::now(),
+            last_direct: None,
+            rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
+            punch_fails: 0,
+            punch_at: None,
+        }
+    }
+
+    #[test]
+    fn офлайн_участник_без_пути_в_снимке() {
+        let paths = PathTable::empty();
+        // Таблица ещё помнит путь (участник только что ушёл в офлайн) —
+        // снимок офлайн-участника пути не содержит (issue #14).
+        paths.record_server_rtt(1, 0);
+        paths.ensure_target(7);
+        paths.recalc(100, true);
+        assert_eq!(paths.current(7), Some(PathKind::Server));
+        let p = PeerSnap::from_sess(&peer(false, 7), &paths, Instant::now());
+        assert!(!p.online);
+        assert!(p.path.is_none(), "у офлайн-участника путь: {:?}", p.path);
+        // Онлайн — путь снова в снимке.
+        let p = PeerSnap::from_sess(&peer(true, 7), &paths, Instant::now());
+        assert_eq!(p.path.map(|x| x.kind), Some(PathKind::Server));
+    }
+
+    #[test]
+    fn онлайн_участник_с_серверным_путём_и_rtt_сервера() {
+        let paths = PathTable::empty();
+        // Плечо «мы→сервер» — 1 мс, честный end-to-end маршрута — 42 мс.
+        paths.record_server_rtt(1, 0);
+        paths.ensure_target(7);
+        paths.recalc(100, true);
+        paths.record_server_path_rtt(7, 42, 150);
+        paths.record_probe_sent(7);
+        paths.record_probe_answered(7);
+        let p = PeerSnap::from_sess(&peer(true, 7), &paths, Instant::now());
+        let path = p.path.expect("путь сервера");
+        assert_eq!(path.kind, PathKind::Server);
+        assert_eq!(path.rtt_ms, Some(42), "RTT — end-to-end, не плечо");
+        assert_eq!(path.leg_ms, Some(1), "плечо отдельным полем");
+        assert_eq!(path.loss_pm, Some(0), "проба ответила");
+        assert_eq!(path.jitter_ms, Some(0));
+        assert_eq!(path.hist, vec![42], "история текущего пути");
+        // Прямой путь плеча не имеет — leg_ms только для сервера.
+        let paths = PathTable::empty();
+        paths.record_direct_rtt(7, 30, 0);
+        paths.ensure_target(7);
+        paths.recalc(10, true);
+        let path = PeerSnap::from_sess(&peer(true, 7), &paths, Instant::now())
+            .path
+            .expect("прямой путь");
+        assert_eq!(path.kind, PathKind::Direct);
+        assert_eq!(path.leg_ms, None);
     }
 }

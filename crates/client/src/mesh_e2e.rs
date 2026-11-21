@@ -59,10 +59,7 @@ impl Node {
     }
 
     fn start_as(name: &str, server: &tunnel_server::Server, identity: proto::Identity) -> Node {
-        let cfg = Config {
-            name: name.into(),
-            ..Config::default()
-        };
+        let cfg = test_cfg(name);
         Node::start_cfg(cfg, server, identity).expect("движок подключается")
     }
 
@@ -182,6 +179,21 @@ impl Node {
 
 fn local(addr: SocketAddr) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], addr.port()))
+}
+
+/// Конфиг узла для e2e путей: на loopback разница direct↔server — единицы
+/// миллисекунд, поэтому абсолютный гистерезис 15 мс и удержание 10 с сделали
+/// бы переключение на прямой путь недостижимым за таймаут теста. Механика
+/// выбора та же, пороги берутся из конфига (issue #16/#17); пробы — раз в 2 с,
+/// чтобы тесты не ждали 5-секундный интервал.
+fn test_cfg(name: &str) -> Config {
+    Config {
+        name: name.into(),
+        rtt_interval_ms: 2_000,
+        path_hysteresis_ms: 0,
+        path_dwell_ms: 0,
+        ..Config::default()
+    }
 }
 
 fn temp_dir(tag: &str) -> PathBuf {

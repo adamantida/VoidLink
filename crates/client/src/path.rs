@@ -6,20 +6,33 @@
 //!
 //! ```text
 //! cost(direct)  = rtt_direct
-//! cost(server)  = rtt_server + 5
+//! cost(server)  = rtt_server_e2e + 5   (пока e2e нет — плечо до сервера + 5)
 //! cost(peer R)  = rtt(us→R) + rtt(R→dst) + 15 + 10 * load(R)
 //! ```
+//!
+//! `rtt_server_e2e` — **честный end-to-end** замер маршрута через сервер
+//! ([`PathTable::record_server_path_rtt`], issue #15): PONG на групповой PING,
+//! ушедший серверу. Плечо «мы→сервер» (`CTRL_PONG`) — только стоимость до
+//! первого e2e-замера и отдельное поле снимка ([`PathTable::server_rtt`]);
+//! [`PathTable::current_rtt`] плечо не возвращает никогда.
 //!
 //! Правила:
 //! 1. Пересчёт — [`PathTable::recalc`] (движок зовёт раз в 10 с и при падении
 //!    пути).
-//! 2. **Гистерезис 20 %**: новый путь выбирается, только если он дешевле
-//!    текущего на ≥ 20 % либо текущий путь мёртв, — иначе «дребезг» между
-//!    почти равными путями.
-//! 3. **Ручное закрепление** ([`PathTable::set_pin`], `client.json` →
-//!    `pinned_paths`) сильнее автоматики. Закреплённый, но недоступный путь
-//!    даёт `Lost` и откат на автоматику; закрепление при этом не удаляется, а
-//!    помечается нерабочим (пока путь не оживёт).
+//! 2. **Гистерезис** (issue #17): новый путь выбирается, только если он
+//!    дешевле текущего и относительно (≥ [`HYSTERESIS_PCT`] %), и абсолютно
+//!    (≥ `path_hysteresis_ms`), а текущий путь держится не меньше
+//!    `path_dwell_ms`. Мёртвый текущий путь переключается сразу, без порогов и
+//!    без dwell.
+//! 3. **Проверка нового пути** (issue #26): [`VERIFY_MS`] после
+//!    автопереключения новый путь сравнивается со старым по RTT, потерям и
+//!    джиттеру; если он хуже — откат на старый путь и карантин альтернативы
+//!    на [`QUARANTINE_MS`] (`PathChange::Reverted`).
+//! 4. **Ручное закрепление** ([`PathTable::set_pin`], `client.json` →
+//!    `pinned_paths`) сильнее автоматики и не подчиняется dwell/порогам.
+//!    Закреплённый, но недоступный путь даёт `Lost` и откат на автоматику;
+//!    закрепление при этом не удаляется, а помечается нерабочим (пока путь не
+//!    оживёт).
 //!
 //! События `PathChanged`/`PathLost` формирует движок: таблица только считает
 //! изменения ([`PathChange`]), не зная про UI и каналы.
@@ -27,11 +40,14 @@
 //! Все времена — миллисекунды от старта движка (`now_ms`), а не `Instant`:
 //! так тесты детерминированы, а `Mutex` держится коротко (только арифметика).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tunnel_protocol as proto;
+
+use crate::store::{DEFAULT_PATH_DWELL_MS, DEFAULT_PATH_HYSTERESIS_MS, DEFAULT_RTT_INTERVAL_MS};
 
 /// Надбавка за релей сервера (L1): лишний хоп и очередь сервера.
 pub const HOP_PENALTY_SERVER_MS: f64 = 5.0;
@@ -40,18 +56,29 @@ pub const HOP_PENALTY_PEER_MS: f64 = 15.0;
 /// Надбавка за загрузку реле-пира: `load` 0..1 → 0..10 мс.
 pub const LOAD_PENALTY_MS: f64 = 10.0;
 /// Насколько новый путь должен быть дешевле текущего (в процентах), чтобы
-/// переключиться: 20 % — порог гистерезиса.
+/// переключиться: 20 % — относительный порог гистерезиса.
 pub const HYSTERESIS_PCT: f64 = 20.0;
 /// Прямой канал считается живым столько после последнего замера: `direct_addr`
-/// старше 12 с — «прямой путь не работает» (§3.4).
+/// старше 12 с — «прямой путь не работает» (§3.4). При интервале проб больше
+/// 4 с порог растягивается до `3 × интервал` ([`Policy::direct_fresh_ms`],
+/// issue #16): одна-две пропущенные пробы канал не убивают.
 pub const DIRECT_FRESH_MS: u64 = 12_000;
-/// RTT сервера считается актуальным столько (периодический CTRL_PING идёт
-/// чаще, но после потери связи замер устаревает).
+/// RTT сервера (плечо) считается актуальным столько (периодический CTRL_PING
+/// идёт чаще, но после потери связи замер устаревает).
 pub const SERVER_FRESH_MS: u64 = 30_000;
 /// Замер маршрута через пира актуален столько.
 pub const PEER_FRESH_MS: u64 = 30_000;
 /// Сколько последних замеров RTT держать для спарклайна (issue #26).
 pub const RTT_HIST_LEN: usize = 60;
+/// Окно учёта проб для потерь (issue #26): по последним пробам считаются
+/// промилле без ответа. 10 проб при интервале 5 с — около минуты; одна
+/// потерянная проба в новом пути даёт 100 ‰ и перекрывает порог отката.
+pub const LOSS_WINDOW: usize = 10;
+/// Сколько проверять новый путь после автопереключения (issue #26).
+pub const VERIFY_MS: u64 = 5_000;
+/// Карантин пути, от которого откатились (issue #26): автоматика его не
+/// выбирает.
+pub const QUARANTINE_MS: u64 = 60_000;
 
 /// Куда (через кого) идёт трафик до участника.
 ///
@@ -126,11 +153,113 @@ pub enum PathChange {
         /// Что было (`None` — пути не было).
         from: Option<PathKind>,
         to: PathKind,
-        /// Измеренный RTT выбранного пути (у сервера/пира может быть неизвестен).
+        /// Измеренный RTT выбранного пути (у сервера — только end-to-end,
+        /// плечо сюда не попадает; может быть неизвестен).
         rtt_ms: Option<u32>,
     },
     /// Доступных путей не осталось. `from` — что было текущим.
     Lost { ip: u32, from: PathKind },
+    /// Автоматика откатила путь назад после проверки нового (issue #26):
+    /// `from` — путь, от которого отказались (уходит в карантин), `to` —
+    /// восстановленный.
+    Reverted {
+        ip: u32,
+        from: PathKind,
+        to: PathKind,
+    },
+}
+
+/// Метрики текущего пути получателя (issue #26) — то, что уходит в снимок.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathMetrics {
+    /// Джиттер: EWMA модуля разности соседних замеров RTT, мс.
+    pub jitter_ms: u32,
+    /// Потери по последним [`LOSS_WINDOW`] пробам, промилле.
+    pub loss_pm: u16,
+    /// Последние замеры RTT текущего пути (не больше [`RTT_HIST_LEN`]),
+    /// старые первыми.
+    pub hist: Vec<u16>,
+}
+
+/// Настройки выбора пути из конфига (issue #16/#17): пороги гистерезиса,
+/// удержание и интервал проб. Движок обновляет их из `Config`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Policy {
+    hysteresis_ms: u32,
+    dwell_ms: u64,
+    probe_interval_ms: u64,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            hysteresis_ms: DEFAULT_PATH_HYSTERESIS_MS,
+            dwell_ms: DEFAULT_PATH_DWELL_MS,
+            probe_interval_ms: DEFAULT_RTT_INTERVAL_MS,
+        }
+    }
+}
+
+impl Policy {
+    /// Свежесть замера прямого канала: не меньше [`DIRECT_FRESH_MS`] и не
+    /// меньше трёх интервалов проб (issue #16) — иначе проба на 5–20 с
+    /// «убивала» бы живой канал между замерами.
+    fn direct_fresh_ms(&self) -> u64 {
+        DIRECT_FRESH_MS.max(self.probe_interval_ms.saturating_mul(3))
+    }
+
+    /// Свежесть end-to-end замера через сервер (issue #15): не меньше
+    /// [`SERVER_FRESH_MS`] и не меньше двух интервалов проб.
+    fn server_e2e_fresh_ms(&self) -> u64 {
+        SERVER_FRESH_MS.max(self.probe_interval_ms.saturating_mul(2))
+    }
+}
+
+/// Окно проб для потерь (issue #26): `true` — ответ (PONG) пришёл.
+#[derive(Clone, Debug, Default)]
+struct LossWindow {
+    probes: VecDeque<bool>,
+}
+
+impl LossWindow {
+    /// Новая проба без ответа.
+    fn sent(&mut self) {
+        self.probes.push_back(false);
+        while self.probes.len() > LOSS_WINDOW {
+            self.probes.pop_front();
+        }
+    }
+
+    /// Ответ на последнюю пробу.
+    fn answered(&mut self) {
+        if let Some(last) = self.probes.back_mut() {
+            *last = true;
+        }
+    }
+
+    /// Промилле проб без ответа (0 — ни одной, 1000 — ни одна не ответила).
+    fn loss_pm(&self) -> u16 {
+        if self.probes.is_empty() {
+            return 0;
+        }
+        let lost = self.probes.iter().filter(|ok| !**ok).count();
+        (lost * 1000 / self.probes.len()) as u16
+    }
+
+    fn clear(&mut self) {
+        self.probes.clear();
+    }
+}
+
+/// Окно проверки нового пути после автопереключения (issue #26): метрики
+/// старого пути и момент переключения.
+#[derive(Clone, Copy, Debug)]
+struct Verify {
+    old: PathKind,
+    old_cost: f64,
+    old_jitter_ms: u32,
+    old_loss_pm: u16,
+    at: u64,
 }
 
 /// Маршрут через пира-реле: кто релеит и что известно о задержке.
@@ -160,18 +289,126 @@ impl PeerRoute {
     }
 }
 
-/// Один получатель: измерения по путям и выбранный путь.
+/// Один получатель: измерения по путям, метрики и выбранный путь.
 #[derive(Clone, Debug, Default)]
 struct Target {
     direct_ms: Option<u32>,
     direct_at: u64,
     peer: Option<PeerRoute>,
+    /// Честный end-to-end RTT маршрута через сервер (issue #15) и время
+    /// замера.
+    server_e2e_ms: Option<u32>,
+    server_e2e_at: u64,
     /// Текущий путь и его стоимость на момент выбора (для гистерезиса).
     current: Option<PathKind>,
     current_cost: Option<f64>,
+    /// Когда выбран текущий путь (для dwell, issue #17).
+    current_since: u64,
     /// Закреплённый путь был недоступен (уже сообщили `Lost`); сбрасывается,
     /// когда он снова доступен.
     pin_broken: bool,
+    /// Джиттер текущего пути: EWMA |ΔRTT|, мс (issue #26).
+    jitter_ms: u32,
+    /// Предыдущий замер текущего пути (для джиттера и истории).
+    last_rtt_ms: Option<u32>,
+    /// Какой путь накопил `hist`/`jitter`: смена пути начинает историю заново.
+    hist_kind: Option<PathKind>,
+    /// Последние замеры RTT текущего пути (спарклайн, issue #26).
+    hist: VecDeque<u16>,
+    /// Пробы по получателю: по ним считаются потери (issue #26).
+    loss: LossWindow,
+    /// Окно проверки нового пути после автопереключения (issue #26).
+    verify: Option<Verify>,
+    /// Карантин после отката: путь → момент, до которого автоматика его не
+    /// выбирает (issue #26).
+    blocked: Vec<(PathKind, u64)>,
+}
+
+impl Target {
+    /// Замер RTT пути: джиттер, история и предыдущий замер — только для
+    /// **текущего** пути; замеры других путей историю не трогают. Первый замер
+    /// после смены пути начинает историю заново.
+    fn note_rtt(&mut self, kind: PathKind, rtt_ms: u32) {
+        if self.current != Some(kind) {
+            return;
+        }
+        if self.hist_kind != Some(kind) {
+            self.hist_kind = Some(kind);
+            self.hist.clear();
+            self.jitter_ms = 0;
+            self.last_rtt_ms = None;
+        }
+        if let Some(prev) = self.last_rtt_ms {
+            let diff = prev.abs_diff(rtt_ms) as u64;
+            // EWMA с α = 1/4: ровный путь даёт джиттер около 0, «пила» — растёт.
+            self.jitter_ms = ((self.jitter_ms as u64 * 3 + diff) / 4) as u32;
+        }
+        self.last_rtt_ms = Some(rtt_ms);
+        self.hist.push_back(rtt_ms.min(u16::MAX as u32) as u16);
+        while self.hist.len() > RTT_HIST_LEN {
+            self.hist.pop_front();
+        }
+    }
+
+    /// Проба ушла (ответа ещё нет).
+    fn note_probe(&mut self) {
+        self.loss.sent();
+    }
+
+    /// Ответ на последнюю пробу пришёл.
+    fn note_answer(&mut self) {
+        self.loss.answered();
+    }
+
+    fn loss_pm(&self) -> u16 {
+        self.loss.loss_pm()
+    }
+
+    /// Сменить текущий путь: отметка времени для dwell, метрики — заново.
+    fn set_current(&mut self, kind: PathKind, cost: Option<f64>, now_ms: u64) {
+        if self.current != Some(kind) {
+            self.current = Some(kind);
+            self.current_since = now_ms;
+            self.hist.clear();
+            self.hist_kind = None;
+            self.jitter_ms = 0;
+            self.last_rtt_ms = None;
+            self.loss.clear();
+        }
+        self.current_cost = cost;
+    }
+
+    /// Путь в карантине: автоматика его не выбирает до `until`.
+    fn is_blocked(&self, kind: PathKind, now_ms: u64) -> bool {
+        self.blocked
+            .iter()
+            .any(|(k, until)| *k == kind && now_ms < *until)
+    }
+
+    /// Отправить путь в карантин (issue #26).
+    fn block(&mut self, kind: PathKind, now_ms: u64) {
+        let until = now_ms.saturating_add(QUARANTINE_MS);
+        match self.blocked.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, t)) => *t = until,
+            None => self.blocked.push((kind, until)),
+        }
+    }
+
+    /// Свежий end-to-end замер через сервер (issue #15).
+    fn server_e2e_fresh(&self, now_ms: u64, policy: Policy) -> Option<u32> {
+        let ms = self.server_e2e_ms?;
+        (now_ms.saturating_sub(self.server_e2e_at) <= policy.server_e2e_fresh_ms()).then_some(ms)
+    }
+
+    /// Новый путь после автопереключения хуже старого (issue #26)?
+    fn worse_than(&self, cost: f64, v: Verify, policy: Policy) -> bool {
+        let rtt_worse =
+            cost > v.old_cost * 1.2 && cost - v.old_cost > f64::from(policy.hysteresis_ms);
+        let loss_worse = self.loss_pm() > v.old_loss_pm.saturating_add(50);
+        let jitter_worse =
+            v.old_jitter_ms > 0 && self.jitter_ms > v.old_jitter_ms.saturating_mul(2);
+        rtt_worse || loss_worse || jitter_worse
+    }
 }
 
 #[derive(Debug, Default)]
@@ -179,10 +416,24 @@ struct Paths {
     targets: BTreeMap<u32, Target>,
     /// Закрепления: ip → путь (из `client.json`).
     pins: BTreeMap<u32, PathKind>,
-    /// Последний измеренный RTT сервера и время замера.
+    /// Последний измеренный RTT сервера (плечо) и время замера.
     server: Option<(u32, u64)>,
     /// Релей через пиров разрешён (`SetRelayEnabled`).
     relay_enabled: bool,
+    /// Пороги выбора пути и интервал проб (issue #16/#17).
+    policy: Policy,
+    /// Последнее известное таблице время (мс от старта движка): по нему
+    /// проверяется свежесть замеров в геттерах, у которых нет `now_ms`.
+    now_ms: u64,
+}
+
+impl Paths {
+    /// Отметить время: свежесть замеров в геттерах считается по нему.
+    fn tick(&mut self, now_ms: u64) {
+        if now_ms > self.now_ms {
+            self.now_ms = now_ms;
+        }
+    }
 }
 
 /// Таблица путей: измерения, выбор с гистерезисом и ручные закрепления.
@@ -221,6 +472,8 @@ impl PathTable {
                 pins: parsed,
                 server: None,
                 relay_enabled: true,
+                policy: Policy::default(),
+                now_ms: 0,
             }),
         }
     }
@@ -228,6 +481,21 @@ impl PathTable {
     /// Таблица без закреплений и измерений (тесты, движок до конфига).
     pub fn empty() -> Self {
         Self::new(&BTreeMap::new())
+    }
+
+    /// Пороги выбора пути и интервал проб из конфига (issue #16/#17).
+    /// `PathTable` создаётся до чтения конфига, поэтому движок обновляет их
+    /// сеттером; повтор с теми же значениями ничего не делает.
+    pub fn set_limits(&self, hysteresis_ms: u32, dwell_ms: u64, interval: Duration) {
+        let policy = Policy {
+            hysteresis_ms,
+            dwell_ms,
+            probe_interval_ms: interval.as_millis() as u64,
+        };
+        let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if p.policy != policy {
+            p.policy = policy;
+        }
     }
 
     /// Заменить все закрепления (после правки `client.json`).
@@ -292,14 +560,47 @@ impl PathTable {
     /// Замер прямого канала (из RTT-таймера группы).
     pub fn record_direct_rtt(&self, ip: u32, rtt_ms: u32, now_ms: u64) {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.tick(now_ms);
         let t = p.targets.entry(ip).or_default();
         t.direct_ms = Some(rtt_ms);
         t.direct_at = now_ms;
+        t.note_rtt(PathKind::Direct, rtt_ms);
     }
 
-    /// Замер RTT сервера (CTRL_PONG с меткой).
+    /// Замер RTT сервера — **плечо** «мы → сервер» (CTRL_PONG с меткой).
+    /// Это не RTT маршрута до участника: в [`PathTable::current_rtt`] он не
+    /// попадает (issue #15).
     pub fn record_server_rtt(&self, rtt_ms: u32, now_ms: u64) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).server = Some((rtt_ms, now_ms));
+        let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.tick(now_ms);
+        p.server = Some((rtt_ms, now_ms));
+    }
+
+    /// **Честный end-to-end** замер маршрута через сервер (issue #15): PONG на
+    /// групповой PING, ушедший серверу. Именно он — RTT серверного пути и его
+    /// стоимость; плечо до сервера его не подменяет.
+    pub fn record_server_path_rtt(&self, ip: u32, rtt_ms: u32, now_ms: u64) {
+        let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.tick(now_ms);
+        let t = p.targets.entry(ip).or_default();
+        t.server_e2e_ms = Some(rtt_ms);
+        t.server_e2e_at = now_ms;
+        t.note_rtt(PathKind::Server, rtt_ms);
+    }
+
+    /// Проба (групповой PING) ушла получателю — считаем её в потерях
+    /// (issue #26), пока не придёт ответ.
+    pub fn record_probe_sent(&self, ip: u32) {
+        let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.targets.entry(ip).or_default().note_probe();
+    }
+
+    /// Ответ (PONG) на последнюю пробу получателя (issue #26).
+    pub fn record_probe_answered(&self, ip: u32) {
+        let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = p.targets.get_mut(&ip) {
+            t.note_answer();
+        }
     }
 
     /// Замер маршрута через пира `via`: `up_ms` — мы→реле, `down_ms` —
@@ -314,6 +615,7 @@ impl PathTable {
         now_ms: u64,
     ) {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.tick(now_ms);
         let t = p.targets.entry(ip).or_default();
         t.peer = Some(PeerRoute {
             via,
@@ -322,6 +624,7 @@ impl PathTable {
             load: load.clamp(0.0, 1.0),
             at: now_ms,
         });
+        t.note_rtt(PathKind::PeerRelay { via }, up_ms.saturating_add(down_ms));
     }
 
     /// Текущий путь сломался (реле отказал, прямой канал пропал): следующий
@@ -346,6 +649,7 @@ impl PathTable {
         }
         t.current = None;
         t.current_cost = None;
+        t.verify = None;
     }
 
     /// Забыть всё про получателя (вышел из группы).
@@ -378,18 +682,23 @@ impl PathTable {
             .and_then(|t| t.current)
     }
 
-    /// Измеренный RTT текущего пути.
+    /// Измеренный **end-to-end** RTT текущего пути (issue #15).
+    ///
+    /// Для серверного пути это только свежий замер полного маршрута: плечо
+    /// «мы→сервер» здесь не возвращается никогда — иначе UI показывал бы 1 мс
+    /// вместо реальных десятков.
     pub fn current_rtt(&self, ip: u32) -> Option<u32> {
         let p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let t = p.targets.get(&ip)?;
         match t.current? {
             PathKind::Direct => t.direct_ms,
-            PathKind::Server => p.server.map(|(r, _)| r),
+            PathKind::Server => t.server_e2e_fresh(p.now_ms, p.policy),
             PathKind::PeerRelay { .. } => t.peer.map(|r| r.rtt()),
         }
     }
 
-    /// Замер RTT сервера (для снимка состояния).
+    /// Замер RTT сервера — плечо «мы→сервер» (для снимка состояния, issue
+    /// #15): отдельно от end-to-end RTT маршрута.
     pub fn server_rtt(&self) -> Option<u32> {
         self.inner
             .lock()
@@ -398,10 +707,24 @@ impl PathTable {
             .map(|(r, _)| r)
     }
 
+    /// Метрики текущего пути получателя (issue #26): джиттер, потери и
+    /// история замеров. `None` — пути нет.
+    pub fn metrics(&self, ip: u32) -> Option<PathMetrics> {
+        let p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let t = p.targets.get(&ip)?;
+        t.current?;
+        Some(PathMetrics {
+            jitter_ms: t.jitter_ms,
+            loss_pm: t.loss_pm(),
+            hist: t.hist.iter().copied().collect(),
+        })
+    }
+
     /// Пересчитать пути всех получателей. Возвращает изменения — движок
     /// рассылает их событиями. `server_up` — есть ли связь с сервером.
     pub fn recalc(&self, now_ms: u64, server_up: bool) -> Vec<PathChange> {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.tick(now_ms);
         // Закрепления копируются: иначе нельзя одновременно держать
         // `targets.iter_mut()` и `pins.get()` (один и тот же `Paths`).
         let pins = p.pins.clone();
@@ -409,6 +732,7 @@ impl PathTable {
             server: p.server,
             server_up,
             relay: p.relay_enabled,
+            policy: p.policy,
             now_ms,
         };
         let mut changes = Vec::new();
@@ -422,10 +746,12 @@ impl PathTable {
     /// Пересчёт одного получателя (движок может позвать точечно).
     pub fn recalc_one(&self, ip: u32, now_ms: u64, server_up: bool) -> Vec<PathChange> {
         let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.tick(now_ms);
         let ctx = Ctx {
             server: p.server,
             server_up,
             relay: p.relay_enabled,
+            policy: p.policy,
             now_ms,
         };
         let pin = p.pins.get(&ip).copied();
@@ -460,6 +786,7 @@ impl PathTable {
             server: p.server,
             server_up,
             relay: p.relay_enabled,
+            policy: p.policy,
             now_ms,
         };
         let Some(t) = p.targets.get(&ip) else {
@@ -491,28 +818,38 @@ struct Ctx {
     server: Option<(u32, u64)>,
     server_up: bool,
     relay: bool,
+    policy: Policy,
     now_ms: u64,
 }
 
 /// Стоимость и RTT пути, если он сейчас доступен.
+///
+/// RTT (`Some`) — то, что увидит UI: для серверного пути это **только**
+/// end-to-end замер (issue #15), плечо до сервера сюда не подставляется.
 fn cost_of(t: &Target, kind: PathKind, ctx: Ctx) -> Option<(f64, Option<u32>)> {
     match kind {
         PathKind::Direct => {
             let ms = t.direct_ms?;
-            (ctx.now_ms.saturating_sub(t.direct_at) <= DIRECT_FRESH_MS)
+            (ctx.now_ms.saturating_sub(t.direct_at) <= ctx.policy.direct_fresh_ms())
                 .then_some((ms as f64, Some(ms)))
         }
         PathKind::Server => {
             if !ctx.server_up {
                 return None;
             }
+            // Честный end-to-end маршрут (issue #15) — он и стоимость, и RTT.
+            if let Some(ms) = t.server_e2e_fresh(ctx.now_ms, ctx.policy) {
+                return Some((ms as f64 + HOP_PENALTY_SERVER_MS, Some(ms)));
+            }
+            // До первого e2e-замера стоимость считаем по плечу «мы→сервер»:
+            // иначе серверный путь был бы несравним и первый выбор «залипал»
+            // бы на прямом. Плечо при этом остаётся плечом — в RTT не идёт.
             match ctx.server {
-                // Свежий замер — сравниваем по стоимости.
                 Some((rtt, at)) if ctx.now_ms.saturating_sub(at) <= SERVER_FRESH_MS => {
-                    Some((rtt as f64 + HOP_PENALTY_SERVER_MS, Some(rtt)))
+                    Some((rtt as f64 + HOP_PENALTY_SERVER_MS, None))
                 }
-                // Связь есть, RTT ещё не измерили: путь доступен, но пока
-                // несравним (None-стоимость).
+                // Связь есть, замеров ещё нет: путь доступен, но пока
+                // несравним (INFINITY-стоимость).
                 _ => Some((f64::INFINITY, None)),
             }
         }
@@ -538,14 +875,14 @@ fn recalc_target_pinned(
 ) {
     let cost = |t: &Target, kind: PathKind| cost_of(t, kind, ctx);
 
-    // 1. Ручное закрепление сильнее автоматики.
+    // 1. Ручное закрепление сильнее автоматики и не подчиняется dwell.
     if let Some(want) = pin {
         if let Some((c, rtt)) = cost(t, want) {
             t.pin_broken = false;
+            t.verify = None;
             if t.current != Some(want) {
                 let from = t.current;
-                t.current = Some(want);
-                t.current_cost = Some(c);
+                t.set_current(want, Some(c), ctx.now_ms);
                 out.push(PathChange::Changed {
                     ip,
                     from,
@@ -569,10 +906,35 @@ fn recalc_target_pinned(
             // каждый пересчёт нельзя.
             t.current = None;
             t.current_cost = None;
+            t.verify = None;
         }
     }
 
-    // 2. Автоматика: все доступные пути, лучший по стоимости.
+    // 2. Окно проверки нового пути (issue #26): если после автопереключения
+    //    он хуже старого — откат и карантин альтернативы.
+    if let Some(v) = t.verify {
+        if ctx.now_ms.saturating_sub(v.at) > VERIFY_MS {
+            t.verify = None;
+        } else if let Some(cur) = t.current
+            && cur != v.old
+            && let Some((cc, _)) = cost(t, cur)
+            && cc.is_finite()
+            && t.worse_than(cc, v, ctx.policy)
+        {
+            t.verify = None;
+            t.block(cur, ctx.now_ms);
+            t.set_current(v.old, None, ctx.now_ms);
+            out.push(PathChange::Reverted {
+                ip,
+                from: cur,
+                to: v.old,
+            });
+            return;
+        }
+    }
+
+    // 3. Автоматика: все доступные пути, лучший по стоимости. Пути в
+    //    карантине (issue #26) не рассматриваются.
     let mut best: Option<(f64, PathKind, Option<u32>)> = None;
     let candidates = [
         Some(PathKind::Direct),
@@ -580,6 +942,9 @@ fn recalc_target_pinned(
         t.peer.map(|r| PathKind::PeerRelay { via: r.via }),
     ];
     for kind in candidates.into_iter().flatten() {
+        if t.is_blocked(kind, ctx.now_ms) {
+            continue;
+        }
         let Some((c, rtt)) = cost(t, kind) else {
             continue;
         };
@@ -596,13 +961,25 @@ fn recalc_target_pinned(
     let current_ok = current.and_then(|k| cost(t, k));
 
     match (current, current_ok) {
-        // Текущий путь жив и измерен: меняем только при выигрыше ≥ 20 %.
+        // Текущий путь жив и измерен: меняем только при выигрыше и
+        // относительного (20 %), и абсолютного порога, и после dwell
+        // (issue #17).
         (Some(cur), Some((cc, _))) if cc.is_finite() => {
             if let Some((bc, bk, brtt)) = best {
                 let threshold = cc * (100.0 - HYSTERESIS_PCT) / 100.0;
-                if bk != cur && bc <= threshold {
-                    t.current = Some(bk);
-                    t.current_cost = Some(bc);
+                let abs_ok = bc <= cc - f64::from(ctx.policy.hysteresis_ms);
+                let dwell_ok = ctx.now_ms.saturating_sub(t.current_since) >= ctx.policy.dwell_ms;
+                if bk != cur && bc <= threshold && abs_ok && dwell_ok {
+                    // Автопереключение: запоминаем метрики старого пути —
+                    // через `VERIFY_MS` сравним и, если новый хуже, откатим.
+                    t.verify = Some(Verify {
+                        old: cur,
+                        old_cost: cc,
+                        old_jitter_ms: t.jitter_ms,
+                        old_loss_pm: t.loss_pm(),
+                        at: ctx.now_ms,
+                    });
+                    t.set_current(bk, Some(bc), ctx.now_ms);
                     out.push(PathChange::Changed {
                         ip,
                         from: Some(cur),
@@ -615,16 +992,15 @@ fn recalc_target_pinned(
             t.current_cost = Some(cc);
         }
         // Текущий путь доступен, но ещё не измерен (сервер до первого
-        // CTRL_PONG): держим его — сравнение появится после замера.
+        // замера): держим его — сравнение появится после замера.
         (Some(_), Some((cc, _))) => {
             t.current_cost = Some(cc);
         }
-        // Текущего живого пути нет: берём лучший без гистерезиса — держаться
-        // не за что.
+        // Текущего живого пути нет: берём лучший без гистерезиса и без dwell —
+        // держаться не за что (сломанный путь меняется сразу).
         (cur, _) => {
             if let Some((bc, bk, brtt)) = best {
-                t.current = Some(bk);
-                t.current_cost = Some(bc);
+                t.set_current(bk, Some(bc), ctx.now_ms);
                 out.push(PathChange::Changed {
                     ip,
                     from: cur,
@@ -635,8 +1011,7 @@ fn recalc_target_pinned(
             }
             // Ничего измеренного: сервер — единственный заведомо рабочий путь.
             if ctx.server_up {
-                t.current = Some(PathKind::Server);
-                t.current_cost = None;
+                t.set_current(PathKind::Server, None, ctx.now_ms);
                 out.push(PathChange::Changed {
                     ip,
                     from: cur,
@@ -646,6 +1021,7 @@ fn recalc_target_pinned(
             } else if let Some(from) = cur {
                 t.current = None;
                 t.current_cost = None;
+                t.verify = None;
                 out.push(PathChange::Lost { ip, from });
             }
         }
@@ -673,8 +1049,17 @@ mod tests {
     const OTHER: u32 = 0x6442_0003;
     const VIA: [u8; 32] = [7; 32];
 
+    /// Таблица с порогами из конфига по умолчанию, но без dwell: тесты про
+    /// гистерезис не должны ждать 10 с удержания пути. Интервал проб — 5 с
+    /// (как в `Config::default`), от него зависит свежесть прямого канала.
     fn table() -> PathTable {
-        PathTable::empty()
+        let t = PathTable::empty();
+        t.set_limits(
+            crate::store::DEFAULT_PATH_HYSTERESIS_MS,
+            0,
+            Duration::from_millis(crate::store::DEFAULT_RTT_INTERVAL_MS),
+        );
+        t
     }
 
     /// Единственное изменение (паника, если их не одно).
@@ -729,6 +1114,8 @@ mod tests {
     fn гистерезис_20_процентов() {
         let t = table();
         t.record_server_rtt(50, 0); // стоимость сервера 55
+        // End-to-end замер маршрута — он же RTT серверного пути (issue #15).
+        t.record_server_path_rtt(IP, 50, 0);
         t.record_direct_rtt(IP, 10, 0);
         one(t.recalc(100, true));
         assert_eq!(t.current(IP), Some(PathKind::Direct));
@@ -770,8 +1157,9 @@ mod tests {
         t.record_direct_rtt(IP, 10, 0);
         one(t.recalc(100, true));
         assert_eq!(t.current(IP), Some(PathKind::Direct));
-        // Замер прямой старше 12 с — путь мёртв, даже без гистерезиса.
-        let c = one(t.recalc(DIRECT_FRESH_MS + 1000, true));
+        // Замер прямой старше трёх интервалов проб (15 с) — путь мёртв, даже
+        // без гистерезиса.
+        let c = one(t.recalc(16_000, true));
         assert!(matches!(
             c,
             PathChange::Changed {
@@ -817,6 +1205,7 @@ mod tests {
     fn мёртвый_пин_даёт_lost_и_откат_но_не_удаляется() {
         let t = table();
         t.record_server_rtt(50, 0);
+        t.record_server_path_rtt(IP, 50, 0);
         // Пин на прямой, но прямого замера нет вовсе: Lost + откат на сервер
         // в одном пересчёте.
         t.set_pin(IP, Some(PathKind::Direct));
@@ -858,6 +1247,7 @@ mod tests {
     fn пин_на_реле_через_пира() {
         let t = table();
         t.record_server_rtt(50, 0);
+        t.record_server_path_rtt(IP, 50, 0);
         t.set_pin(IP, Some(PathKind::PeerRelay { via: VIA }));
         // Маршрута через реле нет — пин мёртв, откат на сервер.
         let changes = t.recalc(100, true);
@@ -989,7 +1379,9 @@ mod tests {
         t.record_direct_rtt(OTHER, 90, 0); // 90 > 45 → сервер
         let mut changes = t.recalc(100, true);
         changes.sort_by_key(|c| match c {
-            PathChange::Changed { ip, .. } | PathChange::Lost { ip, .. } => *ip,
+            PathChange::Changed { ip, .. }
+            | PathChange::Lost { ip, .. }
+            | PathChange::Reverted { ip, .. } => *ip,
         });
         assert_eq!(changes.len(), 2);
         assert!(matches!(
@@ -1092,6 +1484,195 @@ mod tests {
             h.join().unwrap();
         }
     }
+
+    #[test]
+    fn гистерезис_не_переключает_на_разницу_меньше_15_мс() {
+        let t = table();
+        // Прямой 40, сервер 55 (e2e 50 + 5): текущий — прямой.
+        t.record_server_rtt(50, 0);
+        t.record_server_path_rtt(IP, 50, 0);
+        t.record_direct_rtt(IP, 40, 0);
+        one(t.recalc(100, true));
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Сервер подешевел до 46 (e2e 41): выигрыш 6 мс < 15 мс — абсолютный
+        // порог не пройден, держимся (issue #17).
+        t.record_server_path_rtt(IP, 41, 200);
+        assert!(t.recalc(300, true).is_empty(), "разница меньше порога");
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Сервер 25 (e2e 20): выигрыш ровно 15 мс и 37 % — переключаемся.
+        t.record_server_path_rtt(IP, 20, 400);
+        let c = one(t.recalc(500, true));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                from: Some(PathKind::Direct),
+                to: PathKind::Server,
+                rtt_ms: Some(20),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dwell_не_даёт_переключаться_слишком_часто() {
+        let t = PathTable::empty();
+        // Удержание 10 с (как `path_dwell_ms` по умолчанию), интервал проб 5 с.
+        t.set_limits(15, 10_000, Duration::from_secs(5));
+        t.record_server_rtt(50, 0);
+        t.record_server_path_rtt(IP, 50, 0); // стоимость 55
+        t.record_direct_rtt(IP, 30, 0); // дешевле — выбран прямой
+        one(t.recalc(100, true));
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Сервер стал вдвое дешевле (e2e 10 → 15), но 10 с удержания не прошло.
+        t.record_server_path_rtt(IP, 10, 200);
+        assert!(t.recalc(5_000, true).is_empty(), "dwell не прошёл");
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Прошло 10 с с момента выбора — переключаемся.
+        let c = one(t.recalc(10_100, true));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                from: Some(PathKind::Direct),
+                to: PathKind::Server,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn сломанный_путь_переключается_без_dwell() {
+        let t = PathTable::empty();
+        // Удержание 60 с — сломанный путь всё равно меняется сразу.
+        t.set_limits(15, 60_000, Duration::from_secs(5));
+        t.record_server_rtt(50, 0);
+        t.record_server_path_rtt(IP, 50, 0);
+        t.record_direct_rtt(IP, 10, 0);
+        one(t.recalc(100, true));
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Прямой отказал: ни порогов, ни dwell (issue #17).
+        t.record_failure(IP);
+        let c = one(t.recalc(200, true));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                from: None,
+                to: PathKind::Server,
+                ..
+            }
+        ));
+        assert_eq!(t.current(IP), Some(PathKind::Server));
+    }
+
+    #[test]
+    fn серверный_путь_показывает_e2e_а_не_плечо() {
+        let t = table();
+        // Плечо до сервера — 1 мс (как в issue #14), честный маршрут — 42 мс.
+        t.record_server_rtt(1, 0);
+        t.record_server_path_rtt(IP, 42, 0);
+        let c = one(t.recalc(100, true));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                to: PathKind::Server,
+                rtt_ms: Some(42),
+                ..
+            }
+        ));
+        assert_eq!(t.current(IP), Some(PathKind::Server));
+        assert_eq!(t.current_rtt(IP), Some(42), "RTT пути — end-to-end");
+        // Плечо доступно отдельно — UI покажет, из чего сложился маршрут.
+        assert_eq!(t.server_rtt(), Some(1));
+    }
+
+    #[test]
+    fn плечо_не_подменяет_e2e_при_протухшем_замере() {
+        let t = table();
+        t.record_server_rtt(1, 0);
+        t.record_server_path_rtt(IP, 42, 0);
+        one(t.recalc(100, true));
+        assert_eq!(t.current_rtt(IP), Some(42));
+        // End-to-end замер протух: путь остаётся серверным (связь есть), но
+        // RTT неизвестен — плечо 1 мс не подставляется (issue #15).
+        t.recalc(SERVER_FRESH_MS + 1, true);
+        assert_eq!(t.current(IP), Some(PathKind::Server));
+        assert_eq!(t.current_rtt(IP), None, "плечо не подменяет e2e");
+        assert_eq!(t.server_rtt(), Some(1), "плечо не потерялось");
+    }
+
+    #[test]
+    fn jitter_и_loss_считаются_по_пробам() {
+        let t = table();
+        t.record_server_path_rtt(IP, 40, 0);
+        one(t.recalc(100, true));
+        // Три пробы: ответ, ответ, без ответа — 1 из 3 = 333 ‰.
+        t.record_probe_sent(IP);
+        t.record_probe_answered(IP);
+        t.record_probe_sent(IP);
+        t.record_probe_answered(IP);
+        t.record_probe_sent(IP);
+        let m = t.metrics(IP).expect("метрики текущего пути");
+        assert_eq!(m.loss_pm, 333);
+        // Замеры текущего пути: 40 → 60 → 80. Джиттер — EWMA |Δ| с α = 1/4:
+        // (0*3+20)/4 = 5, (5*3+20)/4 = 8.
+        t.record_server_path_rtt(IP, 40, 200);
+        t.record_server_path_rtt(IP, 60, 300);
+        t.record_server_path_rtt(IP, 80, 400);
+        let m = t.metrics(IP).expect("метрики текущего пути");
+        assert_eq!(m.jitter_ms, 8);
+        assert_eq!(m.hist, vec![40, 60, 80], "история — старые первыми");
+        // Замер другого пути историю текущего не трогает.
+        t.record_direct_rtt(IP, 999, 500);
+        assert_eq!(t.metrics(IP).unwrap().hist, vec![40, 60, 80]);
+    }
+
+    #[test]
+    fn авто_откат_при_ухудшении_и_карантин() {
+        let t = table();
+        t.record_direct_rtt(IP, 30, 0);
+        t.record_server_path_rtt(IP, 50, 0); // 55
+        one(t.recalc(100, true));
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Прямой подорожал до 100, сервер 65 — автопереключение по выгоде:
+        // окно проверки запоминает метрики старого пути.
+        t.record_direct_rtt(IP, 100, 150);
+        t.record_server_path_rtt(IP, 60, 150);
+        let c = one(t.recalc(200, true));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                from: Some(PathKind::Direct),
+                to: PathKind::Server,
+                ..
+            }
+        ));
+        // В окне проверки новый путь оказался хуже (130 против 100 мс):
+        // откат на старый путь и карантин альтернативы на 60 с.
+        t.record_server_path_rtt(IP, 125, 300);
+        let c = one(t.recalc(1_000, true));
+        assert_eq!(
+            c,
+            PathChange::Reverted {
+                ip: IP,
+                from: PathKind::Server,
+                to: PathKind::Direct
+            }
+        );
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // В карантине автоматика сервер не выбирает, даже если он дешевле.
+        t.record_server_path_rtt(IP, 5, 1_100); // стоимость 10
+        assert!(t.recalc(2_000, true).is_empty(), "карантин не истёк");
+        assert_eq!(t.current(IP), Some(PathKind::Direct));
+        // Карантин истёк, прямой замер протух — снова сервер.
+        let c = one(t.recalc(QUARANTINE_MS + 1_000, true));
+        assert!(matches!(
+            c,
+            PathChange::Changed {
+                from: Some(PathKind::Direct),
+                to: PathKind::Server,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1101,15 +1682,28 @@ mod choose_tests {
     const IP: u32 = 0x6442_0002;
     const VIA: [u8; 32] = [7; 32];
 
+    /// Таблица с порогами из конфига по умолчанию и без dwell: тесты про
+    /// выбор пути не должны ждать удержание.
+    fn table() -> PathTable {
+        let t = PathTable::empty();
+        t.set_limits(
+            crate::store::DEFAULT_PATH_HYSTERESIS_MS,
+            0,
+            Duration::from_millis(crate::store::DEFAULT_RTT_INTERVAL_MS),
+        );
+        t
+    }
+
     #[test]
     fn choose_заводит_цель_и_возвращает_путь_сразу() {
-        let t = PathTable::empty();
+        let t = table();
         // Цели ещё нет в таблице: choose заводит её (участник группы).
         let (path, changes) = t.choose(IP, 0, false);
         assert_eq!(path, None, "без связи и измерений пути нет");
         assert!(changes.is_empty());
         // Связь есть, замер сервера есть — сервер (путь по умолчанию).
         t.record_server_rtt(50, 5);
+        t.record_server_path_rtt(IP, 50, 5);
         let (path, changes) = t.choose(IP, 10, true);
         assert_eq!(path, Some(PathKind::Server));
         assert_eq!(
@@ -1138,7 +1732,7 @@ mod choose_tests {
 
     #[test]
     fn choose_выбирает_реле_по_стоимости() {
-        let t = PathTable::empty();
+        let t = table();
         t.record_server_rtt(60, 0); // cost 65
         t.record_direct_rtt(IP, 20, 0); // cost 20 — прямой дешевле
         let (path, _) = t.choose(IP, 10, true);
@@ -1172,7 +1766,7 @@ mod choose_tests {
 
     #[test]
     fn fallbacks_по_возрастанию_стоимости() {
-        let t = PathTable::empty();
+        let t = table();
         t.record_server_rtt(50, 0);
         t.record_direct_rtt(IP, 10, 0);
         t.record_peer_rtt(IP, VIA, 5, 5, 0.0, 0);

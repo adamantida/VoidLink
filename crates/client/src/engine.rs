@@ -53,10 +53,10 @@ pub const DEFAULT_ADAPTER: &str = "voidlink0";
 pub const DEFAULT_ADAPTER: &str = "utun";
 /// Шаг цикла движка (верхняя граница задержки таймеров).
 const TICK: Duration = Duration::from_millis(100);
-/// RTT-зонд онлайн-пирам. Для прямых каналов он же держит NAT-маппинг.
-const RTT_EVERY: Duration = Duration::from_secs(2);
-/// PUNCH онлайн-пирам без прямого канала.
+/// PUNCH онлайн-пирам без прямого канала: базовый шаг (issue #16).
 const PUNCH_EVERY: Duration = Duration::from_secs(5);
+/// Потолок интервала PUNCH с бэкоффом (issue #16).
+const PUNCH_MAX: Duration = Duration::from_secs(60);
 /// CTRL_PING серверу (сервер держит сессию 30 с без пакетов).
 const PING_EVERY: Duration = Duration::from_secs(5);
 const LIST_EVERY: Duration = Duration::from_secs(15);
@@ -93,6 +93,24 @@ const COOKIE_GAP: Duration = Duration::from_millis(250);
 /// Нет прямых фреймов от пира столько — прямой канал считается потерянным,
 /// трафик идёт через релей (пир сменил порт, NAT закрыл маппинг…).
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Сколько прямой канал живёт без единого прямого фрейма (issue #16): не
+/// меньше [`DIRECT_TIMEOUT`] и не меньше трёх интервалов проб. При интервале
+/// 5 с это 15 с, при 20 с — 60 с: одна-две пропущенные пробы канал не убивают.
+fn direct_timeout(interval: Duration) -> Duration {
+    DIRECT_TIMEOUT.max(interval * 3)
+}
+
+/// Интервал PUNCH с бэкоффом после `fails` неудач подряд (issue #16):
+/// 5 → 10 → 20 → 40 → 60 с, дальше — потолок.
+fn punch_interval(fails: u32) -> Duration {
+    let mut d = PUNCH_EVERY;
+    for _ in 0..fails.min(8) {
+        d *= 2;
+    }
+    d.min(PUNCH_MAX)
+}
+
 /// LEAVE повторяется, пока сервер не подтвердит выход списком групп.
 const LEAVE_RETRY: Duration = Duration::from_secs(1);
 const LEAVE_GIVE_UP: Duration = Duration::from_secs(20);
@@ -175,6 +193,11 @@ pub struct PeerSess {
     pub mesh_x: Option<[u8; 32]>,
     /// Возможности mesh (`mesh::caps::*`) из mesh-секции.
     pub mesh_caps: u8,
+    /// Неудачных PUNCH подряд (issue #16): интервал растёт до `PUNCH_MAX`,
+    /// сбрасывается появлением прямого канала.
+    pub punch_fails: u32,
+    /// Когда снова можно слать PUNCH этому пиру (issue #16); `None` — сразу.
+    pub punch_at: Option<Instant>,
 }
 
 impl PeerSess {
@@ -504,6 +527,10 @@ impl GroupSess {
             // до него сохраняем прежние (адрес/ключ пира не менялся).
             mesh_x: prev.and_then(|p| p.mesh_x),
             mesh_caps: prev.map(|p| p.mesh_caps).unwrap_or(0),
+            // Бэкофф PUNCH переживает обновление списка: иначе каждый
+            // GROUP_UPDATE обнулял бы его и снова спамил (issue #16).
+            punch_fails: prev.map(|p| p.punch_fails).unwrap_or(0),
+            punch_at: prev.and_then(|p| p.punch_at),
         };
         if m.online {
             peer.rtt_ms = prev.and_then(|p| p.rtt_ms);
@@ -813,11 +840,24 @@ pub enum Event {
         name: String,
         path: PathKind,
         rtt_ms: Option<u32>,
+        /// `true` — путь изменён ручным закреплением (`Cmd::PinPath`/
+        /// `Cmd::UnpinPath`), `false` — автоматикой (issue #26). UI по этому
+        /// флагу решает, показывать ли уведомление.
+        #[serde(default)]
+        manual: bool,
     },
     /// Доступных путей до участника не осталось: трафик не доставляется.
     PathLost {
         ip: u32,
         name: String,
+    },
+    /// Автоматика откатила путь назад: новый путь оказался хуже старого и
+    /// ушёл в карантин на [`path::QUARANTINE_MS`] (issue #26).
+    PathReverted {
+        ip: u32,
+        name: String,
+        from: PathKind,
+        to: PathKind,
     },
     /// Результат пробы сервера (`Cmd::ProbeServer`, §3.7). Для недоступного
     /// сервера — `success: false`; `key_match` — сверка с закреплённым ключом.
@@ -2379,6 +2419,9 @@ struct State {
     /// Последний отправленный `SERVER_HINT` (T4): `None` — ещё не слали
     /// этому серверу (сразу после WELCOME, не чаще `SERVER_HINT_EVERY`).
     last_hint: Option<Instant>,
+    /// Последняя применённая политика путей (гистерезис, dwell, интервал
+    /// проб) — чтобы не дёргать таблицу путей каждый тик (issue #16/#17).
+    path_policy: (u32, u64, u64),
 }
 
 impl State {
@@ -2425,6 +2468,7 @@ impl State {
             last_route_probe: now,
             lookup_seq: 1,
             last_hint: None,
+            path_policy: (u32::MAX, u64::MAX, u64::MAX),
         }
     }
 
@@ -2933,13 +2977,25 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
         }
     }
     // P2P-таймеры работают и без сервера: прямые каналы живут сами.
-    if now.duration_since(st.last_rtt) >= RTT_EVERY {
+    // Каденция проб — из конфига (issue #16): 2–20 с, по умолчанию 5 с.
+    let (rtt_every, hysteresis_ms, dwell_ms) = {
+        let c = env.cfg.lock().unwrap();
+        (c.rtt_interval(), c.path_hysteresis(), c.path_dwell())
+    };
+    let policy = (hysteresis_ms, dwell_ms, rtt_every.as_millis() as u64);
+    if st.path_policy != policy {
+        st.path_policy = policy;
+        // Пороги гистерезиса/dwell и интервал проб — в таблицу путей: от них
+        // зависит свежесть замеров и правило переключения (issue #16/#17).
+        env.paths.set_limits(hysteresis_ms, dwell_ms, rtt_every);
+    }
+    if now.duration_since(st.last_rtt) >= rtt_every {
         st.last_rtt = now;
-        rtt_round(env, st.connected(), now);
+        rtt_round(env, st.connected(), now, rtt_every);
     }
     if now.duration_since(st.last_punch) >= PUNCH_EVERY {
         st.last_punch = now;
-        punch_round(env);
+        punch_round(env, now);
     }
     // Пути доставки: пересчёт раз в 10 с и сразу при падении пути (§3.6).
     if now.duration_since(st.last_paths) >= PATHS_EVERY {
@@ -2953,15 +3009,31 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
     }
 }
 
+/// Снять путь с участников, ушедших в офлайн (issue #14): у офлайн-участника
+/// пути нет вовсе — иначе таблица держала бы «server» и плечо сервера как
+/// RTT, а UI показывал бы 1 мс до человека, которого нет в сети.
+fn drop_offline_paths(env: &Env, events: &[Event]) {
+    for e in events {
+        if let Event::PeerOffline { ip, .. } = e {
+            env.paths.clear_target(*ip);
+        }
+    }
+}
+
 /// Пересчёт путей всех участников: события `PathChanged`/`PathLost` (§3.6).
 fn paths_round(env: &Env, connected: bool, _now: Instant) {
-    // Каждому участнику — запись в таблице: у кого нет ни прямого канала, ни
-    // mesh-маршрута, путь по умолчанию — сервер.
+    // Каждому онлайн-участнику — запись в таблице: у кого нет ни прямого
+    // канала, ни mesh-маршрута, путь по умолчанию — сервер. Офлайн-участник
+    // пути не имеет (issue #14): его цель снимается.
     {
         let g = env.groups.lock().unwrap();
         for gs in g.values() {
             for p in gs.members.values() {
-                env.paths.ensure_target(p.ip);
+                if p.online {
+                    env.paths.ensure_target(p.ip);
+                } else {
+                    env.paths.clear_target(p.ip);
+                }
             }
         }
     }
@@ -2981,6 +3053,7 @@ fn paths_round(env: &Env, connected: bool, _now: Instant) {
                     name: peer_name(env, ip),
                     path: to,
                     rtt_ms,
+                    manual: false,
                 });
             }
             path::PathChange::Lost { ip, from } => {
@@ -2990,6 +3063,17 @@ fn paths_round(env: &Env, connected: bool, _now: Instant) {
                 env.emit(Event::PathLost {
                     ip,
                     name: peer_name(env, ip),
+                });
+            }
+            path::PathChange::Reverted { ip, from, to } => {
+                if debug() {
+                    eprintln!("[engine] путь {ip} откатан: {from:?} -> {to:?}");
+                }
+                env.emit(Event::PathReverted {
+                    ip,
+                    name: peer_name(env, ip),
+                    from,
+                    to,
                 });
             }
         }
@@ -3525,7 +3609,7 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
                     });
                     let connected = env.meta.lock().unwrap().connected;
                     for change in env.paths.recalc_one(ip, uptime_ms(env), connected) {
-                        emit_path_change(env, change);
+                        emit_path_change(env, change, false);
                     }
                 }
                 if debug() {
@@ -3574,12 +3658,15 @@ fn ip_of_ed(env: &Env, ed: &[u8; 32]) -> Option<u32> {
 fn recalc_path_now(env: &Env, ip: u32) {
     let connected = env.meta.lock().unwrap().connected;
     for change in env.paths.recalc_one(ip, uptime_ms(env), connected) {
-        emit_path_change(env, change);
+        // Закрепление/открепление — ручное изменение (issue #26): UI решает по
+        // флагу, показывать ли уведомление.
+        emit_path_change(env, change, true);
     }
 }
 
-/// Событие смены пути — из [`path::PathChange`].
-fn emit_path_change(env: &Env, change: path::PathChange) {
+/// Событие смены пути — из [`path::PathChange`]. `manual` — изменение пришло
+/// от `Cmd::PinPath`/`Cmd::UnpinPath` (issue #26).
+fn emit_path_change(env: &Env, change: path::PathChange, manual: bool) {
     match change {
         path::PathChange::Changed {
             ip,
@@ -3595,6 +3682,7 @@ fn emit_path_change(env: &Env, change: path::PathChange) {
                 name: peer_name(env, ip),
                 path: to,
                 rtt_ms,
+                manual,
             });
         }
         path::PathChange::Lost { ip, from } => {
@@ -3604,6 +3692,17 @@ fn emit_path_change(env: &Env, change: path::PathChange) {
             env.emit(Event::PathLost {
                 ip,
                 name: peer_name(env, ip),
+            });
+        }
+        path::PathChange::Reverted { ip, from, to } => {
+            if debug() {
+                eprintln!("[engine] путь {ip} откатан: {from:?} -> {to:?}");
+            }
+            env.emit(Event::PathReverted {
+                ip,
+                name: peer_name(env, ip),
+                from,
+                to,
             });
         }
     }
@@ -4052,7 +4151,7 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             // Снятие/включение L2 меняет набор путей — пересчитать сразу.
             let connected = env.meta.lock().unwrap().connected;
             for change in env.paths.recalc(uptime_ms(env), connected) {
-                emit_path_change(env, change);
+                emit_path_change(env, change, false);
             }
             env.emit(Event::Notice(if on {
                 "релей через пиров включён".into()
@@ -4602,6 +4701,7 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
             crate::dns::DNS_ADDR
         )));
     }
+    drop_offline_paths(env, &events);
     for ev in events {
         env.emit(ev);
     }
@@ -4665,6 +4765,7 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
         }
         gs.rev = u.rev;
     }
+    drop_offline_paths(env, &events);
     for ev in events {
         env.emit(ev);
     }
@@ -4723,6 +4824,9 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         return FrameVerdict::Drop;
     }
     let mut became_direct: Option<String> = None;
+    // Замер RTT из PONG: адрес получателя, мс и по какому пути он пришёл
+    // (прямой / через сервер) — для честного end-to-end RTT (issue #15).
+    let mut pong: Option<(u32, u32, bool, bool)> = None;
     let reply = {
         let mut g = env.groups.lock().unwrap();
         let Some(gs) = g.get_mut(&h.gid) else {
@@ -4756,6 +4860,9 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
                 None => {
                     peer.direct_addr = Some(src);
                     peer.last_direct = Some(now);
+                    // Прямой канал есть — бэкофф PUNCH сброшен (issue #16).
+                    peer.punch_fails = 0;
+                    peer.punch_at = None;
                     became_direct = Some(peer.name.clone());
                 }
                 Some(a) if a == src => peer.last_direct = Some(now),
@@ -4765,7 +4872,16 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         if typ == proto::grp::PONG
             && let Ok(sent_ms) = payloads::dec_ping(&payload)
         {
-            peer.rtt_ms = Some(epoch_ms().saturating_sub(sent_ms));
+            let rtt = epoch_ms().saturating_sub(sent_ms);
+            peer.rtt_ms = Some(rtt);
+            let direct = !is_relay && peer.direct_addr == Some(src);
+            let via_server = !direct && src == env.server();
+            pong = Some((
+                h.src,
+                u32::try_from(rtt).unwrap_or(u32::MAX),
+                direct,
+                via_server,
+            ));
         }
         // Через релея heartbeat не отвечаем: ответ ушёл бы не туда (dst —
         // исходный отправитель), а прямой канал его и так покрывает.
@@ -4790,6 +4906,17 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
             ip: h.src,
             name,
         });
+    }
+    // Замер из PONG — в таблицу путей: прямой — стоимость L0, серверный —
+    // честный end-to-end маршрута (issue #15), плечо сюда не попадает.
+    if let Some((ip, rtt, direct, via_server)) = pong {
+        let now_ms = uptime_ms(env);
+        if direct {
+            env.paths.record_direct_rtt(ip, rtt, now_ms);
+        } else if via_server {
+            env.paths.record_server_path_rtt(ip, rtt, now_ms);
+        }
+        env.paths.record_probe_answered(ip);
     }
     match (typ, reply) {
         (proto::grp::DATA, _) => {
@@ -4859,7 +4986,7 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let now_ms = uptime_ms(env);
     let (chosen, changes) = env.paths.choose(dst, now_ms, connected);
     for ch in changes {
-        emit_path_change(env, ch);
+        emit_path_change(env, ch, false);
     }
     match chosen {
         Some(PathKind::Direct) => match direct {
@@ -4943,14 +5070,20 @@ fn answer_dns(env: &Env, bytes: &[u8]) {
 // ---------- раунды RTT и NAT ----------
 
 /// RTT-зонд онлайн-пирам: прямым — напрямую (это же держит NAT-маппинг),
-/// остальным — через релей. Заодно гасит протухшие прямые каналы.
-fn rtt_round(env: &Env, connected: bool, now: Instant) {
+/// остальным — через сервер (честный end-to-end замер маршрута, issue #15).
+/// Заодно гасит протухшие прямые каналы: порог — [`direct_timeout`] от
+/// интервала проб (issue #16), поэтому одна-две пропущенные пробы канал не
+/// убивают.
+fn rtt_round(env: &Env, connected: bool, now: Instant, interval: Duration) {
     let payload = payloads::enc_ping(epoch_ms());
     let mut frames: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     // Замеры прямого канала (RTT из PONG по прямому пути) и падения.
     let mut direct_rtts: Vec<(u32, u32)> = Vec::new();
+    // Получатели, которым реально ушла проба (для учёта потерь, issue #26).
+    let mut probes: Vec<u32> = Vec::new();
     let mut failures: Vec<u32> = Vec::new();
+    let timeout = direct_timeout(interval);
     {
         let server = env.server();
         let mut g = env.groups.lock().unwrap();
@@ -4966,7 +5099,7 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                 if peer.direct_addr.is_some()
                     && peer
                         .last_direct
-                        .is_none_or(|t| now.duration_since(t) > DIRECT_TIMEOUT)
+                        .is_none_or(|t| now.duration_since(t) > timeout)
                 {
                     peer.direct_addr = None;
                     peer.last_direct = None;
@@ -4995,6 +5128,7 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                     proto::seal_group(&k, proto::grp::PING, &h, c, &payload),
                     target,
                 ));
+                probes.push(ip);
             }
         }
     }
@@ -5002,6 +5136,9 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
     let now_ms = uptime_ms(env);
     for (ip, rtt) in direct_rtts {
         env.paths.record_direct_rtt(ip, rtt, now_ms);
+    }
+    for ip in probes {
+        env.paths.record_probe_sent(ip);
     }
     for ev in events {
         env.emit(ev);
@@ -5021,7 +5158,11 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
 
 /// PUNCH онлайн-пирам без прямого канала — на endpoint и все кандидаты.
 /// Пирам с прямым каналом не шлём ничего: их маппинг держат RTT-зонды.
-fn punch_round(env: &Env) {
+///
+/// Бэкофф (issue #16): каждая неудача удваивает паузу до пира —
+/// 5 → 10 → 20 → 40 → 60 с. Прямой канал сбрасывает счётчик (см.
+/// `handle_group_frame`), поэтому живая пара не платит за чужие неудачи.
+fn punch_round(env: &Env, now: Instant) {
     let mut frames: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
     {
         let mut g = env.groups.lock().unwrap();
@@ -5030,9 +5171,18 @@ fn punch_round(env: &Env) {
                 .members
                 .iter()
                 .filter(|(_, p)| p.online && p.direct_addr.is_none())
+                .filter(|(_, p)| p.punch_at.is_none_or(|t| now >= t))
                 .map(|(ip, p)| (*ip, p.punch_addrs()))
                 .collect();
             for (ip, addrs) in targets {
+                let Some(peer) = gs.members.get_mut(&ip) else {
+                    continue;
+                };
+                // Прошлый PUNCH прямого канала не дал — следующая попытка
+                // позже; счётчик растёт только здесь, сбрасывается каналом.
+                let wait = punch_interval(peer.punch_fails);
+                peer.punch_fails = peer.punch_fails.saturating_add(1);
+                peer.punch_at = Some(now + wait);
                 for a in addrs {
                     let (k, h, c) = gs.next_frame(*gid, ip);
                     frames.push((proto::seal_group(&k, proto::grp::PUNCH, &h, c, &[]), a));
@@ -5232,7 +5382,7 @@ pub fn run(
             }
             Event::ServerPingResult { .. } => {}
             // Этап 9: путь доставки, пробы, релей. UI-часть — T2/T3/T5.
-            Event::PathChanged { .. } | Event::PathLost { .. } => {}
+            Event::PathChanged { .. } | Event::PathLost { .. } | Event::PathReverted { .. } => {}
             Event::ProbeResult { .. } => {}
             Event::RelayStats { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
@@ -5617,6 +5767,8 @@ mod tests {
             rtt_ms: None,
             mesh_x: None,
             mesh_caps: 0,
+            punch_fails: 0,
+            punch_at: None,
         };
         let mut groups: HashMap<u32, GroupSess> = HashMap::new();
         for gid in [3, 5, 9] {
@@ -5667,6 +5819,8 @@ mod tests {
                 rtt_ms: None,
                 mesh_x: None,
                 mesh_caps: 0,
+                punch_fails: 0,
+                punch_at: None,
             },
         );
         let h = |src, epoch| proto::GroupHeader {
@@ -6039,6 +6193,8 @@ mod tests {
                 rtt_ms: Some(20),
                 mesh_x: None,
                 mesh_caps: 0,
+                punch_fails: 0,
+                punch_at: None,
             },
         );
         env.groups.lock().unwrap().insert(1, g);
@@ -6204,5 +6360,135 @@ mod tests {
             }
         }
         assert_eq!(hint_candidates(&env).len(), payloads::MAX_SERVER_HINT);
+    }
+
+    /// Участник для тестов таймеров P2P: онлайн, без прямого канала.
+    fn timer_peer(ip: u32, endpoint: Option<SocketAddr>) -> PeerSess {
+        PeerSess {
+            pubkey: [3; 32],
+            name: "bravo".into(),
+            status: String::new(),
+            online: true,
+            ip,
+            endpoint,
+            candidates: Vec::new(),
+            direct_addr: None,
+            last_rx: Instant::now(),
+            last_direct: None,
+            rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
+            punch_fails: 0,
+            punch_at: None,
+        }
+    }
+
+    #[test]
+    fn пробы_идут_не_чаще_интервала() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, _ev) = test_env(server);
+        let mut st = State::new([1; 32]);
+        // Интервал из конфига — 20 с (issue #16), а не прежние жёсткие 2 с.
+        env.cfg.lock().unwrap().rtt_interval_ms = 20_000;
+        let t0 = Instant::now();
+        st.last_rtt = t0;
+        // Прошло 2 с — пробы нет: раунд не сдвинул отметку.
+        tick(&env, &mut st, t0 + Duration::from_secs(2));
+        assert_eq!(st.last_rtt, t0, "проба чаще интервала");
+        // Интервал прошёл — раунд случился.
+        tick(&env, &mut st, t0 + Duration::from_secs(20));
+        assert!(st.last_rtt > t0, "проба не ушла через интервал");
+        // Свежесть прямого канала масштабируется: 3 × 20 с = 60 с, поэтому
+        // замер 30-секундной давности ещё жив.
+        let ip = 0x6442_0102;
+        env.paths.ensure_target(ip);
+        env.paths.record_direct_rtt(ip, 10, 0);
+        env.paths.recalc(30_000, true);
+        assert_eq!(env.paths.current(ip), Some(PathKind::Direct));
+        env.paths.recalc(61_000, true);
+        assert_eq!(
+            env.paths.current(ip),
+            Some(PathKind::Server),
+            "протухший прямой путь не держится"
+        );
+    }
+
+    #[test]
+    fn прямой_канал_не_умирает_от_одной_пропущенной_пробы() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, ev) = test_env(server);
+        let t0 = Instant::now();
+        let peer_ip = 0x6442_0102;
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut g = GroupSess::new(&state(1, 1, 1), t0, KeyLog::default());
+        let mut peer = timer_peer(peer_ip, None);
+        peer.direct_addr = Some(addr);
+        peer.last_direct = Some(t0);
+        g.members.insert(peer_ip, peer);
+        env.groups.lock().unwrap().insert(1, g);
+        let interval = Duration::from_secs(5);
+        // Одна пропущенная проба (5 с без прямых фреймов) канал не убивает:
+        // порог — max(12 с, 3 × интервал) = 15 с (issue #16).
+        rtt_round(&env, true, t0 + Duration::from_secs(5), interval);
+        assert!(
+            env.groups.lock().unwrap()[&1].members[&peer_ip]
+                .direct_addr
+                .is_some(),
+            "одна пропущенная проба убила прямой канал"
+        );
+        // Три интервала без единого фрейма — канал потерян, событие есть.
+        rtt_round(&env, true, t0 + Duration::from_secs(16), interval);
+        assert!(
+            env.groups.lock().unwrap()[&1].members[&peer_ip]
+                .direct_addr
+                .is_none()
+        );
+        assert!(matches!(
+            ev.try_recv().expect("нет события"),
+            Event::DirectLost { ip, .. } if ip == peer_ip
+        ));
+    }
+
+    #[test]
+    fn punch_с_бэкоффом_не_спамит() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, _ev) = test_env(server);
+        let t0 = Instant::now();
+        let peer_ip = 0x6442_0102;
+        let mut g = GroupSess::new(&state(1, 1, 1), t0, KeyLog::default());
+        g.members.insert(
+            peer_ip,
+            timer_peer(peer_ip, Some("127.0.0.1:9".parse().unwrap())),
+        );
+        env.groups.lock().unwrap().insert(1, g);
+        punch_round(&env, t0);
+        {
+            let g = env.groups.lock().unwrap();
+            let p = &g[&1].members[&peer_ip];
+            assert_eq!(p.punch_fails, 1, "попытка не учтена");
+            assert_eq!(p.punch_at, Some(t0 + Duration::from_secs(5)));
+        }
+        // Раньше срока PUNCH не уходит — счётчик не растёт (issue #16).
+        punch_round(&env, t0 + Duration::from_secs(1));
+        assert_eq!(
+            env.groups.lock().unwrap()[&1].members[&peer_ip].punch_fails,
+            1
+        );
+        // Через 5 с — вторая попытка, пауза удвоилась.
+        punch_round(&env, t0 + Duration::from_secs(5));
+        {
+            let g = env.groups.lock().unwrap();
+            let p = &g[&1].members[&peer_ip];
+            assert_eq!(p.punch_fails, 2);
+            assert_eq!(p.punch_at, Some(t0 + Duration::from_secs(15)));
+        }
+        // Потолок 60 с: 5 → 10 → 20 → 40 → 60 → 60…
+        let secs = |n| Duration::from_secs(n);
+        assert_eq!(punch_interval(0), secs(5));
+        assert_eq!(punch_interval(1), secs(10));
+        assert_eq!(punch_interval(2), secs(20));
+        assert_eq!(punch_interval(3), secs(40));
+        assert_eq!(punch_interval(4), secs(60));
+        assert_eq!(punch_interval(100), secs(60));
     }
 }
