@@ -1556,19 +1556,21 @@ fn path_metrics(th: &Theme, snap: &PathSnap) -> Option<Line<'static>> {
 /// считается по ним: метрик у старого демона нет, и окно не растёт зря.
 struct PopupBody {
     lines: Vec<Line<'static>>,
-    /// История RTT — отдельная строка под текстом (пусто — строки нет).
+    /// История RTT — рисуется поверх пустой строки-заглушки `hist_row`.
     hist: Vec<u16>,
+    /// Строка под спарклайн (сразу после метрик пути).
+    hist_row: u16,
 }
 
 impl PopupBody {
-    /// Строк в окне: текст + спарклайн (если есть) + кнопки + рамка.
+    /// Строк в окне: текст (вместе со строкой спарклайна) + кнопки + рамка.
     fn height(&self) -> u16 {
-        self.lines.len() as u16 + u16::from(!self.hist.is_empty()) + 3
+        self.lines.len() as u16 + 3
     }
 
-    /// Номер строки с кнопками — сразу под текстом и спарклайном.
+    /// Номер строки с кнопками — сразу под текстом.
     fn buttons_row(&self) -> u16 {
-        self.lines.len() as u16 + u16::from(!self.hist.is_empty())
+        self.lines.len() as u16
     }
 }
 
@@ -1603,6 +1605,7 @@ fn peer_card_body(app: &App, th: &Theme, c: &PeerCardPopup) -> PopupBody {
     let peer = app.peers.iter().find(|p| p.pubkey == c.pubkey);
     let mut lines = identicon_lines(&c.pubkey);
     let mut hist = Vec::new();
+    let mut hist_at = None;
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("имя: ", th.dim),
@@ -1665,6 +1668,8 @@ fn peer_card_body(app: &App, th: &Theme, c: &PeerCardPopup) -> PopupBody {
                 lines.push(line);
             }
             if !snap.hist.is_empty() {
+                hist_at = Some(lines.len() as u16);
+                lines.push(Line::from(""));
                 hist.clone_from(&snap.hist);
             }
         }
@@ -1693,7 +1698,11 @@ fn peer_card_body(app: &App, th: &Theme, c: &PeerCardPopup) -> PopupBody {
         )));
     }
     lines.push(Line::from(""));
-    PopupBody { lines, hist }
+    PopupBody {
+        lines,
+        hist,
+        hist_row: hist_at.unwrap_or(0),
+    }
 }
 
 /// Карточка участника: текст, спарклайн RTT и кнопки.
@@ -1706,7 +1715,7 @@ fn draw_peer_card(
     area: Rect,
 ) {
     let buttons_at = body.buttons_row();
-    let hist_at = body.lines.len() as u16;
+    let hist_at = body.hist_row;
     let hist = body.hist;
     let block = popup_block(
         th,
@@ -1765,6 +1774,7 @@ fn path_pin_body(app: &App, th: &Theme, p: &PathPinPopup) -> PopupBody {
     ];
     // Метрики и спарклайн живого пути (issue #18/#26): у офлайна и у старого
     // демона их нет — тогда строк не добавляем.
+    let mut hist_at = None;
     if let Some(peer) = peer
         && peer.online
         && let Some(snap) = peer.path.as_ref()
@@ -1773,6 +1783,8 @@ fn path_pin_body(app: &App, th: &Theme, p: &PathPinPopup) -> PopupBody {
             lines.push(line);
         }
         if !snap.hist.is_empty() {
+            hist_at = Some(lines.len() as u16);
+            lines.push(Line::from(""));
             hist.clone_from(&snap.hist);
         }
     }
@@ -1827,14 +1839,18 @@ fn path_pin_body(app: &App, th: &Theme, p: &PathPinPopup) -> PopupBody {
         "0–3 — закрепить · Esc — закрыть",
         th.dim,
     )));
-    PopupBody { lines, hist }
+    PopupBody {
+        lines,
+        hist,
+        hist_row: hist_at.unwrap_or(0),
+    }
 }
 
 /// Окно выбора пути до участника (этап 9): `0 авто`, `1 прямой`,
 /// `2 сервер`, `3 реле`. Текущее закрепление помечено «●», недоступное
 /// (нет известного реле) — «—».
 fn draw_path_pin(f: &mut Frame, th: &Theme, p: &PathPinPopup, body: PopupBody, area: Rect) {
-    let hist_at = body.lines.len() as u16;
+    let hist_at = body.hist_row;
     let hist = body.hist;
     let block = popup_block(
         th,
