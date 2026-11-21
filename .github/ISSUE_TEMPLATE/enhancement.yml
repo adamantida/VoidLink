@@ -1,0 +1,62 @@
+name: ✨ Улучшение
+description: Новая возможность или доработка существующей
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Проблема / мотивация
+      description: Что неудобно или чего не хватает. Цифры и замеры приветствуются.
+      placeholder: "При 3 участниках постоянный обмен 300–600 Б/с из-за пингации"
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Предлагаемое решение
+      placeholder: "Пробы по таймеру 5–10 с, интервал конфигурируемый"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Альтернативы
+      description: Что рассматривали и почему не подошло. Можно пусто.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Компонент
+      multiple: true
+      options:
+        - protocol
+        - server
+        - client (движок / TUN / DNS)
+        - TUI
+        - CLI
+        - daemon / IPC
+        - tray
+        - winsvc (служба Windows)
+        - docs
+    validations:
+      required: true
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Влияние на протокол
+      options:
+        - Не затрагивает проводной формат
+        - Расширение без смены версии (как этап 9)
+        - Несовместимое изменение (новая версия протокола)
+        - Не знаю
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Критерии приёмки
+      description: Чек-лист, по которому issue можно закрыть.
+      value: |
+        - [ ] поведение реализовано
+        - [ ] тесты (юнит / e2e)
+        - [ ] docs / CHANGELOG обновлены
