@@ -218,12 +218,74 @@ impl PeerSess {
 /// сервера) окна прежнего ключа не наследует.
 type RxWindows = HashMap<u32, proto::ReplayWindow>;
 
-/// Что клиент накопил под ключом группы: следующий счётчик отправки и окна
-/// приёма.
+/// Сколько последних seq потока помнит кольцо дедупа (issue #25).
+pub const DEDUP_WINDOW: usize = 64;
+/// Сколько seq считается повтором, мс: дольше — это уже не дублирование
+/// путей, а запоздавший/подделанный кадр (его отсечёт окно повторов).
+pub const DEDUP_TTL_MS: u32 = 2_000;
+/// Предел числа потоков в кольце (LRU по времени последнего кадра).
+pub const DEDUP_FLOWS_MAX: usize = 64;
+/// Поток без кадров дольше — выбрасывается из кольца, мс.
+pub const DEDUP_FLOW_IDLE_MS: u32 = 10_000;
+
+/// Запись кольца дедупа: сквозной seq кадра (счётчик AEAD группы) и время.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DedupEntry {
+    seq: u64,
+    at_ms: u32,
+}
+
+/// Кольцо дедупа одного потока (`src_ip`) на выходе (issue #25): последние
+/// [`DEDUP_WINDOW`] seq, принятых не дольше [`DEDUP_TTL_MS`] назад.
+///
+/// Живёт в [`KeyState`], поэтому принадлежит ключу: при смене ключа кольцо
+/// пустое и счётчики начинаются с нуля — как у окон повторов.
+#[derive(Debug)]
+struct DedupRing {
+    entries: [Option<DedupEntry>; DEDUP_WINDOW],
+    /// Куда пишется следующая запись (кольцевой буфер).
+    next: usize,
+    /// Время последнего принятого кадра потока (для LRU по потокам).
+    last_ms: u32,
+}
+
+impl Default for DedupRing {
+    fn default() -> Self {
+        Self {
+            entries: [None; DEDUP_WINDOW],
+            next: 0,
+            last_ms: 0,
+        }
+    }
+}
+
+impl DedupRing {
+    /// `seq` уже доставлен этим потоком не дольше [`DEDUP_TTL_MS`] назад.
+    fn seen(&self, seq: u64, now_ms: u32) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|e| e.seq == seq && now_ms.wrapping_sub(e.at_ms) < DEDUP_TTL_MS)
+    }
+
+    /// Запомнить доставленный `seq`.
+    fn record(&mut self, seq: u64, now_ms: u32) {
+        self.entries[self.next] = Some(DedupEntry { seq, at_ms: now_ms });
+        self.next = (self.next + 1) % DEDUP_WINDOW;
+        self.last_ms = now_ms;
+    }
+}
+
+/// Кольца дедупа под ключом группы: src_ip → кольцо.
+type RxDedup = HashMap<u32, DedupRing>;
+
+/// Что клиент накопил под ключом группы: следующий счётчик отправки, окна
+/// приёма и кольца дедупа на выходе.
 #[derive(Default)]
 struct KeyState {
     tx: u64,
     rx: RxWindows,
+    dedup: RxDedup,
 }
 
 /// Отслуженные ключи групп и их [`KeyState`]. Общий для всех групп и их
@@ -245,7 +307,7 @@ impl KeyLog {
     }
 
     fn put(&self, key: proto::SymKey, st: KeyState) {
-        if st.tx == 0 && st.rx.is_empty() {
+        if st.tx == 0 && st.rx.is_empty() && st.dedup.is_empty() {
             return;
         }
         let mut log = self.0.lock().unwrap();
@@ -357,6 +419,29 @@ impl GroupSess {
             .as_mut()
             .filter(|p| p.key == *key)
             .map(|p| p.st.rx.entry(src).or_default())
+    }
+
+    /// Кольцо дедупа потока `src` под ключом `key` (текущим или прошлым).
+    /// Память ограничена: простаивающие дольше [`DEDUP_FLOW_IDLE_MS`] потоки
+    /// выбрасываются, при переполнении — самый старый по последнему кадру
+    /// (LRU), так что число потоков не больше [`DEDUP_FLOWS_MAX`].
+    fn rx_dedup(&mut self, key: &proto::SymKey, src: u32, now_ms: u32) -> Option<&mut DedupRing> {
+        let map = if *key == self.key {
+            &mut self.cur.dedup
+        } else {
+            &mut self.prev.as_mut().filter(|p| p.key == *key)?.st.dedup
+        };
+        if !map.contains_key(&src) {
+            map.retain(|_, r| now_ms.wrapping_sub(r.last_ms) < DEDUP_FLOW_IDLE_MS);
+            while map.len() >= DEDUP_FLOWS_MAX {
+                let Some(oldest) = map.iter().min_by_key(|(_, r)| r.last_ms).map(|(ip, _)| *ip)
+                else {
+                    break;
+                };
+                map.remove(&oldest);
+            }
+        }
+        Some(map.entry(src).or_default())
     }
 
     /// Ключ из GROUP_STATE / GROUP_UPDATE. Новый ключ — свои счётчик и окна
@@ -1197,6 +1282,59 @@ impl TunDev for crate::tun_macos::Utun {
 
 // ---------- общий контекст потоков ----------
 
+/// Предел одновременно дублируемых целей (issue #25): больше — это уже
+/// дублирование всего трафика, а не «маленького latency-sensitive».
+pub const DUP_TARGETS_MAX: usize = 8;
+/// Сколько цель считается активной после дублирования, мс.
+pub const DUP_TARGET_TTL_MS: u64 = 10_000;
+/// Допуск правила «второй путь не хуже 1.5× лучшего», мс: на быстрых путях
+/// (localhost, LAN) RTT — доли миллисекунды, и без допуска отношение скачет
+/// от шума измерений.
+pub const DUP_COST_SLACK_MS: f64 = 5.0;
+/// Во сколько раз второй путь может быть дороже лучшего.
+pub const DUP_COST_RATIO: f64 = 1.5;
+/// Свежесть замера RTT релея для правила выбора, мс (как `PEER_FRESH_MS`).
+pub const DUP_RELAY_FRESH_MS: u64 = 30_000;
+/// Вес нового замера в EWMA скорости цели.
+const DUP_RATE_ALPHA: f64 = 0.2;
+
+/// EWMA скорости цели, кбит/с: по ней решается, дублировать ли поток.
+#[derive(Clone, Copy, Default)]
+struct RateEwma {
+    kbps: f64,
+    at_ms: u64,
+}
+
+impl RateEwma {
+    /// Учесть отправленный пакет и вернуть текущую оценку скорости.
+    fn observe(&mut self, bytes: usize, now_ms: u64) -> f64 {
+        if self.at_ms != 0 {
+            let dt = now_ms.saturating_sub(self.at_ms).max(1) as f64 / 1000.0;
+            let inst = bytes as f64 * 8.0 / 1000.0 / dt;
+            self.kbps = if self.kbps == 0.0 {
+                inst
+            } else {
+                self.kbps * (1.0 - DUP_RATE_ALPHA) + inst * DUP_RATE_ALPHA
+            };
+        }
+        self.at_ms = now_ms;
+        self.kbps
+    }
+}
+
+/// Состояние дублирования путей (issue #25), которое движок ведёт сам:
+/// в `path.rs` только измерения и выбор одного пути, а EWMA скорости цели и
+/// замеры релея для правила «второй путь не хуже» нужны здесь.
+#[derive(Default)]
+struct DupState {
+    /// EWMA скорости цели, кбит/с.
+    rate: HashMap<u32, RateEwma>,
+    /// Когда цель последний раз дублировалась (предел одновременных целей).
+    active: HashMap<u32, u64>,
+    /// RTT маршрута через пира из `MESH_ROUTE_OK`: (получатель, релей) → (мс, когда).
+    relay: HashMap<(u32, [u8; 32]), (f64, u64)>,
+}
+
 struct Env {
     groups: Groups,
     meta: Arc<Mutex<Meta>>,
@@ -1224,6 +1362,9 @@ struct Env {
     paths: Arc<PathTable>,
     /// Пробы серверов (T2).
     probes: Arc<probe::ProbeState>,
+    /// Дублирование путей (issue #25): EWMA скорости цели, активные цели и
+    /// замеры RTT релея.
+    dup: Mutex<DupState>,
 }
 
 impl Env {
@@ -2113,6 +2254,7 @@ pub fn start_with_tun(
         mesh_finds: Arc::new(Mutex::new(Vec::new())),
         paths: paths.clone(),
         probes: Arc::new(probe::ProbeState::new()),
+        dup: Mutex::new(DupState::default()),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -2255,7 +2397,8 @@ fn dispatch(
     if proto::grp::is_group(typ) {
         match handle_group_frame(env, src, datagram, false) {
             FrameVerdict::NeedGroup(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
-            FrameVerdict::Accepted | FrameVerdict::Drop => true,
+            // Повтор уже доставленного кадра — не повод тянуть GROUP_STATE.
+            FrameVerdict::Accepted | FrameVerdict::Duplicate | FrameVerdict::Drop => true,
         }
     } else if src == env.server() {
         in_tx
@@ -3313,6 +3456,10 @@ fn my_mesh_caps(env: &Env) -> u8 {
     if cfg.mesh.relay_enabled {
         c |= proto::mesh::caps::RELAY | proto::mesh::caps::ACCEPT_RELAY;
     }
+    // Дедупликация на выходе работает всегда (issue #25): кольцо в KeyState
+    // не зависит от того, дублируем ли мы сами. Бит сообщает отправителю,
+    // что копии этому пиру можно слать.
+    c |= proto::mesh::caps::DUP;
     c
 }
 
@@ -3436,6 +3583,19 @@ fn handle_mesh_frame(env: &Env, src: SocketAddr, typ: u8, body: &[u8]) {
     apply_mesh_out(env, out);
 }
 
+/// Итог доставки реле-кадра для ACK/NACK (`MeshState::delivery_result`).
+///
+/// Повтор уже доставленного кадра — **успех** (issue #25): ACK, а не NACK.
+/// Иначе потерянный ACK и дубликат снимали бы здоровый путь через
+/// `record_failure` по `ForwardFailed`, а с дублированием это стало бы
+/// систематическим.
+fn delivery_result_of(v: FrameVerdict) -> (bool, u8) {
+    match v {
+        FrameVerdict::Accepted | FrameVerdict::Duplicate => (true, proto::mesh::code::REJECTED),
+        FrameVerdict::NeedGroup(_) | FrameVerdict::Drop => (false, proto::mesh::code::DROP),
+    }
+}
+
 /// Проверка открытого заголовка inner (реле не расшифровывает кадр).
 struct GroupCheck<'a> {
     groups: &'a [GroupMini],
@@ -3474,11 +3634,7 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
     }
     let now_ms = epoch_ms();
     for r in out.deliver {
-        let (ok, why) = match handle_group_frame(env, env.server(), &r.inner, true) {
-            FrameVerdict::Accepted => (true, proto::mesh::code::REJECTED),
-            FrameVerdict::NeedGroup(_) => (false, proto::mesh::code::DROP),
-            FrameVerdict::Drop => (false, proto::mesh::code::DROP),
-        };
+        let (ok, why) = delivery_result_of(handle_group_frame(env, env.server(), &r.inner, true));
         let reply = {
             let mut st = env.mesh.lock().unwrap();
             st.delivery_result(now_ms, &r, ok, why)
@@ -3511,8 +3667,18 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
                 load,
             } => {
                 if let Some(ip) = ip_of_ed(env, &dst_ed) {
-                    env.paths
-                        .record_peer_rtt(ip, via, up_ms, down_ms, load, uptime_ms(env));
+                    // Одно и то же время (uptime) и в таблицу путей, и в кеш
+                    // дублирования: у них общий масштаб свежести.
+                    let up = uptime_ms(env);
+                    env.paths.record_peer_rtt(ip, via, up_ms, down_ms, load, up);
+                    // RTT релея — для правила выбора копий (issue #25):
+                    // в path.rs стоимость не отдаётся, а для «второй путь не
+                    // хуже 1.5× лучшего» нужен замер end-to-end.
+                    let mut d = env.dup.lock().unwrap();
+                    d.relay
+                        .retain(|_, (_, at)| up.saturating_sub(*at) <= DUP_RELAY_FRESH_MS);
+                    d.relay
+                        .insert((ip, via), (f64::from(up_ms) + f64::from(down_ms), up));
                 }
             }
             mesh::MeshEvent::RouteFailed { .. } => {}
@@ -3658,6 +3824,70 @@ fn try_relay(env: &Env, dst: u32, dst_ed: [u8; 32], inner: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Отправить копию кадра через конкретного релея (issue #25, второй путь).
+/// Кандидаты не перебираются: путь выбран таблицей, и если релея нет —
+/// копия просто не уходит (`false`), без снятия пути.
+fn try_relay_via(env: &Env, dst_ed: [u8; 32], via: [u8; 32], inner: &[u8]) -> bool {
+    let w = mesh_world(env);
+    let Some(c) = w.contacts.iter().find(|c| c.ed == via).cloned() else {
+        return false;
+    };
+    let check = GroupCheck { groups: &w.groups };
+    let ctx = mesh::MeshCtx {
+        me: &env.identity,
+        my_caps: my_mesh_caps(env),
+        now_ms: epoch_ms(),
+        my_addr: w.my_addr,
+        contacts: &w.contacts,
+        members: &w.members,
+        relay_enabled: relay_enabled(env),
+        relay_budget: relay_budget(env),
+        check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+    };
+    let mut st = env.mesh.lock().unwrap();
+    match st.start_forward(&ctx, dst_ed, &c, inner) {
+        Ok((to, frame)) => {
+            drop(st);
+            env.send(&frame, to);
+            true
+        }
+        Err(code) => {
+            if debug() {
+                eprintln!(
+                    "[mesh] копия через реле {} не ушла: код {code}",
+                    proto::hex_of(&via)
+                );
+            }
+            false
+        }
+    }
+}
+
+/// Отправить копию кадра по пути `kind` (issue #25). `false` — путь сейчас
+/// не отправить (нет прямого адреса, релея, сессии): тихо пропускаем.
+fn send_extra(
+    env: &Env,
+    dst_ed: [u8; 32],
+    direct: Option<SocketAddr>,
+    frame: &[u8],
+    kind: PathKind,
+) -> bool {
+    match kind {
+        PathKind::Direct => match direct {
+            Some(a) => {
+                env.send(frame, a);
+                true
+            }
+            None => false,
+        },
+        PathKind::Server => {
+            env.send(frame, env.server());
+            true
+        }
+        PathKind::PeerRelay { via } => try_relay_via(env, dst_ed, via, frame),
+    }
 }
 
 fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
@@ -4679,6 +4909,10 @@ enum FrameVerdict {
     Accepted,
     /// Эпоха новее известной: нужен GET_GROUP (сигнал не чаще раза в секунду).
     NeedGroup(u32),
+    /// Повтор уже доставленного кадра (issue #25): не инжектится, окно
+    /// повторов не трогает, но это **не** отказ — отправителю уходит ACK.
+    /// Иначе дубликат (в т.ч. при дублировании путей) снимал бы здоровый путь.
+    Duplicate,
     /// Отброшен: не своя группа, не нам, не тот отправитель, повтор, мусор.
     Drop,
 }
@@ -4695,6 +4929,8 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         return FrameVerdict::Drop;
     };
     let now = Instant::now();
+    // Время для кольца дедупа — до захвата групп (uptime_ms берёт meta).
+    let now_ms = uptime_ms(env) as u32;
     let is_relay = relayed || src == env.server();
     // 1. Группа известна, эпоха — текущая или прошлая в пределах grace.
     let key = {
@@ -4741,12 +4977,31 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
             return FrameVerdict::Drop;
         }
         // 4. Окно повторов (того ключа, которым открыт фрейм) — последним:
-        //    отвергнутый фрейм счётчик не тратит.
+        //    отвергнутый фрейм счётчик не тратит. Перед ним — дедуп на выходе
+        //    (issue #25): повтор уже доставленного кадра отличается от
+        //    подделки/старика и получает ACK, а не NACK.
+        let Some(ring) = gs.rx_dedup(&key, h.src, now_ms) else {
+            return FrameVerdict::Drop;
+        };
+        if ring.seen(ctr, now_ms) {
+            // Не инжектим, окно не трогаем, прямой канал не поднимаем: кадр
+            // уже доставлен, но пир жив — ответ придёт ACK-ом.
+            env.stats.dup_dropped.fetch_add(1, Ordering::Relaxed);
+            if let Some(peer) = gs.members.get_mut(&h.src) {
+                peer.last_rx = now;
+            }
+            return FrameVerdict::Duplicate;
+        }
         let Some(win) = gs.rx_window(&key, h.src) else {
             return FrameVerdict::Drop;
         };
         if !win.commit(ctr) {
             return FrameVerdict::Drop;
+        }
+        // Кольцо заполняется только после успешного commit: подделанный кадр
+        // (AEAD не сошёлся) и повтор вне окна его не отравляют.
+        if let Some(ring) = gs.rx_dedup(&key, h.src, now_ms) {
+            ring.record(ctr, now_ms);
         }
         let peer = gs.members.get_mut(&h.src).expect("участник проверен");
         peer.last_rx = now;
@@ -4828,6 +5083,15 @@ fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
 /// измеренной стоимости (§3.6): прямой → релей сервера → релей через пира.
 /// Отказ выбранного пути (`record_failure` + `PathLost`) — следующий кандидат:
 /// реле пробуются по очереди (до [`RELAY_TRIES`]), затем сервер.
+///
+/// Дублирование (issue #25): маленький пакет к цели, которая умеет дедуп
+/// (`caps::DUP`), уходит по нескольким путям — копии **одной и той же**
+/// датаграммы.
+///
+/// Инвариант: кадр запечатывается **один раз** и может быть отправлен по
+/// любому числу путей. Повторная запечатки того же payload под тем же
+/// счётчиком запрещена — это повтор nonce; per-flow seq здесь один на все
+/// пути, потому что кадр один.
 fn route_packet(env: &Env, bytes: &[u8]) {
     if bytes.len() > proto::MAX_GROUP_PAYLOAD {
         return;
@@ -4841,7 +5105,7 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    let (key, h, ctr, direct, dst_ed) = {
+    let (key, h, ctr, direct, dst_ed, peer_caps) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
@@ -4850,10 +5114,11 @@ fn route_packet(env: &Env, bytes: &[u8]) {
         let Some(peer) = gs.members.get(&dst) else {
             return;
         };
-        let (direct, dst_ed) = (peer.direct_addr, peer.pubkey);
+        let (direct, dst_ed, caps) = (peer.direct_addr, peer.pubkey, peer.mesh_caps);
         let (k, h, c) = gs.next_frame(gid, dst);
-        (k, h, c, direct, dst_ed)
+        (k, h, c, direct, dst_ed, caps)
     };
+    // Запечатали один раз — все копии ниже отправляют эти же байты.
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     let connected = env.meta.lock().unwrap().connected;
     let now_ms = uptime_ms(env);
@@ -4861,6 +5126,14 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     for ch in changes {
         emit_path_change(env, ch);
     }
+    // Дополнительные пути (issue #25) — до отправки: решение не зависит от
+    // того, принял ли кадр выбранный путь. Прямой путь без адреса уже уйдёт
+    // сервером, и копия «сервером» была бы второй одинаковой датаграммой.
+    let extra = if chosen == Some(PathKind::Direct) && direct.is_none() {
+        Vec::new()
+    } else {
+        dup_extra_paths(env, dst, peer_caps, bytes.len(), chosen, now_ms, connected)
+    };
     match chosen {
         Some(PathKind::Direct) => match direct {
             Some(a) => env.send(&frame, a),
@@ -4893,6 +5166,159 @@ fn route_packet(env: &Env, bytes: &[u8]) {
         // ничего не даёт, но и вреда нет).
         Some(PathKind::Server) | None => env.send(&frame, env.server()),
     }
+    // Копии по дополнительным путям (issue #25): те же байты кадра, без
+    // перезапечатки. Отказ копии не трогает таблицу путей: её состояние
+    // поправят обычные измерения, а путь к цели уже выбран.
+    for kind in extra {
+        if send_extra(env, dst_ed, direct, &frame, kind) {
+            env.stats.dup_sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Входы правила дублирования (issue #25): так сигнатура не разрастается, а
+/// тест задаёт их по отдельности.
+struct DupQuery<'a> {
+    cfg: &'a crate::store::MeshConfig,
+    /// Сколько путей копировать (`Config::duplicate_paths`).
+    n_paths: u8,
+    peer_caps: u8,
+    pinned: bool,
+    pkt_len: usize,
+    /// EWMA скорости цели, кбит/с.
+    rate_kbps: f64,
+    chosen: Option<PathKind>,
+    /// Доступные пути по возрастанию стоимости (`PathTable::fallbacks`).
+    paths: &'a [PathKind],
+}
+
+/// Правило выбора путей для дублирования (issue #25) без движка — чистая
+/// функция, чтобы её можно было проверить юнит-тестом.
+///
+/// Копии шлются, только если: дублирование включено, пакет не больше
+/// `duplicate_max_pkt`, получатель умеет дедуп (`caps::DUP`), цель не
+/// закреплена вручную (pin сильнее автоматики), поток цели не быстрее
+/// `duplicate_max_kbps`, доступно ≥ 2 пути и каждый следующий не дороже
+/// [`DUP_COST_RATIO`]× лучшего (+ [`DUP_COST_SLACK_MS`]).
+///
+/// Возвращает пути **сверх** выбранного: не больше `n_paths - 1`.
+fn dup_plan(q: &DupQuery, cost_ms: impl Fn(PathKind) -> Option<f64>) -> Vec<PathKind> {
+    let cfg = q.cfg;
+    if !cfg.duplicate || q.pkt_len > usize::from(cfg.duplicate_max_pkt) {
+        return Vec::new();
+    }
+    // Пир не умеет дедуп — копии для него мусор (и трафик).
+    if !proto::mesh::caps::has(q.peer_caps, proto::mesh::caps::DUP) {
+        return Vec::new();
+    }
+    // Ручное закрепление сильнее автоматики: у пина ровно один путь.
+    if q.pinned || q.chosen.is_none() || q.paths.len() < 2 {
+        return Vec::new();
+    }
+    // Быстрый поток дублировать нельзя: полоса удвоится на потоке, которому
+    // это не нужно (дублирование — для редкого latency-sensitive трафика).
+    if q.rate_kbps > f64::from(cfg.duplicate_max_kbps) {
+        return Vec::new();
+    }
+    let best = q
+        .paths
+        .iter()
+        .filter_map(|k| cost_ms(*k))
+        .fold(f64::INFINITY, f64::min);
+    if !best.is_finite() {
+        return Vec::new();
+    }
+    let limit = usize::from(q.n_paths);
+    let mut out = Vec::new();
+    for kind in q.paths {
+        if Some(*kind) == q.chosen {
+            continue;
+        }
+        if out.len() + 1 >= limit {
+            break;
+        }
+        match cost_ms(*kind) {
+            // `fallbacks` отсортирован по стоимости: дальше только дороже.
+            Some(c) if c <= best * DUP_COST_RATIO + DUP_COST_SLACK_MS => out.push(*kind),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// RTT пути до получателя `ip`, мс (issue #25): оценка стоимости для правила
+/// «второй путь не хуже 1.5× лучшего». Прямой канал — из PONG, сервер — из
+/// CTRL_PONG, релей — из `MESH_ROUTE_OK` (запоминает движок).
+fn path_rtt_ms(env: &Env, ip: u32, kind: PathKind, now_ms: u64) -> Option<f64> {
+    match kind {
+        PathKind::Direct => {
+            let g = env.groups.lock().unwrap();
+            g.values()
+                .find_map(|gs| gs.members.get(&ip).and_then(|p| p.rtt_ms))
+                .map(|r| r as f64)
+        }
+        PathKind::Server => env.paths.server_rtt().map(f64::from),
+        PathKind::PeerRelay { via } => {
+            let d = env.dup.lock().unwrap();
+            d.relay
+                .get(&(ip, via))
+                .filter(|(_, at)| now_ms.saturating_sub(*at) <= DUP_RELAY_FRESH_MS)
+                .map(|(rtt, _)| *rtt)
+        }
+    }
+}
+
+/// Дополнительные пути для копий кадра (issue #25): правила, которым нужно
+/// состояние движка, — EWMA скорости цели, предел одновременных целей,
+/// закрепление, доступные пути и их RTT.
+fn dup_extra_paths(
+    env: &Env,
+    dst: u32,
+    peer_caps: u8,
+    pkt_len: usize,
+    chosen: Option<PathKind>,
+    now_ms: u64,
+    connected: bool,
+) -> Vec<PathKind> {
+    let cfg = env.cfg.lock().unwrap().mesh.clone();
+    if !cfg.duplicate {
+        return Vec::new();
+    }
+    // EWMA скорости цели (кбит/с) — с учётом этого пакета.
+    let rate_kbps = {
+        let mut d = env.dup.lock().unwrap();
+        d.rate
+            .retain(|_, r| now_ms.saturating_sub(r.at_ms) < DUP_TARGET_TTL_MS * 6);
+        d.rate.entry(dst).or_default().observe(pkt_len, now_ms)
+    };
+    // Предел одновременно дублируемых целей: больше DUP_TARGETS_MAX — это уже
+    // дублирование всего трафика, а не маленького latency-sensitive.
+    {
+        let mut d = env.dup.lock().unwrap();
+        d.active
+            .retain(|_, at| now_ms.saturating_sub(*at) < DUP_TARGET_TTL_MS);
+        if !d.active.contains_key(&dst) && d.active.len() >= DUP_TARGETS_MAX {
+            return Vec::new();
+        }
+    }
+    let pinned = env.paths.pin_of(dst).is_some();
+    let fb = env.paths.fallbacks(dst, now_ms, connected);
+    let n_paths = env.cfg.lock().unwrap().duplicate_paths();
+    let q = DupQuery {
+        cfg: &cfg,
+        n_paths,
+        peer_caps,
+        pinned,
+        pkt_len,
+        rate_kbps,
+        chosen,
+        paths: &fb,
+    };
+    let extra = dup_plan(&q, |k| path_rtt_ms(env, dst, k, now_ms));
+    if !extra.is_empty() {
+        env.dup.lock().unwrap().active.insert(dst, now_ms);
+    }
+    extra
 }
 
 /// Ответ встроенного DNS на запрос из адаптера: имена — нормализованные
@@ -5884,6 +6310,11 @@ mod tests {
 
     /// Минимальный `Env` без потоков: мета/группы/сокет/таблица путей.
     fn test_env(server: SocketAddr) -> (Arc<Env>, mpsc::Receiver<Event>) {
+        test_env_tun(server, Arc::new(NullTun))
+    }
+
+    /// То же, но со своей заглушкой адаптера (счётчик инъекций в тестах дедупа).
+    fn test_env_tun(server: SocketAddr, tun: Arc<dyn TunDev>) -> (Arc<Env>, mpsc::Receiver<Event>) {
         let (ev_tx, ev_rx) = mpsc::channel();
         let meta = Arc::new(Mutex::new(Meta {
             connected: true,
@@ -5913,7 +6344,7 @@ mod tests {
             server: Mutex::new(server),
             sock,
             tcp: Mutex::new(None),
-            tun: Arc::new(NullTun),
+            tun,
             quit: AtomicBool::new(false),
             key_log: KeyLog::default(),
             mesh: Arc::new(Mutex::new(mesh::MeshState::new(true))),
@@ -5921,6 +6352,7 @@ mod tests {
             mesh_finds: Arc::new(Mutex::new(Vec::new())),
             paths: paths.clone(),
             probes: Arc::new(probe::ProbeState::new()),
+            dup: Mutex::new(DupState::default()),
         });
         (env, ev_rx)
     }
@@ -5932,6 +6364,377 @@ mod tests {
             at: Instant::now() - Duration::from_millis(30),
             report,
         }
+    }
+
+    // ---------- issue #25: дедупликация на выходе и дублирование путей ----------
+
+    /// Заглушка адаптера со счётчиком инъекций.
+    #[derive(Default)]
+    struct CountTun {
+        injected: AtomicU64,
+    }
+
+    impl TunDev for CountTun {
+        fn inject(&self, _packet: &[u8]) -> Result<()> {
+            self.injected.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn ensure_address(&self, _ip: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Минимальный IPv4-пакет (заголовок 20 байт + данные).
+    fn ipv4(src: u32, dst: u32, data: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        let len = (20 + data.len()) as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src.to_be_bytes());
+        p[16..20].copy_from_slice(&dst.to_be_bytes());
+        p.extend_from_slice(data);
+        p
+    }
+
+    /// Группа с одним участником: свой ip, ключ `[2; 32]`, эпоха 1.
+    fn test_group(gid: u32, my_ip: u32, peer_ip: u32, peer_addr: SocketAddr) -> GroupSess {
+        let mut gs = GroupSess::new(
+            &payloads::GroupState {
+                gid,
+                rev: 1,
+                epoch: 1,
+                revoke_prev: false,
+                name: "g".into(),
+                owner: [1; 32],
+                private: false,
+                key: [2; 32],
+                deleted: false,
+                my_ip,
+                members: Vec::new(),
+                mesh: Vec::new(),
+            },
+            Instant::now(),
+            KeyLog::default(),
+        );
+        gs.members.insert(
+            peer_ip,
+            PeerSess {
+                pubkey: [3; 32],
+                name: "bravo".into(),
+                status: String::new(),
+                online: true,
+                ip: peer_ip,
+                endpoint: Some(peer_addr),
+                candidates: Vec::new(),
+                direct_addr: None,
+                last_rx: Instant::now(),
+                last_direct: None,
+                rtt_ms: Some(20),
+                mesh_x: None,
+                mesh_caps: proto::mesh::caps::MESH | proto::mesh::caps::DUP,
+            },
+        );
+        gs
+    }
+
+    /// Кадр группы под ключом `[2; 32]` (тот же, что у `test_group`).
+    fn test_frame(gid: u32, src: u32, dst: u32, ctr: u64, payload: &[u8]) -> Vec<u8> {
+        proto::seal_group(
+            &[2u8; 32],
+            proto::grp::DATA,
+            &proto::GroupHeader {
+                gid,
+                src,
+                dst,
+                epoch: 1,
+            },
+            ctr,
+            payload,
+        )
+    }
+
+    #[test]
+    fn дедуп_повтор_не_инжектится_дважды() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let tun = Arc::new(CountTun::default());
+        let (env, _ev) = test_env_tun(server, tun.clone());
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        env.groups
+            .lock()
+            .unwrap()
+            .insert(gid, test_group(gid, my_ip, peer_ip, peer));
+        let pkt = ipv4(peer_ip, my_ip, b"dedup");
+        let f = test_frame(gid, peer_ip, my_ip, 5, &pkt);
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Accepted
+        );
+        assert_eq!(tun.injected.load(Ordering::Relaxed), 1);
+        // Второй экземпляр того же кадра (копия по другому пути) — Duplicate.
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Duplicate
+        );
+        assert_eq!(
+            tun.injected.load(Ordering::Relaxed),
+            1,
+            "повтор не инжектится"
+        );
+        assert_eq!(env.stats.dup_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn дедуп_повтор_даёт_ack_а_не_nack() {
+        // Главный фикс issue #25: отброшенный повтор — успех для отправителя,
+        // иначе NACK снимал бы здоровый путь (record_failure по ForwardFailed).
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let tun = Arc::new(CountTun::default());
+        let (env, _ev) = test_env_tun(server, tun);
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        env.groups
+            .lock()
+            .unwrap()
+            .insert(gid, test_group(gid, my_ip, peer_ip, peer));
+        let pkt = ipv4(peer_ip, my_ip, b"ack");
+        let f = test_frame(gid, peer_ip, my_ip, 7, &pkt);
+        let first = handle_group_frame(&env, peer, &f, true);
+        let repeat = handle_group_frame(&env, peer, &f, true);
+        assert_eq!(first, FrameVerdict::Accepted);
+        assert_eq!(repeat, FrameVerdict::Duplicate);
+        assert!(delivery_result_of(first).0);
+        assert_eq!(
+            delivery_result_of(repeat),
+            (true, proto::mesh::code::REJECTED),
+            "дубликат подтверждается (ACK), а не отвергается (NACK)"
+        );
+    }
+
+    #[test]
+    fn дедуп_истекает_по_времени() {
+        let mut ring = DedupRing::default();
+        ring.record(7, 1_000);
+        assert!(ring.seen(7, 1_000), "сразу после приёма — повтор");
+        assert!(
+            ring.seen(7, 1_000 + DEDUP_TTL_MS - 1),
+            "в пределах TTL — ещё повтор"
+        );
+        assert!(
+            !ring.seen(7, 1_000 + DEDUP_TTL_MS),
+            "после TTL — уже не дубликат (решает окно повторов)"
+        );
+        // Кольцо ограничено: старые seq вытесняются новыми.
+        for i in 0..DEDUP_WINDOW as u64 {
+            ring.record(100 + i, 1_000);
+        }
+        assert!(!ring.seen(7, 1_000), "seq вытеснен кольцом");
+    }
+
+    #[test]
+    fn дедуп_не_видит_повтор_после_смены_ключа() {
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        let mut gs = test_group(gid, my_ip, peer_ip, peer);
+        let key1 = [2u8; 32];
+        gs.rx_dedup(&key1, peer_ip, 1_000).unwrap().record(5, 1_000);
+        assert!(gs.rx_dedup(&key1, peer_ip, 1_000).unwrap().seen(5, 1_000));
+        // Ротация ключа: кольцо принадлежит ключу и начинается с нуля.
+        gs.set_key(2, [9u8; 32], false, Instant::now());
+        assert!(
+            !gs.rx_dedup(&[9u8; 32], peer_ip, 1_000)
+                .unwrap()
+                .seen(5, 1_000),
+            "новый ключ не наследует кольцо прежнего"
+        );
+        // Прошлый ключ ещё принимается (grace) — и его кольцо цело.
+        assert!(gs.rx_dedup(&key1, peer_ip, 1_000).unwrap().seen(5, 1_000));
+    }
+
+    #[test]
+    fn дедуп_память_ограничена_числом_потоков() {
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        let mut gs = test_group(gid, my_ip, peer_ip, peer);
+        let key = [2u8; 32];
+        for i in 0..(DEDUP_FLOWS_MAX as u32 * 3) {
+            let src = 0x6442_1000 + i;
+            let now = 1_000 + i;
+            gs.rx_dedup(&key, src, now)
+                .unwrap()
+                .record(u64::from(i), now);
+        }
+        assert_eq!(
+            gs.cur.dedup.len(),
+            DEDUP_FLOWS_MAX,
+            "число потоков в кольце ограничено"
+        );
+        // Простаивающий поток выбрасывается, даже если место есть.
+        let stale = 0x6442_9000;
+        gs.rx_dedup(&key, stale, 1_000).unwrap();
+        let later = 1_000 + DEDUP_FLOW_IDLE_MS + 1;
+        gs.rx_dedup(&key, 0x6442_A000, later).unwrap();
+        assert!(
+            !gs.cur.dedup.contains_key(&stale),
+            "простаивающий поток выброшен"
+        );
+    }
+
+    #[test]
+    fn дедуп_не_трогает_окно_повторов() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let tun = Arc::new(CountTun::default());
+        let (env, _ev) = test_env_tun(server, tun);
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        env.groups
+            .lock()
+            .unwrap()
+            .insert(gid, test_group(gid, my_ip, peer_ip, peer));
+        let pkt = ipv4(peer_ip, my_ip, b"window");
+        let f = test_frame(gid, peer_ip, my_ip, 5, &pkt);
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Accepted
+        );
+        let (max_before, bits_before) = {
+            let g = env.groups.lock().unwrap();
+            let w = g[&gid].cur.rx[&peer_ip].clone();
+            (w.max(), w.check(4))
+        };
+        assert_eq!(max_before, Some(5));
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Duplicate
+        );
+        let g = env.groups.lock().unwrap();
+        let w = &g[&gid].cur.rx[&peer_ip];
+        assert_eq!(w.max(), max_before, "окно не сдвинулось повтором");
+        assert_eq!(w.check(4), bits_before, "биты окна не изменились");
+    }
+
+    /// Правила дублирования без движка: пути Direct (10 мс) и Server (12 мс).
+    fn dup_cfg() -> crate::store::MeshConfig {
+        crate::store::MeshConfig {
+            duplicate: true,
+            ..Default::default()
+        }
+    }
+
+    fn dup_paths() -> Vec<PathKind> {
+        vec![PathKind::Direct, PathKind::Server]
+    }
+
+    fn dup_cost(kind: PathKind) -> Option<f64> {
+        Some(match kind {
+            PathKind::Direct => 10.0,
+            PathKind::Server => 12.0,
+            PathKind::PeerRelay { .. } => 20.0,
+        })
+    }
+
+    /// Запрос с выбранным Direct и путями `paths`.
+    fn dup_query<'a>(
+        cfg: &'a crate::store::MeshConfig,
+        caps: u8,
+        paths: &'a [PathKind],
+    ) -> DupQuery<'a> {
+        DupQuery {
+            cfg,
+            n_paths: 2,
+            peer_caps: caps,
+            pinned: false,
+            pkt_len: 64,
+            rate_kbps: 0.0,
+            chosen: Some(PathKind::Direct),
+            paths,
+        }
+    }
+
+    #[test]
+    fn дублирование_не_включается_без_caps() {
+        let cfg = dup_cfg();
+        let paths = dup_paths();
+        let no_dup = proto::mesh::caps::MESH | proto::mesh::caps::RELAY;
+        assert!(
+            dup_plan(&dup_query(&cfg, no_dup, &paths), dup_cost).is_empty(),
+            "без caps::DUP копии не шлём"
+        );
+        let with_dup = no_dup | proto::mesh::caps::DUP;
+        assert_eq!(
+            dup_plan(&dup_query(&cfg, with_dup, &paths), dup_cost),
+            vec![PathKind::Server]
+        );
+        // Выключенное дублирование — пусто даже с битом.
+        let off = crate::store::MeshConfig {
+            duplicate: false,
+            ..cfg.clone()
+        };
+        assert!(dup_plan(&dup_query(&off, with_dup, &paths), dup_cost).is_empty());
+        // Ручное закрепление сильнее автоматики: у пина один путь.
+        let pinned = DupQuery {
+            pinned: true,
+            ..dup_query(&cfg, with_dup, &paths)
+        };
+        assert!(dup_plan(&pinned, dup_cost).is_empty());
+    }
+
+    #[test]
+    fn дублирование_только_для_малого_трафика() {
+        let cfg = dup_cfg();
+        let caps = proto::mesh::caps::MESH | proto::mesh::caps::DUP;
+        let paths = dup_paths();
+        let q = dup_query(&cfg, caps, &paths);
+        // Размер: больше duplicate_max_pkt — не дублируем.
+        let big = DupQuery {
+            pkt_len: usize::from(cfg.duplicate_max_pkt) + 1,
+            ..dup_query(&cfg, caps, &paths)
+        };
+        assert!(
+            dup_plan(&big, dup_cost).is_empty(),
+            "большой пакет не дублируется"
+        );
+        assert_eq!(dup_plan(&q, dup_cost), vec![PathKind::Server]);
+        // Скорость: быстрый поток цели — не дублируем.
+        let fast = DupQuery {
+            rate_kbps: f64::from(cfg.duplicate_max_kbps) + 1.0,
+            ..dup_query(&cfg, caps, &paths)
+        };
+        assert!(
+            dup_plan(&fast, dup_cost).is_empty(),
+            "быстрый поток не дублируется"
+        );
+        // Стоимость: второй путь дороже 1.5× лучшего (+ допуск) — не дублируем.
+        let far = |kind: PathKind| match kind {
+            PathKind::Direct => Some(10.0),
+            _ => Some(100.0),
+        };
+        assert!(dup_plan(&q, far).is_empty(), "дорогой второй путь не берём");
+        // Три пути: duplicate_paths = 3 — обе копии, кроме выбранной.
+        let three = crate::store::MeshConfig {
+            duplicate_paths: 3,
+            ..cfg.clone()
+        };
+        let relay = PathKind::PeerRelay { via: [7u8; 32] };
+        let mut paths3 = dup_paths();
+        paths3.push(relay);
+        assert_eq!(
+            dup_plan(
+                &DupQuery {
+                    n_paths: 3,
+                    ..dup_query(&three, caps, &paths3)
+                },
+                dup_cost
+            ),
+            vec![PathKind::Server, relay]
+        );
+        // duplicate_paths = 2 — только один дополнительный путь.
+        assert_eq!(
+            dup_plan(&dup_query(&cfg, caps, &paths3), dup_cost),
+            vec![PathKind::Server]
+        );
     }
 
     #[test]
