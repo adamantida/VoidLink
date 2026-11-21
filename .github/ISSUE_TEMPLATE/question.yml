@@ -1,0 +1,23 @@
+name: ❓ Вопрос / «так задумано?»
+description: Сомнение в поведении или архитектуре — «возможно, я неправ»
+title: "question: "
+labels: ["question"]
+body:
+  - type: textarea
+    id: observation
+    attributes:
+      label: Наблюдение
+      placeholder: "Без сервера при повторном запуске в приложение не зайти"
+    validations:
+      required: true
+  - type: textarea
+    id: assumption
+    attributes:
+      label: Моё предположение
+      description: Как, по-вашему, должно работать и почему. Ошибаться здесь — нормально.
+      placeholder: "Значит DHT не реализован? Bootstrap должен быть нужен только для первого входа…"
+  - type: textarea
+    id: context
+    attributes:
+      label: Контекст
+      description: Версия, конфигурация, ссылки на docs / код / спецификацию.
