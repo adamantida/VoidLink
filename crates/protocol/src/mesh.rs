@@ -1062,4 +1062,50 @@ mod tests {
             assert!(!ctrl::is_plaintext(t));
         }
     }
+
+    #[test]
+    fn caps_dup_бит_не_ломает_разбор() {
+        // issue #25: DUP — бит в существующем байте caps, а не новое поле.
+        // Формат кадров и версия протокола не меняются: старый декодер видит
+        // те же длины, а незнакомый бит просто не проверяет.
+        assert_eq!(caps::DUP, 1 << 3);
+        assert!(!caps::has(caps::MESH | caps::RELAY, caps::DUP));
+        assert!(caps::has(caps::MESH | caps::DUP, caps::DUP));
+        let all = caps::MESH | caps::RELAY | caps::ACCEPT_RELAY | caps::DUP;
+        // MESH_HELLO: длина и подпись прежние, бит едет в байте flags.
+        let a = Identity::generate();
+        let ea = eph();
+        let now = 1_700_000_000_000;
+        let h = MeshHello::new(&a, ea.public(), [7u8; MESH_NONCE_LEN], now, all);
+        let body = h.encode();
+        assert_eq!(body.len(), MESH_HELLO_LEN, "формат кадра не изменился");
+        let got = MeshHello::decode(&body).unwrap();
+        assert_eq!(got.flags, all);
+        got.verify_from(&a.ed_pub(), now).unwrap();
+        // Контакт DHT (MESH_NODES) с тем же байтом caps — туда и обратно.
+        let node = Node {
+            ed: a.ed_pub(),
+            x: a.x_pub(),
+            addr: "203.0.113.7:4100".parse().unwrap(),
+            caps: all,
+            rtt_ms: 25,
+        };
+        let body = Rpc::Nodes {
+            id: 1,
+            nodes: vec![node.clone()],
+        }
+        .encode();
+        match Rpc::decode(MESH_NODES, &body).unwrap() {
+            Rpc::Nodes { nodes, .. } => {
+                assert_eq!(nodes, vec![node]);
+                assert!(caps::has(nodes[0].caps, caps::DUP));
+            }
+            other => panic!("не Nodes: {other:?}"),
+        }
+        // MESH_INFO (ctrl 0x17): DUP едет данными, кадр не меняется.
+        let info = crate::payloads::enc_mesh_info(&a.x_pub(), all);
+        assert_eq!(info.len(), 33);
+        let (x, c) = crate::payloads::dec_mesh_info(&info).unwrap();
+        assert_eq!((x, c), (a.x_pub(), all));
+    }
 }
