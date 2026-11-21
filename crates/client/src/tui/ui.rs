@@ -22,6 +22,7 @@ use ratatui::widgets::{
 use tunnel_protocol as proto;
 
 use crate::path::PathKind;
+use crate::snapshot::PathSnap;
 use crate::tui::app::{
     App, ConfirmPopup, Focus, FriendCardPopup, InputPopup, InvitePopup, ListPickPopup, MsgKind,
     PathPinPopup, PeerCardPopup, PeerPickPopup, PeerView, Popup, SETTING_ROWS, SettingsPopup,
@@ -268,31 +269,61 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 
 // ---------------------------------------------------------------- панель действий
 
+/// Ширина кнопки в клетках: чип — « подпись » (пробелы вокруг), выделение
+/// клавиши `keycap` меняет только стиль, не ширину.
+fn chip_width(label: &str) -> u16 {
+    Span::raw(label).width() as u16 + 2
+}
+
+/// Ширина ряда кнопок с зазорами `gap` между ними.
+fn buttons_width(items: &[(&str, Btn, KeyEvent)], gap: u16) -> u16 {
+    let n = items.len() as u16;
+    items.iter().map(|(l, _, _)| chip_width(l)).sum::<u16>() + gap * n.saturating_sub(1)
+}
+
+/// Необязательная кнопка «путь до участника» (Shift+P): в [`TOOLBAR`] её нет,
+/// потому что на 80 колонках ряд не влезает и без неё (issue #22).
+const PATH_BTN: (&str, KeyCode, KeyModifiers) = ("P путь", KeyCode::Char('P'), KeyModifiers::NONE);
+
+/// Кнопки панели действий: постоянные подписи плюс «P путь» сразу за
+/// «p профиль», если весь ряд помещается в `width`. Иначе кнопку не добавляем:
+/// `draw_buttons` молча выбрасывает не влезшие, и вместе с ней пропали бы
+/// «F3 настройки» и «: команда».
+fn toolbar_items(width: u16) -> Vec<(&'static str, Btn, KeyEvent)> {
+    let mut items: Vec<(&'static str, Btn, KeyEvent)> = TOOLBAR
+        .iter()
+        .map(|(label, code, mods)| (*label, Btn::Normal, KeyEvent::new(*code, *mods)))
+        .collect();
+    let Some(at) = TOOLBAR
+        .iter()
+        .position(|(_, code, _)| *code == KeyCode::Char('p'))
+        .map(|i| i + 1)
+    else {
+        return items;
+    };
+    let mut probe = items.clone();
+    probe.insert(
+        at,
+        (
+            PATH_BTN.0,
+            Btn::Normal,
+            KeyEvent::new(PATH_BTN.1, PATH_BTN.2),
+        ),
+    );
+    if buttons_width(&probe, 1) <= width {
+        items = probe;
+    }
+    items
+}
+
 /// Кнопки-клавиши под шапкой: клик по ним = нажатие клавиши.
 fn draw_toolbar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
-    // «p» в таблице участников — выбор пути, в остальных местах — профиль:
-    // подпись на кнопке должна говорить правду.
-    let p_label = if app.focus == Focus::Peers && app.sel_peer.is_some() {
-        "p путь"
-    } else {
-        "p профиль"
-    };
-    let items: Vec<(&str, Btn, KeyEvent)> = TOOLBAR
-        .iter()
-        .map(|(label, code, mods)| {
-            let label = if *code == KeyCode::Char('p') {
-                p_label
-            } else {
-                *label
-            };
-            (label, Btn::Normal, KeyEvent::new(*code, *mods))
-        })
-        .collect();
     let row = Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(1),
         ..area
     };
+    let items = toolbar_items(row.width);
     draw_buttons(f, th, &app.hits.toolbar, row, &items, 1, true);
 }
 
@@ -326,7 +357,7 @@ fn draw_buttons(
             ],
             _ => vec![Span::styled(format!(" {label} "), style)],
         };
-        let w: u16 = chip.iter().map(|s| s.width() as u16).sum();
+        let w = chip_width(label);
         if x + w > row.right() {
             break;
         }
@@ -594,11 +625,14 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         } else {
             ("◇ relay", th.relay)
         };
-        let rtt = match p.rtt_ms {
+        // RTT офлайн-участника не показываем (issue #18): замер остался с
+        // прошлой сессии, и «48 мс» у строки «офлайн» — выдумка.
+        let rtt_ms = p.rtt_ms.filter(|_| p.online);
+        let rtt = match rtt_ms {
             Some(v) => format!("{v} мс"),
             None => "—".to_string(),
         };
-        let rtt_style = match p.rtt_ms {
+        let rtt_style = match rtt_ms {
             Some(v) if v < 50 => th.ok,
             Some(v) if v < 150 => th.warn,
             Some(_) => th.error,
@@ -697,10 +731,15 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 /// длину маршрута в хопах, для промежуточного реле она постоянна.
 const RELAY_HOPS: u32 = 2;
 
-/// Текст метки пути (этап 9): `◆ прямой 12 мс`, `◇ сервер 48 мс`,
-/// `⇄ через <реле> 33 мс (2 хопа)`; `—` — пути ещё нет.
-/// `short` — узкая колонка: без RTT и хопов, чтобы метка влезла.
+/// Текст метки пути (этап 9): `◆ прямой 12 мс`, `◇ сервер 48 мс, плечо 1 мс`,
+/// `⇄ через <реле> 33 мс (2 хопа)`; `—` — пути нет или участник офлайн.
+/// `short` — узкая колонка: без RTT, хопов и плеча, чтобы метка влезла.
 fn path_text(app: &App, p: &PeerView, short: bool) -> String {
+    // Офлайн-участник пути не имеет (issue #18): в кэше мог остаться путь с
+    // прошлого пересчёта, но показывать его — значит врать.
+    if !p.online {
+        return "—".to_string();
+    }
     let Some(snap) = &p.path else {
         return "—".to_string();
     };
@@ -709,8 +748,12 @@ fn path_text(app: &App, p: &PeerView, short: bool) -> String {
             (false, Some(ms)) => format!("◆ прямой {ms} мс"),
             _ => "◆ прямой".to_string(),
         },
-        PathKind::Server => match (short, snap.rtt_ms) {
-            (false, Some(ms)) => format!("◇ сервер {ms} мс"),
+        // Полный RTT и плечо «мы → сервер» отдельно: видно, из чего сложилась
+        // цифра (issue #15/#18).
+        PathKind::Server => match (short, snap.rtt_ms, snap.leg_ms) {
+            (false, Some(ms), Some(leg)) => format!("◇ сервер {ms} мс, плечо {leg} мс"),
+            (false, Some(ms), None) => format!("◇ сервер {ms} мс"),
+            (false, None, Some(leg)) => format!("◇ сервер, плечо {leg} мс"),
             _ => "◇ сервер".to_string(),
         },
         PathKind::PeerRelay { via } => {
@@ -730,16 +773,16 @@ fn path_text(app: &App, p: &PeerView, short: bool) -> String {
 
 /// Колонка «путь» таблицы участников: текст и стиль под вид пути.
 fn path_cell(app: &App, th: &Theme, p: &PeerView, short: bool) -> (String, Style) {
-    let style = if !p.online {
-        // Офлайн: путь мог остаться с прошлого пересчёта — приглушаем.
-        th.offline
-    } else {
-        match p.path.as_ref().map(|s| &s.kind) {
-            Some(PathKind::Direct) => th.direct,
-            Some(PathKind::Server) => th.accent,
-            Some(PathKind::PeerRelay { .. }) => th.relay,
-            None => th.dim,
-        }
+    // Офлайн — всегда «—» и приглушённый стиль: путь из кэша мог остаться с
+    // прошлого пересчёта (issue #18).
+    if !p.online {
+        return ("—".to_string(), th.offline);
+    }
+    let style = match p.path.as_ref().map(|s| &s.kind) {
+        Some(PathKind::Direct) => th.direct,
+        Some(PathKind::Server) => th.accent,
+        Some(PathKind::PeerRelay { .. }) => th.relay,
+        None => th.dim,
     };
     (path_text(app, p, short), style)
 }
@@ -1181,15 +1224,19 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
             draw_friend_card(f, app, th, c, rect);
         }
         Popup::PeerCard(c) => {
-            // 5 строк identicon + 9 строк данных + кнопки + рамка.
-            let rect = centered(area, 62, 18);
+            // Высота — по содержимому: строки данных плюс спарклайн RTT, если
+            // движок прислал историю (issue #18).
+            let body = peer_card_body(app, th, c);
+            let rect = centered(area, 62, body.height());
             open_popup(f, app, rect);
-            draw_peer_card(f, app, th, c, rect);
+            draw_peer_card(f, app, th, c, body, rect);
         }
         Popup::PathPin(p) => {
-            let rect = centered(area, 52, 12);
+            // Высота — по содержимому: метрики и спарклайн добавляют строки.
+            let body = path_pin_body(app, th, p);
+            let rect = centered(area, 52, body.height());
             open_popup(f, app, rect);
-            draw_path_pin(f, app, th, p, rect);
+            draw_path_pin(f, th, p, body, rect);
         }
         Popup::ListPick(p) => {
             let h = (p.items.len() as u16 + 4).clamp(8, 20);
@@ -1477,11 +1524,85 @@ fn pin_text(app: &App, ip: u32) -> String {
     }
 }
 
-/// Карточка участника (Enter в таблице участников): путь доставки,
-/// закрепление, для L2 — имя реле (этап 9).
-fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area: Rect) {
+/// Потери в промилле → проценты: 0 → «0 %», 12 → «1.2 %», 1000 → «100 %».
+fn loss_text(loss_pm: u16) -> String {
+    if loss_pm.is_multiple_of(10) {
+        format!("{} %", loss_pm / 10)
+    } else {
+        format!("{}.{} %", loss_pm / 10, loss_pm % 10)
+    }
+}
+
+/// Строка метрик канала (issue #26): джиттер и потери. Пусто у старого
+/// демона, который этих полей не присылает, — тогда строки нет вовсе.
+fn path_metrics(th: &Theme, snap: &PathSnap) -> Option<Line<'static>> {
+    let mut parts = Vec::new();
+    if let Some(jitter) = snap.jitter_ms {
+        parts.push(format!("джиттер {jitter} мс"));
+    }
+    if let Some(loss) = snap.loss_pm {
+        parts.push(format!("потери {}", loss_text(loss)));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(Line::from(vec![
+        Span::styled("канал: ", th.dim),
+        Span::styled(parts.join(" · "), th.base),
+    ]))
+}
+
+/// Содержимое попапа: строки текста и история RTT для спарклайна. Высота окна
+/// считается по ним: метрик у старого демона нет, и окно не растёт зря.
+struct PopupBody {
+    lines: Vec<Line<'static>>,
+    /// История RTT — отдельная строка под текстом (пусто — строки нет).
+    hist: Vec<u16>,
+}
+
+impl PopupBody {
+    /// Строк в окне: текст + спарклайн (если есть) + кнопки + рамка.
+    fn height(&self) -> u16 {
+        self.lines.len() as u16 + u16::from(!self.hist.is_empty()) + 3
+    }
+
+    /// Номер строки с кнопками — сразу под текстом и спарклайном.
+    fn buttons_row(&self) -> u16 {
+        self.lines.len() as u16 + u16::from(!self.hist.is_empty())
+    }
+}
+
+/// Спарклайн истории RTT в одну строку окна (приём тот же, что у графика
+/// трафика: `Sparkline` с потолком по максимуму). Пустая история — ничего.
+fn draw_rtt_hist(f: &mut Frame, th: &Theme, row: Rect, hist: &[u16]) {
+    if hist.is_empty() || row.width < 12 || row.height == 0 {
+        return;
+    }
+    let cols = Layout::horizontal([Constraint::Length(6), Constraint::Min(1)]).split(row);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(" rtt: ", th.dim))),
+        cols[0],
+    );
+    // Потолок — максимум истории: относительные высоты читаются лучше, чем
+    // по абсолютной шкале. Хвост — самые свежие замеры.
+    let max = hist.iter().copied().max().unwrap_or(1).max(1);
+    let w = cols[1].width as usize;
+    let data = &hist[hist.len().saturating_sub(w)..];
+    f.render_widget(
+        Sparkline::default()
+            .data(data.iter().copied().map(u64::from))
+            .max(u64::from(max))
+            .style(th.accent),
+        cols[1],
+    );
+}
+
+/// Строки карточки участника (Enter в таблице участников): путь доставки,
+/// метрики канала, закрепление, для L2 — имя реле (этап 9, issue #18/#26).
+fn peer_card_body(app: &App, th: &Theme, c: &PeerCardPopup) -> PopupBody {
     let peer = app.peers.iter().find(|p| p.pubkey == c.pubkey);
     let mut lines = identicon_lines(&c.pubkey);
+    let mut hist = Vec::new();
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("имя: ", th.dim),
@@ -1507,18 +1628,22 @@ fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area:
                 if p.online { th.ok } else { th.offline },
             ),
         ]));
+        // Связь и RTT — только у живого участника: у офлайна замер остался
+        // с прошлой сессии (issue #18).
         lines.push(Line::from(vec![
             Span::styled("связь: ", th.dim),
             Span::styled(
-                if p.direct {
+                if !p.online {
+                    "—"
+                } else if p.direct {
                     "прямой канал"
                 } else {
                     "через релей"
                 },
-                th.base,
+                if p.online { th.base } else { th.offline },
             ),
             Span::styled(
-                match p.rtt_ms {
+                match p.rtt_ms.filter(|_| p.online) {
                     Some(ms) => format!("  {ms} мс"),
                     None => String::new(),
                 },
@@ -1531,6 +1656,18 @@ fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area:
             Span::styled("путь: ", th.dim),
             Span::styled(text, style),
         ]));
+        // Метрики и спарклайн — только для живого пути: у офлайна их нет, а у
+        // старого демона их нет в снимке (обратная совместимость).
+        if p.online
+            && let Some(snap) = p.path.as_ref()
+        {
+            if let Some(line) = path_metrics(th, snap) {
+                lines.push(line);
+            }
+            if !snap.hist.is_empty() {
+                hist.clone_from(&snap.hist);
+            }
+        }
         // Закрепление: из конфига в снимке (переживает рестарт движка).
         lines.push(Line::from(vec![
             Span::styled("закреплено: ", th.dim),
@@ -1556,8 +1693,21 @@ fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area:
         )));
     }
     lines.push(Line::from(""));
-    let buttons_at = lines.len() as u16;
+    PopupBody { lines, hist }
+}
 
+/// Карточка участника: текст, спарклайн RTT и кнопки.
+fn draw_peer_card(
+    f: &mut Frame,
+    app: &App,
+    th: &Theme,
+    c: &PeerCardPopup,
+    body: PopupBody,
+    area: Rect,
+) {
+    let buttons_at = body.buttons_row();
+    let hist_at = body.lines.len() as u16;
+    let hist = body.hist;
     let block = popup_block(
         th,
         popup_title(
@@ -1567,14 +1717,15 @@ fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area:
         ),
         th.focused_border,
     );
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(Paragraph::new(body.lines).block(block), area);
+    draw_rtt_hist(f, th, inner_row(area, hist_at), &hist);
     draw_buttons(
         f,
         th,
         &app.hits.popup_buttons,
         inner_row(area, buttons_at),
         &[
-            ("Путь (p)", Btn::Primary, key(KeyCode::Char('p'))),
+            ("Путь (P)", Btn::Primary, key(KeyCode::Char('P'))),
             ("Закрыть (Esc)", Btn::Normal, key(KeyCode::Esc)),
         ],
         2,
@@ -1582,15 +1733,16 @@ fn draw_peer_card(f: &mut Frame, app: &App, th: &Theme, c: &PeerCardPopup, area:
     );
 }
 
-/// Окно выбора пути до участника (этап 9): `0 авто`, `1 прямой`,
-/// `2 сервер`, `3 реле`. Текущее закрепление помечено «●», недоступное
-/// (нет известного реле) — «—».
-fn draw_path_pin(f: &mut Frame, app: &App, th: &Theme, p: &PathPinPopup, area: Rect) {
+/// Строки окна пути до участника: текущий путь, метрики канала и варианты
+/// закрепления (`0 авто`, `1 прямой`, `2 сервер`, `3 реле`).
+fn path_pin_body(app: &App, th: &Theme, p: &PathPinPopup) -> PopupBody {
     let key_ip = crate::path::ip_key(p.ip);
     let current = app
         .pinned_paths
         .get(&key_ip)
         .and_then(|raw| PathKind::parse_config(raw));
+    let peer = app.peers.iter().find(|x| x.pubkey == p.pubkey);
+    let mut hist = Vec::new();
     let mut lines = vec![
         Line::from(vec![
             Span::styled("до: ", th.dim),
@@ -1600,7 +1752,7 @@ fn draw_path_pin(f: &mut Frame, app: &App, th: &Theme, p: &PathPinPopup, area: R
             ),
         ]),
         // Что движок выбрал сам — чтобы решение было осознанным.
-        match app.peers.iter().find(|x| x.pubkey == p.pubkey) {
+        match peer {
             Some(peer) => {
                 let (text, style) = path_cell(app, th, peer, false);
                 Line::from(vec![
@@ -1610,8 +1762,21 @@ fn draw_path_pin(f: &mut Frame, app: &App, th: &Theme, p: &PathPinPopup, area: R
             }
             None => Line::from(Span::styled("сейчас: —", th.dim)),
         },
-        Line::from(""),
     ];
+    // Метрики и спарклайн живого пути (issue #18/#26): у офлайна и у старого
+    // демона их нет — тогда строк не добавляем.
+    if let Some(peer) = peer
+        && peer.online
+        && let Some(snap) = peer.path.as_ref()
+    {
+        if let Some(line) = path_metrics(th, snap) {
+            lines.push(line);
+        }
+        if !snap.hist.is_empty() {
+            hist.clone_from(&snap.hist);
+        }
+    }
+    lines.push(Line::from(""));
     let opt = |k: char, text: String, on: bool, enabled: bool| {
         let (mark, style) = if !enabled {
             ("—", th.dim)
@@ -1662,13 +1827,22 @@ fn draw_path_pin(f: &mut Frame, app: &App, th: &Theme, p: &PathPinPopup, area: R
         "0–3 — закрепить · Esc — закрыть",
         th.dim,
     )));
+    PopupBody { lines, hist }
+}
 
+/// Окно выбора пути до участника (этап 9): `0 авто`, `1 прямой`,
+/// `2 сервер`, `3 реле`. Текущее закрепление помечено «●», недоступное
+/// (нет известного реле) — «—».
+fn draw_path_pin(f: &mut Frame, th: &Theme, p: &PathPinPopup, body: PopupBody, area: Rect) {
+    let hist_at = body.lines.len() as u16;
+    let hist = body.hist;
     let block = popup_block(
         th,
         popup_title(th, "⇄", &format!("Путь до {}", p.name)),
         th.focused_border,
     );
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(Paragraph::new(body.lines).block(block), area);
+    draw_rtt_hist(f, th, inner_row(area, hist_at), &hist);
 }
 
 fn draw_list_pick(f: &mut Frame, th: &Theme, p: &ListPickPopup, area: Rect) -> usize {
@@ -1940,8 +2114,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("r (в друзьях)", "переименовать друга (:alias друг имя)"),
         kv("c", "скопировать IP / pubkey / friend code"),
         kv("p", "карточка профиля"),
+        // 1:1 замена прежней строки «p (участники)»: высота справки не растёт
+        // (на 40-строчном терминале она уже упирается в предел), issue #22.
         kv(
-            "p (участники)",
+            "P · :path",
             "путь до участника: 0 авто · 1 прямой · 2 сервер · 3 реле",
         ),
         kv("F3", "настройки (имя, сервер, автовход, тема, невидимка)"),
@@ -2104,6 +2280,15 @@ mod tests {
         out
     }
 
+    /// Первая строка экрана, в которой есть `text` (для проверок колонок).
+    fn text_row(screen: &[Vec<char>], text: &str) -> String {
+        screen
+            .iter()
+            .map(|r| r.iter().collect::<String>())
+            .find(|r| r.contains(text))
+            .unwrap_or_else(|| panic!("нет строки с «{text}»"))
+    }
+
     #[test]
     fn основной_экран_содержит_ключевое() {
         let text = render(&demo_app(), 140, 40);
@@ -2200,6 +2385,209 @@ mod tests {
             text.contains("3 — реле: нет"),
             "нет недоступного реле:\n{text}"
         );
+    }
+
+    #[test]
+    fn метрики_и_спарклайн_пути_когда_движок_их_прислал() {
+        let mut app = demo_app();
+        app.toasts.clear();
+        // Новые поля контракта (issue #15/#26): полный RTT, плечо, джиттер,
+        // потери и история замеров.
+        let mut snap = PathSnap::new(PathKind::Server, Some(48));
+        snap.leg_ms = Some(1);
+        snap.jitter_ms = Some(3);
+        snap.loss_pm = Some(12);
+        snap.hist = vec![10, 20, 30, 40];
+        app.peers[0].path = Some(snap.clone());
+        app.groups[0].peers[0].path = Some(snap);
+
+        // Колонка «путь»: полный RTT и плечо «мы → сервер» (issue #18).
+        let s = frame(&app, 140, 40);
+        let row = text_row(&s, "100.66.1.3");
+        assert!(row.contains("◇ сервер 48 мс, плечо 1 мс"), "{row}");
+
+        // Карточка участника: метрики канала и спарклайн RTT.
+        app.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        let text = render(&app, 140, 40);
+        assert!(
+            text.contains("канал: джиттер 3 мс · потери 1.2 %"),
+            "нет метрик канала:\n{text}"
+        );
+        assert!(text.contains("rtt:"), "нет спарклайна RTT:\n{text}");
+        // Узкий экран: спарклайн не рисуется, паники нет.
+        let _ = render(&app, 40, 12);
+
+        // Окно пути: те же метрики.
+        app.stack.clear();
+        app.stack.push(Popup::PathPin(PathPinPopup {
+            pubkey: [2; 32],
+            name: "bravo".into(),
+            ip: 0x6442_0103,
+            relay: None,
+        }));
+        let text = render(&app, 140, 40);
+        assert!(text.contains("Путь до bravo"), "нет окна пути:\n{text}");
+        assert!(
+            text.contains("канал: джиттер 3 мс · потери 1.2 %"),
+            "нет метрик в окне пути:\n{text}"
+        );
+        assert!(text.contains("rtt:"), "нет спарклайна в окне пути:\n{text}");
+
+        // Старый демон: полей нет — ни строк метрик, ни спарклайна.
+        let mut old = demo_app();
+        old.toasts.clear();
+        old.peers[0].path = Some(PathSnap::new(PathKind::Server, Some(48)));
+        old.groups[0].peers[0].path = Some(PathSnap::new(PathKind::Server, Some(48)));
+        old.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        let text = render(&old, 140, 40);
+        assert!(!text.contains("канал:"), "метрики без данных:\n{text}");
+        assert!(!text.contains("rtt:"), "спарклайн без истории:\n{text}");
+    }
+
+    #[test]
+    fn офлайн_участник_без_пути_и_rtt() {
+        // Снимок мог сохранить путь и замер RTT с прошлой сессии: у строки
+        // «офлайн» их быть не должно (issue #18).
+        let mut app = demo_app();
+        app.toasts.clear();
+        let mut peer = app.peers[0].clone();
+        peer.online = false;
+        peer.rtt_ms = Some(48);
+        peer.path = Some(PathSnap::new(PathKind::Server, Some(48)));
+        app.peers = vec![peer.clone()];
+        app.groups[0].peers = vec![peer];
+
+        let s = frame(&app, 140, 40);
+        let row = text_row(&s, "100.66.1.3");
+        assert!(row.contains('—'), "нет «—» вместо пути и RTT: {row}");
+        assert!(!row.contains("мс"), "у офлайна остался RTT: {row}");
+        assert!(!row.contains("сервер"), "у офлайна остался путь: {row}");
+
+        // Карточка участника: связь «—», пути нет, метрик и спарклайна нет.
+        app.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        let text = render(&app, 140, 40);
+        assert!(text.contains("связь: —"), "нет «связь: —»:\n{text}");
+        assert!(text.contains("путь: —"), "нет «путь: —»:\n{text}");
+        assert!(!text.contains("канал:"), "метрики офлайн-пути:\n{text}");
+        assert!(!text.contains("rtt:"), "спарклайн офлайн-пути:\n{text}");
+    }
+
+    #[test]
+    fn колонка_путь_следует_за_событиями_и_снимком() {
+        // Три кадра: путь из снимка → событие сменило путь → участник офлайн.
+        let mut app = demo_app();
+        app.toasts.clear();
+        let s = frame(&app, 140, 40);
+        let row = text_row(&s, "100.66.1.3");
+        assert!(row.contains("◆ прямой 7 мс"), "кадр 1: {row}");
+
+        app.apply_events(
+            vec![crate::engine::Event::PathChanged {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+                path: PathKind::Server,
+                rtt_ms: Some(48),
+            }],
+            &crate::snapshot::Snapshot::default(),
+        );
+        let s = frame(&app, 140, 40);
+        let row = text_row(&s, "100.66.1.3");
+        assert!(row.contains("◇ сервер 48 мс"), "кадр 2: {row}");
+        assert!(
+            !row.contains("прямой"),
+            "кадр 2: старый путь остался: {row}"
+        );
+
+        // Снимок вслед за событием: участник ушёл в офлайн, кэш пути снят.
+        app.apply_events(
+            vec![crate::engine::Event::PeerOffline {
+                gid: 1,
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+            }],
+            &crate::snapshot::Snapshot::default(),
+        );
+        assert!(app.peers[0].path.is_none(), "кэш пути пережил офлайн");
+        for peer in app.peers.iter_mut().chain(app.groups[0].peers.iter_mut()) {
+            peer.online = false;
+        }
+        let s = frame(&app, 140, 40);
+        let row = text_row(&s, "100.66.1.3");
+        assert!(row.contains('—'), "кадр 3: нет «—»: {row}");
+        assert!(!row.contains("мс"), "кадр 3: остался RTT: {row}");
+        assert!(!row.contains("сервер"), "кадр 3: остался путь: {row}");
+    }
+
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
+    #[test]
+    fn справка_знает_про_p_и_P() {
+        let th = Theme::of(crate::tui::theme::ThemeKind::Dark);
+        let lines = help_lines(&th);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        // «p» — профиль, «P» (и `:path`) — путь до участника (issue #22).
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.starts_with("p ") && l.contains("карточка профиля")),
+            "нет строки «p» — профиль: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.starts_with("P ") && l.contains("путь до участника")),
+            "нет строки «P» — путь: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|l| !l.contains("p (участники)")),
+            "осталась старая строка «p (участники)»"
+        );
+        // Строки заменены 1:1: справка уже упирается в 40-строчный терминал,
+        // и новые клавиши не должны её удлинять.
+        assert_eq!(lines.len(), 44, "высота справки изменилась");
+    }
+
+    #[test]
+    fn кнопка_путь_появляется_только_когда_влезает() {
+        // На 80 колонках ряд не влезает целиком и без «P путь»: кнопку не
+        // добавляем, иначе draw_buttons выбросил бы «F3 настройки» и
+        // «: команда» (issue #22).
+        let app = demo_app();
+        let s = frame(&app, 80, 24);
+        let keys: Vec<KeyCode> = app
+            .hits
+            .toolbar
+            .borrow()
+            .iter()
+            .map(|(_, k)| k.code)
+            .collect();
+        assert!(
+            !keys.contains(&KeyCode::Char('P')),
+            "«P путь» на 80 колонках: {keys:?}"
+        );
+        // Ни одна постоянная кнопка не потеряна: видимое — префикс TOOLBAR.
+        let base: Vec<KeyCode> = TOOLBAR.iter().map(|(_, c, _)| *c).collect();
+        assert_eq!(keys, base[..keys.len()].to_vec(), "кнопки панели потеряны");
+        let text: String = s.iter().map(|r| r.iter().collect::<String>()).collect();
+        assert!(!text.contains("P путь"), "подпись на 80 колонках");
+
+        // Широкий терминал: кнопка есть, подпись постоянная, клик = Shift+P.
+        let _ = frame(&app, 200, 40);
+        let hits = app.hits.toolbar.borrow().clone();
+        assert!(
+            hits.iter().any(|(_, k)| k.code == KeyCode::Char('P')),
+            "нет кнопки «P путь» на широком экране"
+        );
+        let text = render(&app, 200, 40);
+        assert!(text.contains("P путь"), "нет подписи «P путь»");
+        assert!(text.contains("p профиль"), "нет подписи «p профиль»");
+        assert!(!text.contains("p путь"), "динамическая подмена подписи");
     }
 
     #[test]

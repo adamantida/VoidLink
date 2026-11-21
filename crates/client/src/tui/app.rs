@@ -875,12 +875,14 @@ impl App {
                     self.toast(MsgKind::Error, msg);
                 }
                 E::DirectLost { gid, ip, name } => {
+                    // Автоматика, а не действие пользователя (issue #23):
+                    // прямой канал теряется сам, тост на старте — спам.
                     let msg = format!(
                         "прямой канал с {name} ({}) в {gid} потерян — через релей",
                         proto::ip_str(ip)
                     );
                     self.log(MsgKind::Warn, msg.clone());
-                    self.toast(MsgKind::Warn, msg);
+                    self.status_msg = msg;
                 }
                 E::ServerKeyRotated { addr, new_code } => {
                     let msg = format!("ключ сервера {addr} сменён по цепочке ротации: {new_code}");
@@ -931,15 +933,20 @@ impl App {
                     );
                 }
                 E::PeerOffline { gid, ip, name } => {
+                    // Путь офлайн-участника снимаем сразу: кэш не должен
+                    // расходиться со снимком (issue #18).
+                    self.set_peer_path(ip, None);
                     self.log(
                         MsgKind::Info,
                         format!("{name} ({}) офлайн в {gid}", proto::ip_str(ip)),
                     );
                 }
                 E::Direct { gid, ip, name } => {
+                    // Установка прямого канала — автоматика (issue #23):
+                    // лог и статус, без тоста.
                     let msg = format!("прямой канал с {name} ({}) в {gid}", proto::ip_str(ip));
                     self.log(MsgKind::Ok, msg.clone());
-                    self.toast(MsgKind::Ok, msg);
+                    self.status_msg = msg;
                 }
                 E::Invite {
                     gid,
@@ -1065,34 +1072,30 @@ impl App {
                         }
                     }
                 }
-                // Путь доставки выбран или потерян (этап 9): строка в логе,
-                // отметка в статусе и сразу в кэше участников — снимок догонит.
+                // Путь доставки выбран (этап 9): строка в логе, отметка в
+                // статусе и сразу в кэше участников — снимок догонит. Тост не
+                // поднимаем (issue #23): путь меняет автоматика, тост на
+                // каждую смену — спам; тост бывает только на свою команду.
                 E::PathChanged {
                     ip,
                     name,
                     path: kind,
                     rtt_ms,
                 } => {
-                    self.set_peer_path(ip, Some(PathSnap::new(kind, rtt_ms.map(u64::from))));
+                    let snap = self.path_after_event(ip, kind, rtt_ms);
+                    self.set_peer_path(ip, Some(snap));
                     let msg = format!("путь до {name}: {}", self.path_label(&kind));
                     self.log(MsgKind::Info, msg.clone());
-                    self.status_msg = msg.clone();
-                    // В истории демона — только лог: тосты о давних сменах
-                    // пути всплывали бы пачкой при подключении.
-                    if !self.replaying {
-                        let level = match kind {
-                            PathKind::Direct => MsgKind::Ok,
-                            _ => MsgKind::Warn,
-                        };
-                        self.toast(level, msg);
-                    }
+                    self.status_msg = msg;
                 }
                 E::PathLost { ip, name } => {
                     self.set_peer_path(ip, None);
                     let msg = format!("путь до {name} потерян");
                     self.log(MsgKind::Warn, msg.clone());
                     self.status_msg = msg.clone();
-                    if !self.replaying {
+                    // Тост — только если путь был закреплён вручную: это
+                    // последствие команды пользователя (issue #23).
+                    if self.pinned_paths.contains_key(&path::ip_key(ip)) {
                         self.toast(MsgKind::Warn, msg);
                     }
                 }
@@ -1579,7 +1582,15 @@ impl App {
             KeyCode::Char('a') => self.open_add_friend(),
             KeyCode::Char('d') => self.open_del_friend(),
             KeyCode::Char('c') => self.copy_context(),
-            KeyCode::Char('p') => self.open_profile_or_path(),
+            // «p» — карточка профиля в любом фокусе, «P» — путь до выбранного
+            // участника (issue #22): раньше «p» в панели участников открывала
+            // только путь, и профиль из группы был недоступен.
+            KeyCode::Char('p') => self.stack.push(Popup::Profile),
+            KeyCode::Char('P') => {
+                if let Err(e) = self.open_selected_path() {
+                    self.status_msg = e.to_string();
+                }
+            }
             KeyCode::Char('o') => self.reopen_invites(),
             KeyCode::Char('m') => {
                 if let Some(cmd) = self.open_admin() {
@@ -2002,13 +2013,42 @@ impl App {
         }
     }
 
-    /// «p»: в таблице участников — выбор пути до выбранного пира, иначе профиль.
-    fn open_profile_or_path(&mut self) {
-        match self.sel_peer {
-            Some(pk) if self.focus == Focus::Peers && self.selected_peer().is_some() => {
-                self.open_path_pin(pk)
+    /// Путь участника в кэше (таблица участников и группы).
+    fn peer_path(&self, ip: u32) -> Option<&PathSnap> {
+        self.peers
+            .iter()
+            .chain(self.groups.iter().flat_map(|g| g.peers.iter()))
+            .find(|p| p.ip == ip)
+            .and_then(|p| p.path.as_ref())
+    }
+
+    /// Снимок пути из события `PathChanged`. Метрики `jitter`/`loss`/`hist`
+    /// (issue #26) приходят только в снимке: при смене маршрута они устарели и
+    /// сбрасываются, а если путь тот же (обновился только RTT) — сохраняются,
+    /// чтобы спарклайн в карточке не мигал между событием и снимком.
+    fn path_after_event(&self, ip: u32, kind: PathKind, rtt_ms: Option<u32>) -> PathSnap {
+        let mut snap = PathSnap::new(kind, rtt_ms.map(u64::from));
+        if let Some(old) = self.peer_path(ip).filter(|p| p.kind == kind) {
+            snap.leg_ms = old.leg_ms;
+            snap.jitter_ms = old.jitter_ms;
+            snap.loss_pm = old.loss_pm;
+            snap.hist.clone_from(&old.hist);
+        }
+        snap
+    }
+
+    /// «P» и `:path`: окно пути до выбранного участника — в любом фокусе.
+    /// Без выбранного участника окно не открывается: подсказка в статусе
+    /// (а команда ещё и возвращает ошибку).
+    fn open_selected_path(&mut self) -> Result<()> {
+        match self.sel_peer.filter(|_| self.selected_peer().is_some()) {
+            Some(pk) => {
+                self.open_path_pin(pk);
+                Ok(())
             }
-            _ => self.stack.push(Popup::Profile),
+            None => Err(anyhow!(
+                "не выбран участник: путь — Shift+P в панели участников"
+            )),
         }
     }
 
@@ -2043,11 +2083,15 @@ impl App {
     }
 
     /// Закрепить путь до `ip`; закрепление запоминаем сразу — снимок догонит.
+    /// Тост — потому что это действие пользователя (issue #23): автосмена
+    /// пути идёт только в лог/статус.
     fn pin_path(&mut self, eng: &dyn EngineApi, ip: u32, kind: PathKind) {
         let what = self.path_label(&kind);
         if self.send(eng, Cmd::PinPath { ip, path: kind }) {
             self.pinned_paths.insert(path::ip_key(ip), kind.to_config());
-            self.status_msg = format!("путь закреплён: {what}");
+            let msg = format!("путь закреплён: {what}");
+            self.status_msg = msg.clone();
+            self.toast(MsgKind::Ok, msg);
         }
     }
 
@@ -2055,7 +2099,9 @@ impl App {
     fn unpin_path(&mut self, eng: &dyn EngineApi, ip: u32) {
         if self.send(eng, Cmd::UnpinPath { ip }) {
             self.pinned_paths.remove(&path::ip_key(ip));
-            self.status_msg = "путь снова автоматический".into();
+            let msg = "путь снова автоматический".to_string();
+            self.status_msg = msg.clone();
+            self.toast(MsgKind::Ok, msg);
         }
     }
 
@@ -2151,8 +2197,9 @@ impl App {
                 }
             }
             Popup::PeerCard(card) => {
-                // «p» из карточки — тоже выбор пути (Esc вернёт карточку).
-                if let KeyCode::Char('p') = key.code {
+                // «P» из карточки — тоже выбор пути (Esc вернёт карточку):
+                // «p» везде означает профиль (issue #22).
+                if let KeyCode::Char('P') = key.code {
                     let pubkey = card.pubkey;
                     self.stack.push(Popup::PeerCard(card));
                     self.open_path_pin(pubkey);
@@ -3232,6 +3279,8 @@ impl App {
                 self.send(eng, cmd);
             }
             Command::Servers => self.open_servers(),
+            // Путь до выбранного участника без Shift (issue #22).
+            Command::Path => self.open_selected_path()?,
             Command::Invisible(on) => {
                 self.send(eng, Cmd::SetInvisible(on));
                 self.invisible = on;
@@ -3338,6 +3387,9 @@ pub enum Command {
     Admin(Option<u32>),
     /// Экран «Серверы».
     Servers,
+    /// Окно пути до выбранного участника: `:path` / `:путь` (issue #22) —
+    /// тот же выбор, что Shift+P, но без модификатора.
+    Path,
     /// Вход в федерированную группу (`:joinfed <uuid-hex|gid>`).
     JoinFed(String),
     Invisible(bool),
@@ -3441,6 +3493,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
             Some(gid_of(0)?)
         }),
         "servers" => Command::Servers,
+        "path" | "путь" => Command::Path,
         "invisible" => {
             Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
                 Some("on") => true,
@@ -4540,6 +4593,13 @@ mod tests {
         assert!(matches!(a.stack.last(), Some(Popup::Profile)));
         a.handle_key(key(KeyCode::Esc), &eng);
         assert!(a.stack.is_empty());
+        // «З» = Shift+P — окно пути до выбранного участника (issue #22).
+        let mut paths = path_app();
+        paths.handle_key(ch('З'), &eng);
+        assert!(
+            matches!(paths.stack.last(), Some(Popup::PathPin(_))),
+            "«З» не открыла окно пути"
+        );
         // «Ж» = «:» — командная строка; в ней кириллица остаётся кириллицей.
         a.handle_key(ch('Ж'), &eng);
         a.handle_key(ch('ы'), &eng);
@@ -4919,12 +4979,14 @@ mod tests {
         a
     }
 
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
     #[test]
-    fn путь_окно_по_p_и_закрепление_сервера() {
+    fn путь_окно_по_P_и_закрепление_сервера() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
-        // «p» при фокусе на участниках — окно пути, а не профиль.
-        a.handle_key(ch('p'), &eng);
+        // «P» — окно пути, а не профиль (issue #22).
+        a.handle_key(ch('P'), &eng);
         match a.stack.last() {
             Some(Popup::PathPin(p)) => {
                 assert_eq!(p.name, "bravo");
@@ -4951,12 +5013,14 @@ mod tests {
         );
     }
 
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
     #[test]
-    fn путь_окно_ноль_снимает_закрепление() {
+    fn путь_окно_ноль_снимает_закрепление_по_P() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
         a.pinned_paths.insert("100.66.1.3".into(), "server".into());
-        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('P'), &eng);
         assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
         a.handle_key(ch('0'), &eng);
         assert!(a.stack.is_empty(), "окно не закрылось");
@@ -4967,8 +5031,10 @@ mod tests {
         assert!(a.pinned_paths.is_empty(), "закрепление осталось в кэше");
     }
 
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
     #[test]
-    fn путь_окно_реле_шлёт_peerrelay() {
+    fn путь_окно_реле_шлёт_peerrelay_по_P() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
         // Второй участник группы — кандидат в реле для bravo.
@@ -4978,7 +5044,7 @@ mod tests {
         relay_peer.ip = 0x6442_0104;
         a.peers.push(relay_peer);
         a.groups[0].peers = a.peers.clone();
-        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('P'), &eng);
         let Some(Popup::PathPin(p)) = a.stack.last() else {
             panic!("нет окна выбора пути");
         };
@@ -4998,10 +5064,10 @@ mod tests {
     }
 
     #[test]
-    fn путь_окно_без_реле_не_шлёт_и_профиль_не_сломан() {
+    fn путь_окно_без_реле_не_шлёт_и_p_открывает_профиль() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
-        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('P'), &eng);
         a.handle_key(ch('3'), &eng);
         assert!(
             eng.sent().is_empty(),
@@ -5017,16 +5083,192 @@ mod tests {
         assert!(a.stack.is_empty(), "Esc не закрыл окно");
         assert!(eng.sent().is_empty(), "Esc ничего не шлёт");
 
-        // Фокус не на участниках — «p» по-прежнему открывает профиль.
-        a.focus = Focus::Groups;
-        a.handle_key(ch('p'), &eng);
-        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
-        a.stack.clear();
-        // Участники, но никто не выбран — тоже профиль.
-        a.focus = Focus::Peers;
+        // «p» теперь профиль в любом фокусе, в том числе на участниках.
+        for focus in [Focus::Groups, Focus::Peers] {
+            a.focus = focus;
+            a.stack.clear();
+            a.handle_key(ch('p'), &eng);
+            assert!(matches!(a.stack.last(), Some(Popup::Profile)), "{focus:?}");
+        }
+    }
+
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
+    #[test]
+    fn p_профиль_и_P_путь_во_всех_фокусах() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        for focus in [Focus::Groups, Focus::Friends, Focus::Peers, Focus::Log] {
+            a.focus = focus;
+            a.stack.clear();
+            // «p» — карточка профиля (issue #22: раньше в участниках это был
+            // только путь, и профиль из группы был недоступен).
+            a.handle_key(ch('p'), &eng);
+            assert!(
+                matches!(a.stack.last(), Some(Popup::Profile)),
+                "{focus:?}: «p» не профиль"
+            );
+            a.stack.clear();
+            // «P» — путь до выбранного участника, тоже в любом фокусе.
+            a.handle_key(ch('P'), &eng);
+            match a.stack.last() {
+                Some(Popup::PathPin(p)) => assert_eq!(p.pubkey, [2; 32]),
+                _ => panic!("{focus:?}: «P» не открыл окно пути"),
+            }
+        }
+    }
+
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
+    #[test]
+    fn P_без_выбранного_участника_пишет_в_статус() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
         a.sel_peer = None;
-        a.handle_key(ch('p'), &eng);
-        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
+        a.handle_key(ch('P'), &eng);
+        assert!(a.stack.is_empty(), "окно пути открылось без участника");
+        assert!(
+            a.status_msg.contains("не выбран участник"),
+            "нет подсказки в статусе: {:?}",
+            a.status_msg
+        );
+        // Команда `:path` — тот же выбор: без участника ошибка, с участником
+        // окно (это снимает возражение про регистр как модификатор).
+        assert!(a.run_command("path", &eng).is_err());
+        assert!(a.stack.is_empty());
+        a.sel_peer = Some([2; 32]);
+        a.run_command("path", &eng).unwrap();
+        assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
+        // Кириллическое имя команды — тоже.
+        a.stack.clear();
+        a.run_command("путь", &eng).unwrap();
+        assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
+    }
+
+    #[test]
+    fn смена_пути_не_поднимает_тост() {
+        let mut a = path_app();
+        a.toasts.clear();
+        a.apply_events(
+            vec![Event::PathChanged {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+                path: PathKind::Server,
+                rtt_ms: Some(48),
+            }],
+            &Snapshot::default(),
+        );
+        assert!(
+            a.toasts.is_empty(),
+            "смена пути подняла тост: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // Лог и статус на месте: смена видна, но не всплывает.
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("путь до bravo: сервер"))
+        );
+        assert_eq!(a.status_msg, "путь до bravo: сервер");
+        // Потеря незакреплённого пути — тоже без тоста (issue #23).
+        a.apply_events(
+            vec![Event::PathLost {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+            }],
+            &Snapshot::default(),
+        );
+        assert!(a.toasts.is_empty(), "потеря пути подняла тост");
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("путь до bravo потерян"))
+        );
+    }
+
+    #[test]
+    fn старт_без_тостов_о_пути() {
+        // События, которые движок шлёт на старте: прямой канал, его потеря и
+        // смена пути. Тост — только на действие пользователя (issue #23).
+        let mut a = path_app();
+        a.toasts.clear();
+        a.apply_events(
+            vec![
+                Event::Direct {
+                    gid: 1,
+                    ip: 0x6442_0103,
+                    name: "bravo".into(),
+                },
+                Event::DirectLost {
+                    gid: 1,
+                    ip: 0x6442_0103,
+                    name: "bravo".into(),
+                },
+                Event::PathChanged {
+                    ip: 0x6442_0103,
+                    name: "bravo".into(),
+                    path: PathKind::Direct,
+                    rtt_ms: Some(7),
+                },
+            ],
+            &Snapshot::default(),
+        );
+        assert!(
+            a.toasts.is_empty(),
+            "старт поднял тосты о пути: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("прямой канал с bravo"))
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("потерян — через релей"))
+        );
+        assert!(a.status_msg.contains("путь до bravo"));
+    }
+
+    #[test]
+    fn закрепление_пути_тост_по_команде_пользователя() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        a.toasts.clear();
+        a.handle_key(ch('P'), &eng);
+        a.handle_key(ch('2'), &eng);
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.kind == MsgKind::Ok && t.text.contains("путь закреплён")),
+            "нет тоста о закреплении: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // Закреплённый путь потерян — тост есть: это последствие своей команды.
+        a.toasts.clear();
+        a.apply_events(
+            vec![Event::PathLost {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+            }],
+            &Snapshot::default(),
+        );
+        assert!(
+            a.toasts.iter().any(|t| t.text.contains("потерян")),
+            "нет тоста о потере закреплённого пути"
+        );
+        // Снятие закрепления — тоже своё действие, тоже тост.
+        a.toasts.clear();
+        a.handle_key(ch('P'), &eng);
+        a.handle_key(ch('0'), &eng);
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.kind == MsgKind::Ok && t.text.contains("автоматический")),
+            "нет тоста о снятии закрепления: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
