@@ -694,6 +694,11 @@ struct Group {
     /// только по новому приглашению, пока запись жива (`Limits::left_ttl`).
     /// Сохраняется в `server.json` (`Persisted::left`, issue #20).
     left: HashMap<[u8; 32], u64>,
+    /// Отключённые от доставки участники (GROUP_ATTACH, issue #20): остаются
+    /// участниками, но не получают релей группы и не считаются онлайн.
+    /// Ключ группы при этом не ротируется. Не сохраняется: после рестарта
+    /// сервера доставка снова включена (клиент повторит GROUP_ATTACH).
+    detached: HashSet<[u8; 32]>,
     /// uuid группы в федерации (этап 9, T4b1): `None` — группа не
     /// федерирована (сервер без `--federate` либо uuid ещё не назначен).
     fed_uuid: Option<[u8; 16]>,
@@ -775,6 +780,7 @@ impl Group {
             invites: HashMap::new(),
             joins: Bucket::full(),
             left: HashMap::new(),
+            detached: HashSet::new(),
             fed_uuid: Some(rec.uuid),
             fed_origin: Some(from),
         };
@@ -1395,6 +1401,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             invites,
             joins: Bucket::full(),
             left: HashMap::new(),
+            detached: HashSet::new(),
             // uuid/origin федерации подставит загрузка `federation.groups`
             // (по gid) — см. ниже.
             fed_uuid: None,
@@ -1961,6 +1968,11 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         let Some(dst_pk) = g.by_ip.get(&h.dst).copied() else {
             return;
         };
+        // Получатель отключён от доставки (GROUP_ATTACH, issue #20) — кадр
+        // не релеится: участие и ключ сохранены, доставка разорвана.
+        if g.detached.contains(&dst_pk) {
+            return;
+        }
         // Общий с локальным релеем лимит: иначе федеративный релей обходил бы
         // `--relay-rate`.
         if !ses
@@ -2033,10 +2045,19 @@ fn push_error(out: &mut Outbox, addr: SocketAddr, ses: &Session, text: &str) {
 
 /// MemberInfo участника `pk` глазами `viewer`: invisible-участник для
 /// остальных офлайн, без endpoint и кандидатов (релей для него работает).
-fn member_info(s: &State, pk: &[u8; 32], m: &Member, viewer: &[u8; 32]) -> MemberInfo {
+/// `detached` — отключённый от доставки (GROUP_ATTACH): для всех, включая
+/// себя, `online = false` — так клиент видит подтверждение отключения.
+fn member_info(
+    s: &State,
+    pk: &[u8; 32],
+    m: &Member,
+    viewer: &[u8; 32],
+    detached: bool,
+) -> MemberInfo {
     let live = s
         .session_of(pk)
-        .filter(|(_, x)| !x.invisible || pk == viewer);
+        .filter(|(_, x)| !x.invisible || pk == viewer)
+        .filter(|_| !detached);
     MemberInfo {
         pubkey: *pk,
         name: m.name.clone(),
@@ -2062,7 +2083,7 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
     let mut members: Vec<MemberInfo> = g
         .members
         .iter()
-        .map(|(pk, m)| member_info(s, pk, m, viewer))
+        .map(|(pk, m)| member_info(s, pk, m, viewer, g.detached.contains(pk)))
         .collect();
     members.sort_by_key(|m| m.ip);
     // Mesh-метаданные — только у тех, кто их опубликовал (MESH_INFO) и кто
@@ -2872,7 +2893,7 @@ fn push_update(
         };
         let delta = match change {
             Change::Member(who) => match g.members.get(who) {
-                Some(m) => GroupDelta::Member(member_info(s, who, m, pk)),
+                Some(m) => GroupDelta::Member(member_info(s, who, m, pk, g.detached.contains(who))),
                 None => continue,
             },
             Change::Removed(who) => GroupDelta::Removed(*who),
@@ -2942,6 +2963,7 @@ fn visible_counts(s: &State) -> Vec<(&Group, u32)> {
             let n = g
                 .members
                 .keys()
+                .filter(|pk| !g.detached.contains(*pk))
                 .filter(|pk| s.session_of(pk).is_some_and(|(_, x)| !x.invisible))
                 .count();
             (g, n as u32)
@@ -2965,7 +2987,8 @@ fn summaries(counts: &[(&Group, u32)], me: &[u8; 32], me_invisible: bool) -> Vec
                 name: g.name.clone(),
                 private: g.private,
                 mine,
-                online: visible + u32::from(mine && me_invisible),
+                // Отключённый от доставки себя онлайн не видит (issue #20).
+                online: visible + u32::from(mine && me_invisible && !g.detached.contains(me)),
                 total: g.members.len() as u32,
                 rev: if mine { g.rev } else { 0 },
                 epoch: if mine { g.epoch } else { 0 },
@@ -3383,6 +3406,8 @@ fn is_mutation(typ: u8) -> bool {
             | ctrl::CREATE_GROUP
             | ctrl::JOIN_GROUP
             | ctrl::LEAVE_GROUP
+            // Отключение/подключение доставки группы (issue #20) — мутация.
+            | ctrl::GROUP_ATTACH
             | ctrl::INVITE
             | ctrl::DECLINE_INVITE
             | ctrl::KICK
@@ -3411,6 +3436,9 @@ fn is_urgent(typ: u8) -> bool {
             | ctrl::BAN
             | ctrl::UNBAN
             | ctrl::LEAVE_GROUP
+            // Отключение от группы: состояние доставки не должно теряться при
+            // падении сразу после команды (issue #20).
+            | ctrl::GROUP_ATTACH
             | ctrl::DELETE_GROUP
             | ctrl::TRANSFER_OWNER
             | ctrl::CREATE_GROUP
@@ -3714,6 +3742,7 @@ fn handle_mutation(
                 invites: HashMap::new(),
                 joins: Bucket::full(),
                 left: HashMap::new(),
+                detached: HashSet::new(),
                 // uuid назначится ниже, если федерация включена.
                 fed_uuid: None,
                 fed_origin: None,
@@ -3819,6 +3848,7 @@ fn handle_mutation(
             // Успешный вход снимает запись о выходе: следующий JOIN участника
             // снова обычный (issue #20).
             g.left.remove(&me);
+            g.detached.remove(&me);
             g.insert_member(
                 me,
                 Member {
@@ -3862,6 +3892,8 @@ fn handle_mutation(
                     // пускает только по приглашению) и сохраняется в server.json.
                     g.left.retain(|_, t| now.saturating_sub(*t) < left_ttl);
                     g.left.insert(me, now);
+                    // Выход снимает отключение: участие закончилось целиком.
+                    g.detached.remove(&me);
                     g.rotate(true);
                     g.bump()
                 })
@@ -3879,6 +3911,32 @@ fn handle_mutation(
                 // подтвердить списком только ему.
                 None => push_group_list(s, src, &s.sessions[&src], out),
             }
+        }
+        ctrl::GROUP_ATTACH => {
+            let (gid, attached) = pl::dec_gid_attach(payload)?;
+            let g = s.groups.get_mut(&gid).context("группа не найдена")?;
+            anyhow::ensure!(g.members.contains_key(&me), "вы не участник группы");
+            // Ключ группы **не** ротируется: участие и доступ сохранены,
+            // рвётся только доставка (этим GROUP_ATTACH отличается от LEAVE).
+            let changed = if attached {
+                g.detached.remove(&me)
+            } else {
+                g.detached.insert(me)
+            };
+            if changed {
+                let base = g.bump();
+                sh.log(format!(
+                    "attach: {uname} → {gid} {}",
+                    if attached { "on" } else { "off" }
+                ));
+                s.fed_dirty.insert(gid);
+                push_update(s, &s.groups[&gid], base, &Change::Member(me), None, out);
+                sh.list_dirty.store(true, Ordering::Relaxed);
+            }
+            // Подтверждение — всегда, и на повтор: GROUP_STATE с нашим
+            // MemberInfo.online. Старый сервер тип не знает и молчит — клиент
+            // остаётся на локальном отключении (деградация, PROTOCOL §13).
+            push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
         }
         ctrl::INVITE => {
             let (gid, target) = pl::dec_gid_target(payload)?;
@@ -3976,6 +4034,9 @@ fn handle_mutation(
                 "лимит банов в группе ({max_bans}): снимите старые (UNBAN) или исключите без бана"
             );
             let kicked = g.remove_member(&target);
+            // Кик/бан снимает и отключение (issue #20): после возврата в
+            // группу участие начинается заново.
+            g.detached.remove(&target);
             // Приглашение снимают и KICK, и BAN: кикнутому не всплывёт окно
             // старого приглашения, а KICK приглашённого (не участника) —
             // отзыв приглашения.
@@ -4146,6 +4207,7 @@ mod tests {
             invites: HashMap::new(),
             joins: Bucket::full(),
             left: HashMap::new(),
+            detached: HashSet::new(),
             fed_uuid: None,
             fed_origin: None,
         }
@@ -7518,6 +7580,109 @@ mod tests {
         a.sync();
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(b.state().gid, gid);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- issue #20в: отключение от группы без выхода ----------
+
+    /// Отключённый не получает релей и не считается онлайн; attach возвращает
+    /// доставку. Ключ при этом не ротируется.
+    #[test]
+    fn отключённый_не_получает_релей_и_не_онлайн() {
+        let (server, dir) = test_server("detach-relay");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let st = b.state();
+        let ip_b = st.my_ip;
+        let ip_a = st.members.iter().find(|m| m.pubkey == a.pk).unwrap().ip;
+
+        // Отключаемся: сервер подтверждает GROUP_STATE, где мы сами офлайн.
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, false));
+        let st_off = b.state();
+        let me = st_off.members.iter().find(|m| m.pubkey == b.pk).unwrap();
+        assert!(!me.online, "отключённый показан онлайн");
+        assert_eq!(st_off.epoch, st.epoch, "отключение ротировало ключ");
+        // Онлайн в списке: только A (total — оба). Сначала барьер: в буфере
+        // мог остаться список времён создания группы.
+        a.sync();
+        a.send(ctrl::LIST_GROUPS, &[]);
+        let list = payloads::dec_group_list(&a.expect(ctrl::GROUP_LIST)).unwrap();
+        let sum = list.iter().find(|s| s.gid == gid).unwrap();
+        assert_eq!(
+            (sum.online, sum.total),
+            (1, 2),
+            "онлайн считает отключённого"
+        );
+
+        // Релей отключённому не идёт.
+        let frame = frame_for(&st, ip_a, ip_b, b"while-off");
+        a.sock.send_to(&frame, server.addr).unwrap();
+        assert!(
+            b.group_frame(Duration::from_millis(700)).is_none(),
+            "отключённому отрелеен кадр"
+        );
+        // Подключаемся обратно — тот же кадр доходит.
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, true));
+        assert!(
+            b.state()
+                .members
+                .iter()
+                .any(|m| m.pubkey == b.pk && m.online)
+        );
+        a.sock.send_to(&frame, server.addr).unwrap();
+        assert_eq!(
+            b.group_frame(Duration::from_secs(3)),
+            Some(frame),
+            "после attach релей не вернулся"
+        );
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отключение не меняет состав и ключ: участие сохраняется, rev растёт
+    /// (видимое изменение), detached снимается при attach.
+    #[test]
+    fn отключение_не_ротирует_ключ_и_не_меняет_состав() {
+        let (server, dir) = test_server("detach-state");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        let (epoch, rev, members) = {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            (g.epoch, g.rev, g.members.len())
+        };
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, false));
+        b.state();
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert_eq!(g.epoch, epoch, "отключение ротировало ключ");
+            assert_eq!(g.members.len(), members, "отключение изменило состав");
+            assert!(g.detached.contains(&b.pk), "detached не записан");
+            assert_eq!(g.rev, rev + 1, "отключение не подняло ревизию");
+        }
+        // Повтор с тем же значением — без роста ревизии, но с подтверждением.
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, false));
+        b.state();
+        assert_eq!(
+            server.shared.state.read().unwrap().groups[&gid].rev,
+            rev + 1,
+            "повтор отключения поднял ревизию"
+        );
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, true));
+        b.state();
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert!(g.detached.is_empty(), "detached не снят");
+            assert_eq!((g.epoch, g.members.len()), (epoch, members));
+        }
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
