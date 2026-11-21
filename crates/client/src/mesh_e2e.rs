@@ -5,7 +5,9 @@
 //! 1. релей через третьего участника при **остановленном** сервере;
 //! 2. DHT переживает мёртвый сервер и смену адреса пира;
 //! 3. переключение пути закреплением (`Cmd::PinPath`/`UnpinPath`);
-//! 7. `Cmd::SwitchServer` не теряет DHT/mesh-контакты.
+//! 7. `Cmd::SwitchServer` не теряет DHT/mesh-контакты;
+//! 8. кэш DHT (`mesh.contacts`) грузится при старте движка, а без сервера
+//!    движок честно не стартует (issue #27).
 //!
 //! Модуль отдельный от `engine_e2e.rs`: T2 (probe/offline) правит тот файл
 //! параллельно, а эти тесты трогают mesh-таймеры (шаг 1 с, поиск маршрута
@@ -21,7 +23,7 @@ use tunnel_protocol as proto;
 
 use crate::engine::{self, Cmd, Engine, Event, TunDev};
 use crate::path::PathKind;
-use crate::store::Config;
+use crate::store::{Config, StoredContact};
 
 #[derive(Default)]
 struct TestTun {
@@ -740,4 +742,94 @@ fn e2e_switch_server_не_рвёт_mesh_и_связь() {
     s2.stop();
     let _ = std::fs::remove_dir_all(&dir1);
     let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// Issue #27: сохранённый кэш `mesh.contacts` попадает в таблицу DHT при
+/// старте движка (раньше `Dht::load` был мёртвым кодом). Контакт из кэша —
+/// «чужой» пир, которого сервер в `MESH_SEED` не отдаёт, поэтому непустая
+/// таблица сразу после старта — это именно загрузка кэша.
+#[test]
+fn e2e_кэш_dht_загружается_при_старте_движка() {
+    let dir = temp_dir("dht-cache");
+    let server = start_server(&dir, 47618);
+    // Контакт, который сервер не знает: identity есть, движка нет.
+    let ghost = proto::Identity::generate();
+    let seen_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        // Старше TTL: кэш обязан получить «полу-TTL», а не быть вычищенным.
+        - 3600;
+    let cfg = Config {
+        name: "alpha".into(),
+        mesh: crate::store::MeshConfig {
+            contacts: vec![StoredContact {
+                ed: proto::hex_of(&ghost.ed_pub()),
+                x: proto::hex_of(&ghost.x_pub()),
+                addr: "203.0.113.77:4000".into(),
+                rtt_ms: 0,
+                seen_s,
+                caps: proto::mesh::caps::MESH,
+            }],
+            ..crate::store::MeshConfig::default()
+        },
+        ..Config::default()
+    };
+    let a = Node::start_cfg(cfg, &server, proto::Identity::generate()).expect("движок стартует");
+    assert!(
+        a.eng.dht_contacts() >= 1,
+        "кэш mesh.contacts не загружен в таблицу DHT при старте"
+    );
+    // Первый шаг DHT (раз в 10 с) кэш не вычищает: контакт живёт полу-TTL.
+    std::thread::sleep(Duration::from_secs(11));
+    assert!(
+        a.eng.dht_contacts() >= 1,
+        "первый expire вычистил загруженный кэш"
+    );
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #27, честное поведение: без сервера движок **не** стартует. Ключи
+/// групп, состав и `my_ip` приходят только в `WELCOME`/`GROUP_STATE`, поэтому
+/// кэш DHT и сохранённые контакты входа в сеть не дают — старт падает по
+/// таймауту с «нет WELCOME». Тест пиннит это, чтобы документация и код не
+/// разошлись снова.
+#[test]
+fn e2e_без_сервера_движок_не_стартует() {
+    let tun = Arc::new(TestTun::default());
+    let cfg = Config {
+        name: "offline".into(),
+        ..Config::default()
+    };
+    let saved: Saved = Arc::new(Mutex::new(cfg.clone()));
+    let s = saved.clone();
+    let save: Arc<dyn Fn(&Config) + Send + Sync> = Arc::new(move |c: &Config| {
+        *s.lock().unwrap() = c.clone();
+    });
+    // Порт, на котором никто не слушает: ни WELCOME, ни TCP-фолбэка.
+    let dead = local(SocketAddr::from(([127, 0, 0, 1], 47699)));
+    let t0 = Instant::now();
+    let err = engine::start_with_tun(
+        Arc::new(Mutex::new(cfg)),
+        dead,
+        proto::Identity::generate().ed_pub(),
+        proto::Identity::generate(),
+        tun,
+        save,
+    )
+    .err()
+    .expect("без сервера движок не должен стартовать");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("нет WELCOME"),
+        "неожиданная ошибка старта без сервера: {msg}"
+    );
+    // Таймаут первого подключения — 10 с; проверяем, что ждали именно его,
+    // а не упали мгновенно по другой причине.
+    assert!(
+        t0.elapsed() >= Duration::from_secs(8),
+        "старт упал слишком быстро ({:?}) — не таймаут WELCOME",
+        t0.elapsed()
+    );
 }
