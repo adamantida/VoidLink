@@ -4232,7 +4232,7 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
     {
         let mut cfg = env.cfg.lock().unwrap();
         // gid у каждого сервера свои: неподтверждённые выходы старого сервера
-        // на новом повторились бы в чужие груpпы (issue #20).
+        // на новом повторились бы в чужие группы (issue #20).
         cfg.pending_leave.clear();
         if cfg.activate_server(addr) {
             (env.save)(&cfg);
