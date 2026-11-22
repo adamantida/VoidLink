@@ -68,6 +68,10 @@ const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(2);
 /// Пауза между LEAVE и повторным JOIN той же identity в ту же группу.
 const REJOIN_COOLDOWN: Duration = Duration::from_secs(3);
 const SAVE_EVERY: Duration = Duration::from_secs(3);
+/// Как часто housekeeping освобождает истёкшие аренды адресов (issue #21):
+/// обход групп небесплатный, а аренда живёт дни. Меньше — только тестам
+/// (`Limits::lease_gc_every`).
+const LEASE_GC_EVERY: Duration = Duration::from_secs(60);
 /// Срочное сохранение (кик, бан, выход, удаление…) — не чаще этого: поток
 /// таких команд не превращается в поток записей на диск.
 const URGENT_SAVE_GAP: Duration = Duration::from_millis(200);
@@ -152,6 +156,10 @@ pub struct Limits {
     /// пул, а identity выселяется из групп (issue #21). `ZERO` — не истекает
     /// (поведение до исправления).
     pub lease_ttl: Duration,
+    /// Как часто housekeeping ищет истёкшие аренды (`lease_ttl`). По
+    /// умолчанию `LEASE_GC_EVERY` (60 с); тесты уменьшают, чтобы дождаться
+    /// освобождения за секунды, а не за минуту.
+    pub lease_gc_every: Duration,
     /// Надгробие удалённой группы живёт столько (issue #20): gid не
     /// переиспользуется, вход по нему даёт «группа не существует».
     pub tomb_ttl: Duration,
@@ -186,6 +194,7 @@ impl Default for Limits {
             max_bans_per_group: 1024,
             max_invites_per_target: 64,
             lease_ttl: Duration::from_secs(30 * 24 * 3600),
+            lease_gc_every: LEASE_GC_EVERY,
             tomb_ttl: Duration::from_secs(7 * 24 * 3600),
             left_ttl: Duration::from_secs(10 * 60),
             friend_req_ttl: Duration::from_secs(7 * 24 * 3600),
@@ -257,7 +266,7 @@ pub struct Server {
 impl Server {
     pub fn start(cfg: Config) -> Result<Server> {
         let store = persist::Store::new(&cfg.data_dir);
-        let loaded = load_state(&store)?;
+        let loaded = load_state(&store, &cfg.limits)?;
         let fresh = loaded.fresh;
         let sock = UdpSocket::bind(cfg.listen).with_context(|| format!("bind {}", cfg.listen))?;
         sock.set_read_timeout(Some(RECV_POLL)).ok();
@@ -863,8 +872,15 @@ impl State {
     /// исчерпан — забирается у identity вне групп; `None` — и таких нет.
     fn ip_for(&mut self, pk: [u8; 32]) -> Option<u32> {
         let groups = &self.groups;
-        self.leases
-            .get_or_alloc(pk, |k| groups.values().any(|g| g.members.contains_key(k)))
+        let ip = self
+            .leases
+            .get_or_alloc(pk, |k| groups.values().any(|g| g.members.contains_key(k)));
+        if ip.is_some() {
+            // Создание/вход в группу — активность: аренда продлевается
+            // (issue #21). Время — unix мс, как в `server.json` → `lease_seen`.
+            self.leases.touch(&pk, unix_ms());
+        }
+        ip
     }
 
     /// Свободный gid: начиная с next_gid по кругу (удалённые gid переиспользуются;
@@ -974,6 +990,7 @@ fn refresh_gauges(sh: &Shared) {
     let m = &sh.metrics;
     metrics::Metrics::set(&m.sessions, s.sessions.len() as u64);
     metrics::Metrics::set(&m.groups, s.groups.len() as u64);
+    metrics::Metrics::set(&m.leases, s.leases.iter().count() as u64);
     metrics::Metrics::set(&m.fed_peers, fed_peers);
     metrics::Metrics::set(&m.fed_groups, fed_groups);
     metrics::Metrics::set(&m.fed_addr_claims, fed_claims);
@@ -1265,7 +1282,12 @@ fn init_fed_addrs(sh: &Shared) {
 /// identity без него — адрес из её группы с меньшим gid (файл сервера v3,
 /// где у участника в каждой группе свой `100.66.<gid>.<host>`; такие
 /// адреса не пересекаются между identity, и первый же годится в общий).
-fn load_leases(p: &persist::Persisted) -> leases::Leases {
+///
+/// Время аренды (`lease_seen`, issue #21): запись файла — как есть; аренде
+/// без записи (файл v4 и раньше) и аренде, просроченной больше TTL (сервер
+/// лежал дольше срока), — `now`. Иначе обновление сервера выселяло бы всех
+/// подряд на первом же проходе `expire_leases`.
+fn load_leases(p: &persist::Persisted, now: u64, ttl_ms: u64) -> leases::Leases {
     let mut l = leases::Leases::default();
     for (k, ip) in &p.user_ips {
         if let Ok(pk) = unhex(k) {
@@ -1283,10 +1305,18 @@ fn load_leases(p: &persist::Persisted) -> leases::Leases {
             }
         }
     }
+    let held: Vec<([u8; 32], u32)> = l.iter().map(|(k, ip)| (*k, ip)).collect();
+    for (pk, _) in held {
+        let seen = match p.lease_seen.get(&hex(&pk)) {
+            Some(t) if ttl_ms > 0 && now.saturating_sub(*t) <= ttl_ms => *t,
+            _ => now,
+        };
+        l.set_seen(&pk, seen);
+    }
     l
 }
 
-fn load_state(store: &persist::Store) -> Result<Loaded> {
+fn load_state(store: &persist::Store, limits: &Limits) -> Result<Loaded> {
     let Some(p) = store.load()? else {
         return Ok(Loaded {
             fresh: true,
@@ -1306,7 +1336,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         .map(|l| parse_link(l))
         .collect::<Result<Vec<_>>>()?;
     let now = unix_ms();
-    let mut leases = load_leases(&p);
+    let mut leases = load_leases(&p, now, duration_ms(limits.lease_ttl));
     let mut groups = HashMap::new();
     for g in p.groups {
         let banned = g
@@ -1456,6 +1486,13 @@ fn snapshot(
         next_gid: s.next_gid,
         rotations: links.iter().map(|l| hex(&l.to_bytes())).collect(),
         user_ips: s.leases.iter().map(|(k, ip)| (hex(k), ip)).collect(),
+        // Время аренды (issue #21): без него после рестарта отсчёт начинался
+        // бы заново и освобождение откладывалось бы на целый TTL.
+        lease_seen: s
+            .leases
+            .iter()
+            .filter_map(|(k, _)| s.leases.seen_of(k).map(|t| (hex(k), t)))
+            .collect(),
         federation,
         groups: s
             .groups
@@ -1588,6 +1625,7 @@ fn housekeeping(sh: Arc<Shared>) {
     let mut last_save = Instant::now();
     let mut last_tick = Instant::now();
     let mut last_stats = Instant::now();
+    let mut last_lease_gc = Instant::now();
     let mut last_relayed = 0u64;
     while !sh.stop.load(Ordering::Relaxed) {
         sh.last_tick.store(sh.now_ms(), Ordering::Relaxed);
@@ -1607,6 +1645,13 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        // Аренды адресов (issue #21) — не чаще `lease_gc_every` (по
+        // умолчанию `LEASE_GC_EVERY`): обход групп небесплатный, а аренда
+        // живёт дни.
+        if last_lease_gc.elapsed() >= sh.limits.lease_gc_every {
+            last_lease_gc = Instant::now();
+            expire_leases(&sh);
+        }
         // Федерация: переотправка SRV_HELLO, таймауты попыток и сессий.
         federation::tick(&sh);
         refresh_gauges(&sh);
@@ -1721,6 +1766,105 @@ fn expire_invites(sh: &Shared) {
     }
     sh.dirty.store(true, Ordering::Relaxed);
     sh.flush(out);
+}
+
+/// Освобождение аренд адресов (issue #21): identity без активности дольше
+/// `Limits::lease_ttl` выселяется из своих групп (как по `LEAVE_GROUP`), а её
+/// адрес возвращается в пул. Иначе удалённый профиль (он пересоздаётся с
+/// новым ключом) оставлял бы за собой адрес и «призрачного» участника групп
+/// навсегда.
+///
+/// Порядок обязателен: сначала выселение из групп, потом `revoke` —
+/// `Group::insert_member` пишет `by_ip` безусловно, и два владельца одного
+/// адреса недопустимы.
+fn expire_leases(sh: &Shared) {
+    let ttl_ms = duration_ms(sh.limits.lease_ttl);
+    if ttl_ms == 0 {
+        // `--lease-ttl-days 0`: освобождение выключено.
+        return;
+    }
+    let now = unix_ms();
+    // Под read-lock: кто онлайн (их аренды продлеваются) и что истекло.
+    // Ничего не истекло — write-lock не нужен.
+    let (online, expired) = {
+        let s = sh.state.read().unwrap();
+        let online: Vec<[u8; 32]> = s.by_pub.keys().copied().collect();
+        (online, s.leases.expired(now, ttl_ms))
+    };
+    if expired.is_empty() {
+        return;
+    }
+    let mut out = Outbox::new();
+    let mut evicted = 0u64;
+    {
+        let mut s = sh.state.write().unwrap();
+        // Живая сессия продлевает аренду: долгоживущий клиент, который
+        // давно не слал HELLO3, не должен истечь в момент отключения.
+        for pk in &online {
+            s.leases.touch(pk, now);
+        }
+        for (pk, ip) in expired {
+            // Между проходами identity могла вернуться — перепроверить.
+            if s.online(&pk) {
+                s.leases.touch(&pk, now);
+                continue;
+            }
+            // Владелец группы не выселяется: группа осталась бы без
+            // управляющего (удалить, кикнуть, пригласить стало бы некому).
+            // Аренда при этом продлевается, чтобы предупреждение не
+            // повторялось на каждом проходе.
+            if s.owned_by(&pk) > 0 {
+                s.leases.touch(&pk, now);
+                sh.log(format!(
+                    "lease kept: {} владеет группами — не выселяется",
+                    short(&pk)
+                ));
+                continue;
+            }
+            evict_from_groups(&mut s, &pk, &mut out);
+            s.leases.revoke(&pk);
+            evicted += 1;
+            sh.log(format!(
+                "lease expired: {} ({}) — адрес возвращён в пул",
+                short(&pk),
+                ip_str(ip)
+            ));
+        }
+    }
+    if evicted > 0 {
+        metrics::Metrics::inc(&sh.metrics.leases_expired, evicted);
+        sh.dirty.store(true, Ordering::Relaxed);
+        sh.list_dirty.store(true, Ordering::Relaxed);
+    }
+    sh.flush(out);
+}
+
+/// Выселить identity из её групп так же, как `LEAVE_GROUP`: убрать участника
+/// и приглашение, запомнить выход (повторный вход — не раньше
+/// `REJOIN_COOLDOWN`), сменить ключ с отзывом прошлого, поднять ревизию и
+/// разослать дельту `Removed` остальным участникам. Реплики федерации не
+/// трогаются: их источник правды — сервер-владелец группы.
+fn evict_from_groups(s: &mut State, pk: &[u8; 32], out: &mut Outbox) {
+    for gid in s.groups_of(pk) {
+        let base = {
+            let Some(g) = s.groups.get_mut(&gid) else {
+                continue;
+            };
+            if g.fed_origin.is_some() {
+                continue;
+            }
+            g.remove_member(pk);
+            // Устаревшее приглашение не должно всплыть после выселения.
+            g.invites.remove(pk);
+            // Размер ограничен лимитом входов: выселение — тоже выход.
+            g.left.retain(|_, t| t.elapsed() < REJOIN_COOLDOWN);
+            g.left.insert(*pk, Instant::now());
+            g.rotate(true);
+            g.bump()
+        };
+        s.fed_dirty.insert(gid);
+        push_update(s, &s.groups[&gid], base, &Change::Removed(*pk), None, out);
+    }
 }
 
 // ---------- приём ----------
@@ -3190,6 +3334,10 @@ fn install_session(
         },
     );
     s.by_pub.insert(ed, src);
+    // Успешный HELLO3 — активность identity: аренда адреса продлевается
+    // (issue #21). Без этого аренда долгоживущей сессии истекала бы, хотя
+    // клиент на связи.
+    s.leases.touch(&ed, unix_ms());
     let inv = if h.invisible() { ", invisible" } else { "" };
     sh.log(format!("online: {name} ({}) @ {src}{inv}", short(&ed)));
     out.push((src, welcome));
@@ -4902,7 +5050,7 @@ mod tests {
             let c = temp_dir("ban-crash-copy");
             std::fs::create_dir_all(&c).unwrap();
             std::fs::copy(dir.join("server.json"), c.join("server.json")).unwrap();
-            let l = load_state(&persist::Store::new(&c)).unwrap();
+            let l = load_state(&persist::Store::new(&c), &Limits::default()).unwrap();
             let _ = std::fs::remove_dir_all(&c);
             l
         };
@@ -5807,7 +5955,7 @@ mod tests {
         std::fs::write(dir.join("server.json"), json).unwrap();
         let store = persist::Store::new(&dir);
         let before = unix_ms();
-        let l = load_state(&store).unwrap();
+        let l = load_state(&store, &Limits::default()).unwrap();
         assert!(l.links.is_empty());
         assert_eq!(l.identity.ed_pub(), id.ed_pub());
         let g = &l.groups[&5];
@@ -5825,7 +5973,7 @@ mod tests {
         let server = start_in(&dir, Limits::default());
         assert_eq!(server.pubkey, id.ed_pub());
         server.stop();
-        let l = load_state(&store).unwrap();
+        let l = load_state(&store, &Limits::default()).unwrap();
         assert_eq!(l.groups[&5].members[&member].name, "…");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6191,7 +6339,7 @@ mod tests {
             .save(&snapshot(&id, &[], &s, persist::PFederation::default()))
             .unwrap();
 
-        let l = load_state(&store).unwrap();
+        let l = load_state(&store, &Limits::default()).unwrap();
         let g = &l.groups[&5];
         assert_eq!(g.invites.keys().collect::<Vec<_>>(), vec![&invited]);
         assert_eq!(
@@ -6457,7 +6605,7 @@ mod tests {
 
         // И переживает перезапуск сервера (server.json).
         server.stop();
-        let l = load_state(&persist::Store::new(&dir)).unwrap();
+        let l = load_state(&persist::Store::new(&dir), &Limits::default()).unwrap();
         assert_eq!(l.leases.get(&b.pk), Some(b1.my_ip));
         assert_eq!(l.leases.get(&a.pk), Some(one.my_ip));
         assert_eq!(l.groups[&two.gid].members[&b.pk].ip, b1.my_ip);
@@ -6494,7 +6642,7 @@ mod tests {
         );
         std::fs::write(dir.join("server.json"), json).unwrap();
         let store = persist::Store::new(&dir);
-        let l = load_state(&store).unwrap();
+        let l = load_state(&store, &Limits::default()).unwrap();
         // X — адрес из группы с меньшим gid, во всех группах.
         assert_eq!(l.leases.get(&x), Some(ip(5, 2)));
         assert_eq!(l.leases.get(&y), Some(ip(7, 2)));
@@ -6509,6 +6657,244 @@ mod tests {
         let p = store.load().unwrap().unwrap();
         assert_eq!(p.user_ips.get(&hex(&x)), Some(&ip(5, 2)));
         assert_eq!(p.user_ips.get(&hex(&y)), Some(&ip(7, 2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- аренда адреса с TTL (issue #21) ----------
+
+    /// Снять сессию «исчезнувшего» клиента сразу, а не через `session_timeout`.
+    fn go_offline(sh: &Shared, r: &Raw) {
+        let addr = r.sock.local_addr().unwrap();
+        sh.state.write().unwrap().remove_session(&addr);
+    }
+
+    /// «Состарить» аренду: последняя активность — `ago_ms` назад (ждать
+    /// настоящий TTL в тесте нечего).
+    fn age_lease(sh: &Shared, pk: &[u8; 32], ago_ms: u64) {
+        let mut s = sh.state.write().unwrap();
+        s.leases.set_seen(pk, unix_ms().saturating_sub(ago_ms));
+    }
+
+    /// Лимиты с арендой в 1 с: истечение проверяется без суток ожидания.
+    fn lease_limits() -> Limits {
+        Limits {
+            lease_ttl: Duration::from_secs(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn истёкшая_аренда_освобождается_и_выселяет_из_групп() {
+        let (server, dir) = test_server_with("lease-expire", lease_limits());
+        let a = Raw::connect(server.addr, "alpha");
+        let g = a.create("club", false);
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(g.gid));
+        let b_ip = state_of(&b, g.gid).my_ip;
+        assert_ne!(b_ip, g.my_ip);
+        a.sync(); // дельты входа B дочитаны
+        let epoch = server.shared.state.read().unwrap().groups[&g.gid].epoch;
+
+        // B исчез (профиль удалён): сессии нет, активность — в прошлом.
+        go_offline(&server.shared, &b);
+        age_lease(&server.shared, &b.pk, 5_000);
+        expire_leases(&server.shared);
+
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(s.leases.get(&b.pk).is_none(), "аренда исчезнувшей снята");
+            assert!(s.leases.owner_of(b_ip).is_none(), "адрес вернулся в пул");
+            let grp = &s.groups[&g.gid];
+            assert!(!grp.members.contains_key(&b.pk), "выселен из группы");
+            assert!(!grp.by_ip.contains_key(&b_ip), "индекс релея чист");
+            assert!(
+                grp.left.contains_key(&b.pk),
+                "выход запомнен (REJOIN_COOLDOWN)"
+            );
+            assert_eq!(grp.owner, a.pk, "владение не тронуто");
+            assert!(grp.epoch > epoch, "ключ группы сменён");
+            assert!(grp.revoke_prev, "прошлый ключ отозван, как по LEAVE");
+        }
+        // Остальным — дельта kind 2, как по LEAVE_GROUP.
+        let u = a.update();
+        assert_eq!(u.delta, GroupDelta::Removed(b.pk));
+        assert!(u.revoke_prev && u.epoch > epoch);
+
+        // server.json уменьшился: аренды и её времени там больше нет.
+        server.stop();
+        let p = persist::Store::new(&dir).load().unwrap().unwrap();
+        assert!(!p.user_ips.contains_key(&hex(&b.pk)), "адрес не пишется");
+        assert!(!p.lease_seen.contains_key(&hex(&b.pk)), "время не пишется");
+        assert_eq!(p.user_ips.get(&hex(&a.pk)), Some(&g.my_ip));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn адрес_истёкшей_identity_выдаётся_новой() {
+        let dir = temp_dir("lease-reuse");
+        let limits = lease_limits();
+        let server = start_in(&dir, limits.clone());
+        let a = Raw::connect(server.addr, "alpha");
+        let g = a.create("club", false);
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(g.gid));
+        let gone = state_of(&b, g.gid).my_ip;
+
+        go_offline(&server.shared, &b);
+        age_lease(&server.shared, &b.pk, 5_000);
+        expire_leases(&server.shared);
+        assert!(
+            server
+                .shared
+                .state
+                .read()
+                .unwrap()
+                .leases
+                .get(&b.pk)
+                .is_none()
+        );
+
+        // Перезапуск: указатель выдачи (не персистится) снова с начала пула,
+        // поэтому освобождённый адрес достаётся новой identity — в файле его
+        // уже нет, а адрес alpha занят.
+        server.stop();
+        let store = persist::Store::new(&dir);
+        let p = store.load().unwrap().unwrap();
+        assert!(!p.user_ips.contains_key(&hex(&b.pk)));
+        let server = start_in(&dir, limits);
+        let c = Raw::connect(server.addr, "charlie");
+        c.send(ctrl::JOIN_GROUP, &payloads::enc_gid(g.gid));
+        let c_state = state_of(&c, g.gid);
+        assert_eq!(
+            c_state.my_ip, gone,
+            "адрес исчезнувшей identity выдан новой"
+        );
+        assert_eq!(
+            server.shared.state.read().unwrap().leases.owner_of(gone),
+            Some(c.pk)
+        );
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn активная_identity_не_теряет_адрес() {
+        let (server, dir) = test_server_with("lease-alive", lease_limits());
+        let a = Raw::connect(server.addr, "alpha");
+        let g = a.create("club", false);
+        // Аренда «старая», но сессия жива: продлевается, а не освобождается.
+        age_lease(&server.shared, &a.pk, 5_000);
+        expire_leases(&server.shared);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert_eq!(s.leases.get(&a.pk), Some(g.my_ip), "адрес не потерян");
+            assert!(
+                s.groups[&g.gid].members.contains_key(&a.pk),
+                "из группы не выселен"
+            );
+            assert_eq!(s.groups[&g.gid].epoch, g.epoch, "ключ не менялся");
+            let seen = s.leases.seen_of(&a.pk).unwrap();
+            assert!(
+                seen >= unix_ms().saturating_sub(2_000),
+                "живая сессия продлила аренду"
+            );
+        }
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn владелец_группы_не_выселяется() {
+        let (server, dir) = test_server_with("lease-owner", lease_limits());
+        let b = Raw::connect(server.addr, "bravo");
+        let g = b.create("club", false);
+        go_offline(&server.shared, &b);
+        age_lease(&server.shared, &b.pk, 5_000);
+        expire_leases(&server.shared);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert_eq!(
+                s.leases.get(&b.pk),
+                Some(g.my_ip),
+                "владелец адрес не теряет"
+            );
+            assert!(
+                s.groups[&g.gid].members.contains_key(&b.pk),
+                "группа не остаётся без управляющего"
+            );
+            assert_eq!(s.groups[&g.gid].owner, b.pk);
+            let seen = s.leases.seen_of(&b.pk).unwrap();
+            assert!(
+                seen >= unix_ms().saturating_sub(2_000),
+                "аренда продлена — предупреждение не повторяется каждый проход"
+            );
+        }
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lease_seen_переживает_рестарт_и_старый_файл_получает_отсрочку() {
+        let dir = temp_dir("lease-seen");
+        let limits = Limits::default();
+        let server = start_in(&dir, limits.clone());
+        let a = Raw::connect(server.addr, "alpha");
+        let ip = a.create("club", false).my_ip;
+        a.sync();
+        server.stop();
+        let store = persist::Store::new(&dir);
+        let p = store.load().unwrap().unwrap();
+        let key = hex(&a.pk);
+        let saved = *p
+            .lease_seen
+            .get(&key)
+            .expect("время аренды пишется в server.json");
+        assert!(saved > 0, "время — unix мс, а не 0");
+        // Рестарт: тот же адрес и то же время аренды.
+        let l = load_state(&store, &limits).unwrap();
+        assert_eq!(l.leases.get(&a.pk), Some(ip));
+        assert_eq!(l.leases.seen_of(&a.pk), Some(saved));
+        assert!(
+            l.leases
+                .expired(unix_ms(), duration_ms(limits.lease_ttl))
+                .is_empty()
+        );
+
+        // Файл без `lease_seen` (сервер v4 и раньше): отсчёт от загрузки —
+        // обновление сервера никого не выселяет сразу.
+        let raw = std::fs::read(dir.join("server.json")).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        v.as_object_mut().unwrap().remove("lease_seen");
+        std::fs::write(dir.join("server.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        let before = unix_ms();
+        let l = load_state(&store, &limits).unwrap();
+        let seen = l.leases.seen_of(&a.pk).expect("аренда на месте");
+        assert!(seen >= before, "старый файл: отсчёт от загрузки");
+        assert!(
+            l.leases
+                .expired(unix_ms(), duration_ms(limits.lease_ttl))
+                .is_empty(),
+            "на старте никого не выселяем"
+        );
+
+        // Сервер лежал дольше TTL: клэмп — тоже отсчёт от загрузки.
+        let old = unix_ms().saturating_sub(100 * 24 * 3600 * 1000);
+        let mut m = serde_json::Map::new();
+        m.insert(key.clone(), serde_json::json!(old));
+        v["lease_seen"] = serde_json::Value::Object(m);
+        std::fs::write(dir.join("server.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        let before = unix_ms();
+        let l = load_state(&store, &limits).unwrap();
+        let seen = l.leases.seen_of(&a.pk).expect("аренда на месте");
+        assert!(
+            seen >= before,
+            "просроченная запись клэмпится к now, а не выселяет всех ({seen} < {before})"
+        );
+        assert!(
+            l.leases
+                .expired(unix_ms(), duration_ms(limits.lease_ttl))
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

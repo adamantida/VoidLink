@@ -58,6 +58,8 @@ pub struct Metrics {
     pub groups: AtomicU64,
     pub members: AtomicU64,
     pub invites_pending: AtomicU64,
+    /// Аренды адресов оверлея, выданные identity (issue #21).
+    pub leases: AtomicU64,
     // счётчики
     pub relayed_frames: AtomicU64,
     pub dropped_frames: AtomicU64,
@@ -65,6 +67,9 @@ pub struct Metrics {
     pub challenge_total: AtomicU64,
     pub ctrl_frames: AtomicU64,
     pub bytes_relayed: AtomicU64,
+    /// Освобождённые аренды адресов: identity без активности дольше
+    /// `lease_ttl` (issue #21).
+    pub leases_expired: AtomicU64,
     /// Пробы доступности (`PROBE_REQ`, этап 9).
     pub probes_total: AtomicU64,
     /// Закреплённые (TOFU) серверы-пиры федерации (этап 9, T4a).
@@ -126,7 +131,7 @@ impl Metrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 16] {
+    fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 18] {
         use Kind::*;
         [
             (
@@ -147,6 +152,12 @@ impl Metrics {
                 "Неиспользованные инвайты",
                 Gauge,
                 &self.invites_pending,
+            ),
+            (
+                "voidlink_leases",
+                "Выданные адреса оверлея (аренды)",
+                Gauge,
+                &self.leases,
             ),
             (
                 "voidlink_relayed_frames_total",
@@ -189,6 +200,12 @@ impl Metrics {
                 "Пробы доступности (PROBE_REQ)",
                 Counter,
                 &self.probes_total,
+            ),
+            (
+                "voidlink_leases_expired_total",
+                "Освобождённые аренды адресов (issue #21)",
+                Counter,
+                &self.leases_expired,
             ),
             (
                 "voidlink_fed_peers",
@@ -472,14 +489,17 @@ mod tests {
             let (k, v) = line.split_once(' ').unwrap();
             values.insert(k.to_string(), v.parse::<u64>().unwrap());
         }
-        assert_eq!(types, 16);
-        assert_eq!(values.len(), 16);
+        assert_eq!(types, 18);
+        assert_eq!(values.len(), 18);
         assert_eq!(values["voidlink_sessions"], 3);
         assert_eq!(values["voidlink_relayed_frames_total"], 2);
         assert_eq!(values["voidlink_bytes_relayed_total"], 150);
         assert_eq!(values["voidlink_hello_total"], 7);
         assert_eq!(values["voidlink_dropped_frames_total"], 0);
         assert_eq!(values["voidlink_probes_total"], 0);
+        // Аренды адресов (issue #21): датчик и счётчик освобождений.
+        assert_eq!(values["voidlink_leases"], 0);
+        assert_eq!(values["voidlink_leases_expired_total"], 0);
         s.stop();
     }
 

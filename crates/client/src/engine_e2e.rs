@@ -3255,3 +3255,119 @@ fn e2e_встречные_подсказки_федерации_не_ломаю�
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+// ---------- #21: аренда адреса с TTL ----------
+
+#[test]
+fn e2e_новая_identity_занимает_адрес_исчезнувшей() {
+    // Удалённый профиль пересоздаётся с новым ключом — прежняя identity не
+    // вернётся. Её аренда адреса без активности истекает (`--lease-ttl-days`),
+    // identity выселяется из групп как по LEAVE, адрес возвращается в пул.
+    let dir = temp_dir("lease");
+    let limits = tunnel_server::Limits {
+        lease_ttl: Duration::from_secs(3),
+        // По умолчанию аренды проверяются раз в минуту — в тесте на каждом
+        // проходе housekeeping (раз в 2 с).
+        lease_gc_every: Duration::from_millis(10),
+        // Сессия брошенного клиента — офлайн по таймауту, а не через 30 с.
+        session_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    // Метрики — авторитетный счётчик аренд: `server.json` пишется раз в 3 с,
+    // и по нему не отличить «аренды не было» от «аренда освобождена».
+    let server = tunnel_server::Server::start(tunnel_server::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        data_dir: dir.clone(),
+        workers: 2,
+        quiet: true,
+        limits: limits.clone(),
+        metrics: Some("127.0.0.1:0".parse().unwrap()),
+        ..Default::default()
+    })
+    .expect("сервер стартует");
+    let metrics = server.metrics_addr.expect("метрики включены");
+    let mut a = Node::start("alpha", &server);
+    a.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let gid = a.create("club", false);
+    let a_ip = a.my_ip(gid);
+    let a_pub = proto::hex_of(&a.eng.my_pub);
+    let mut b = Node::start("bravo", &server);
+    b.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.join(gid);
+    let b_ip = b.my_ip(gid);
+    let b_pub = proto::hex_of(&b.eng.my_pub);
+    assert_ne!(a_ip, b_ip, "у каждой identity свой адрес");
+    wait_until("обе аренды выданы", T, || {
+        metric_value(&metrics_text(metrics), "voidlink_leases") == 2
+    });
+    drop(b); // профиль удалён: identity больше не появится
+
+    // Освобождение: сессия — офлайн по таймауту, аренда — по TTL, проверка —
+    // на проходе housekeeping. Владелец группы аренду не теряет.
+    wait_until(
+        "аренда исчезнувшей освобождена",
+        Duration::from_secs(20),
+        || metric_value(&metrics_text(metrics), "voidlink_leases") == 1,
+    );
+    assert!(
+        metric_value(&metrics_text(metrics), "voidlink_leases_expired_total") >= 1,
+        "счётчик освобождённых аренд"
+    );
+
+    // `server.json`: аренды и «призрачного» участника больше нет, владелец
+    // на месте (запись — в пределах SAVE_EVERY).
+    let path = dir.join("server.json");
+    let state = |p: &std::path::Path| -> serde_json::Value {
+        std::fs::read(p)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    wait_until(
+        "server.json без исчезнувшей",
+        Duration::from_secs(20),
+        || {
+            let j = state(&path);
+            j["user_ips"].get(&b_pub).is_none()
+                && j["lease_seen"].get(&b_pub).is_none()
+                && j["user_ips"].get(&a_pub).is_some()
+        },
+    );
+    let j = state(&path);
+    let members: Vec<String> = j["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|g| g["id"].as_u64() == Some(u64::from(gid)))
+        .flat_map(|g| g["members"].as_array().cloned().unwrap_or_default())
+        .filter_map(|m| m[0].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !members.contains(&b_pub),
+        "«призрачный» участник выселен: {members:?}"
+    );
+    assert!(members.contains(&a_pub), "владелец группы на месте");
+    assert_eq!(j["user_ips"][&a_pub].as_u64(), Some(u64::from(a_ip)));
+
+    // Перезапуск: указатель выдачи не персистится и начинается с начала
+    // пула, поэтому освобождённый адрес достаётся новой identity.
+    drop(a);
+    server.stop();
+    let server = start_server_with(&dir, 0, limits);
+    let mut c = Node::start("charlie", &server);
+    c.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    c.join(gid);
+    assert_eq!(
+        c.my_ip(gid),
+        b_ip,
+        "адрес исчезнувшей identity достался новой"
+    );
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

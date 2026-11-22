@@ -7,6 +7,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+/// Верхняя граница `--lease-ttl-days` (10 лет): защита от опечатки, а не
+/// содержательный предел — `0` законно выключает освобождение.
+const LEASE_TTL_DAYS_MAX: u64 = 3650;
+
 const USAGE: &str = "\
 Использование:
   tunnel-server [адрес=0.0.0.0:5555] [флаги]
@@ -29,6 +33,8 @@ const USAGE: &str = "\
   --session-timeout <сек>   сессия без пакетов столько — офлайн (30)
   --max-owned-groups N      групп во владении одной identity (16)
   --invite-ttl-days N       срок жизни приглашения, дней (7)
+  --lease-ttl-days N        аренда адреса оверлея без активности, дней (30);
+                            0 — не освобождать адреса никогда
   --max-invites-per-group N приглашений на группу (256)
   --max-bans-per-group N    банов на группу (1024)
   --max-invites-per-target N живых приглашений одной identity по всем группам (64)
@@ -165,6 +171,12 @@ fn parse_args(args: &[String]) -> Result<tunnel_server::Config> {
                 let days: u64 = value(args, i, a)?;
                 l.invite_ttl = Duration::from_secs(days.saturating_mul(24 * 3600));
             }
+            // Аренда адреса оверлея (issue #21): без активности столько дней
+            // адрес возвращается в пул. 0 — освобождение выключено.
+            "--lease-ttl-days" => {
+                let days: u64 = value(args, i, a)?;
+                l.lease_ttl = Duration::from_secs(days.saturating_mul(24 * 3600));
+            }
             "-q" | "--quiet" => {
                 cfg.quiet = true;
                 i += 1;
@@ -205,6 +217,12 @@ fn parse_args(args: &[String]) -> Result<tunnel_server::Config> {
         "--session-timeout: нужно ≥ 1 с"
     );
     anyhow::ensure!(!l.invite_ttl.is_zero(), "--invite-ttl-days: нужно ≥ 1");
+    // 0 — законное «не освобождать никогда»; верхняя граница — от опечатки
+    // (лишний ноль превратил бы срок в тысячи лет, то есть в то же 0).
+    anyhow::ensure!(
+        l.lease_ttl.as_secs() <= LEASE_TTL_DAYS_MAX * 24 * 3600,
+        "--lease-ttl-days: не больше {LEASE_TTL_DAYS_MAX} дней (0 — не освобождать)"
+    );
     cfg.listen = listen.parse::<SocketAddr>().context("bad listen addr")?;
     Ok(cfg)
 }
@@ -258,5 +276,34 @@ mod tests {
         assert!(parse(&["--fed-pool", "0.0.0.0"]).is_err());
         assert!(parse(&["--federate=да"]).is_err(), "неизвестный флаг");
         assert!(USAGE.contains("--federate") && USAGE.contains("--peer"));
+    }
+
+    #[test]
+    fn lease_ttl_дней_разбирается() {
+        let days = |n: u64| Duration::from_secs(n * 24 * 3600);
+        // По умолчанию — 30 дней, как в `Limits::default`.
+        assert_eq!(parse(&[]).unwrap().limits.lease_ttl, days(30));
+        assert_eq!(
+            parse(&["--lease-ttl-days", "7"]).unwrap().limits.lease_ttl,
+            days(7)
+        );
+        // 0 — освобождение выключено (аренда не истекает никогда).
+        assert_eq!(
+            parse(&["--lease-ttl-days", "0"]).unwrap().limits.lease_ttl,
+            Duration::ZERO
+        );
+        // Мусор, отрицательное и значение без числа отвергаются.
+        assert!(parse(&["--lease-ttl-days", "abc"]).is_err());
+        assert!(parse(&["--lease-ttl-days", "-1"]).is_err());
+        assert!(parse(&["--lease-ttl-days"]).is_err(), "нужно значение");
+        // Верхняя граница — от опечатки (лишний ноль), но не от 0.
+        assert!(parse(&["--lease-ttl-days", "3650"]).is_ok());
+        assert!(parse(&["--lease-ttl-days", "3651"]).is_err());
+        assert!(parse(&["--lease-ttl-days", "999999999"]).is_err());
+        assert!(USAGE.contains("--lease-ttl-days"));
+        // Флаг не мешает остальным и не задевает срок приглашений.
+        let c = parse(&["--lease-ttl-days", "3", "--invite-ttl-days", "5"]).unwrap();
+        assert_eq!(c.limits.lease_ttl, days(3));
+        assert_eq!(c.limits.invite_ttl, days(5));
     }
 }
