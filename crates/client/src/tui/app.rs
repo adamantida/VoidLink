@@ -3847,13 +3847,45 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    fn app() -> App {
+    pub(super) fn app() -> App {
         let cfg = Config {
             name: "alpha".into(),
             status: "тест".into(),
             ..Config::default()
         };
         App::new([7; 32], "TUN-TEST-CODE", &cfg)
+    }
+
+    /// Участник `pk` с именем `name` в группе 1.
+    pub(super) fn peer(pk: [u8; 32], name: &str) -> PeerView {
+        PeerView {
+            pubkey: pk,
+            name: name.into(),
+            ip: 0x6442_0000 + pk[0] as u32,
+            online: true,
+            direct: false,
+            rtt_ms: Some(10),
+            status: String::new(),
+            path: None,
+        }
+    }
+
+    /// App с группой 1 и участниками `peers`.
+    pub(super) fn with_peers(peers: Vec<PeerView>) -> App {
+        let mut a = online();
+        a.groups = vec![GroupView {
+            gid: 1,
+            name: "gamers".into(),
+            private: false,
+            mine: true,
+            online: peers.len() as u32,
+            total: peers.len() as u32 + 1,
+            my_ip: Some(0x6442_0007),
+            owner_is_me: true,
+            peers,
+        }];
+        a.sel_group = Some(1);
+        a
     }
 
     #[test]
@@ -3975,7 +4007,7 @@ mod tests {
     }
 
     /// Онлайн-приложение с выключенной защитой от случайного нажатия.
-    fn online() -> App {
+    pub(super) fn online() -> App {
         let mut a = app();
         a.connected = true;
         a
@@ -4941,15 +4973,17 @@ mod tests {
     // ---------- проба серверов (этап 9, §3.7) ----------
 
     /// Движок-заглушка: события кладём руками, команды TUI — в `sent`.
-    struct FakeEngine {
+    pub(super) struct FakeEngine {
         snap: Mutex<Snapshot>,
         events: Mutex<VecDeque<Event>>,
         sent: Mutex<Vec<Cmd>>,
         me: crate::api::Me,
+        /// Движка нет (офлайн-TUI): сетевые команды отвергаются.
+        offline: bool,
     }
 
     impl FakeEngine {
-        fn new(snap: Snapshot) -> Self {
+        pub(super) fn new(snap: Snapshot) -> Self {
             FakeEngine {
                 snap: Mutex::new(snap),
                 events: Mutex::new(VecDeque::new()),
@@ -4958,6 +4992,16 @@ mod tests {
                     my_pub: [7; 32],
                     my_code: "TUN-TEST".into(),
                 },
+                offline: false,
+            }
+        }
+
+        /// Офлайн-фронтенд без движка: `send` отвечает ошибкой, как
+        /// `offline::OfflineEngine` для сетевых команд (issue #24).
+        pub(super) fn offline() -> Self {
+            FakeEngine {
+                offline: true,
+                ..FakeEngine::new(Snapshot::default())
             }
         }
 
@@ -4965,7 +5009,7 @@ mod tests {
             self.events.lock().unwrap().push_back(ev);
         }
 
-        fn sent(&self) -> Vec<Cmd> {
+        pub(super) fn sent(&self) -> Vec<Cmd> {
             self.sent.lock().unwrap().clone()
         }
     }
@@ -4978,6 +5022,9 @@ mod tests {
             self.events.lock().unwrap().drain(..).collect()
         }
         fn send(&self, cmd: Cmd) -> anyhow::Result<()> {
+            if self.offline {
+                anyhow::bail!("нужен запущенный движок: команда не отправлена");
+            }
             self.sent.lock().unwrap().push(cmd);
             Ok(())
         }
@@ -5309,5 +5356,158 @@ mod tests {
                 .any(|l| l.text.contains("путь до bravo потерян")),
             "нет строки лога о потере пути"
         );
+    }
+}
+
+#[cfg(test)]
+mod friends_tests {
+    //! Друзья в TUI (issue #24): добавление из списка участников и карточки,
+    //! отсечение себя и уже добавленных, ник вместо кода, офлайн-отказ.
+
+    use super::tests::{FakeEngine, app, online, peer, with_peers};
+    use super::*;
+
+    #[test]
+    fn добавление_из_списка_участников_шлёт_заявку() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.open_pick(PickMode::AddFriend);
+        let Some(Popup::PeerPick(p)) = a.stack.last() else {
+            panic!("окно выбора участника открыто")
+        };
+        assert_eq!(p.items.len(), 1, "только кандидат, без «ввести код»");
+        assert_eq!(p.items[0].pubkey, [2; 32]);
+        a.handle_popup_key(key(KeyCode::Enter), &eng);
+        assert!(
+            matches!(eng.sent().as_slice(), [Cmd::AddFriend { pubkey, alias }]
+                if *pubkey == [2; 32] && alias.is_empty()),
+            "ждали AddFriend, пришло {:?}",
+            eng.sent()
+        );
+        // В своём списке — «ждёт ответа», а не «друг».
+        assert_eq!(a.friends.len(), 1);
+        assert_eq!(a.friends[0].state, store::FriendState::PendingOut);
+        assert!(a.toasts.iter().any(|t| t.text.contains("заявка")));
+    }
+
+    #[test]
+    fn карточка_участника_добавляет_в_друзья() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = with_peers(vec![peer([3; 32], "charlie")]);
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [3; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(
+            matches!(eng.sent().as_slice(), [Cmd::AddFriend { pubkey, .. }] if *pubkey == [3; 32]),
+            "ждали AddFriend, пришло {:?}",
+            eng.sent()
+        );
+        assert!(a.friends.iter().any(|f| f.pubkey == [3; 32]));
+    }
+
+    #[test]
+    fn себя_и_уже_друга_не_добавляем() {
+        let eng = FakeEngine::new(Snapshot::default());
+        // Себя: my_pub приложения — [7; 32].
+        let mut a = with_peers(vec![peer([7; 32], "я")]);
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [7; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(eng.sent().is_empty(), "себе заявку не шлём");
+        assert!(a.friends.is_empty());
+        assert!(a.toasts.iter().any(|t| t.text.contains("это вы")));
+
+        // Уже друг.
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bravo".into(),
+            state: store::FriendState::Accepted,
+            pubkey: [2; 32],
+            online: true,
+            shared_groups: 1,
+        }];
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(eng.sent().is_empty(), "другу заявку не шлём");
+        assert!(a.toasts.iter().any(|t| t.text.contains("уже в друзьях")));
+
+        // Заявка уже отправлена — второй раз не шлём.
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bravo".into(),
+            state: store::FriendState::PendingOut,
+            pubkey: [2; 32],
+            online: true,
+            shared_groups: 1,
+        }];
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(eng.sent().is_empty(), "повтор заявки не шлём");
+        assert!(a.toasts.iter().any(|t| t.text.contains("уже отправлена")));
+        // В списке выбора участников таких кандидатов нет вовсе.
+        a.stack.clear();
+        a.open_pick(PickMode::AddFriend);
+        assert!(
+            !matches!(a.stack.last(), Some(Popup::PeerPick(_))),
+            "некого выбирать — окно не открывается"
+        );
+    }
+
+    #[test]
+    fn панель_друзей_показывает_ник_а_не_код() {
+        // Друг без алиаса: в списке ник с сервера, а не friend code.
+        let pk = [0xAB; 32];
+        let code = proto::friend_code_of(&pk);
+        let mut a = app();
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bravo".into(),
+            state: store::FriendState::Accepted,
+            pubkey: pk,
+            online: true,
+            shared_groups: 1,
+        }];
+        assert_eq!(a.friends[0].display(), "bravo");
+        assert_ne!(a.friends[0].display(), code);
+        // Нет ника — короткий код, а не 52 символа.
+        a.friends[0].nick.clear();
+        let shown = a.friends[0].display();
+        assert_eq!(shown, crate::friends::short_code(&pk));
+        assert!(shown.len() < 20, "{shown}");
+        // Алиас перекрывает ник.
+        a.friends[0].nick = "bravo".into();
+        a.friends[0].alias = "мой".into();
+        assert_eq!(a.friends[0].display(), "мой");
+        // Маркер состояния: у обычной дружбы его нет, у заявки — есть.
+        assert!(a.friends[0].badge().is_none());
+        a.friends[0].state = store::FriendState::PendingIn;
+        assert_eq!(a.friends[0].badge(), Some("←"));
+        a.friends[0].state = store::FriendState::Legacy;
+        assert_eq!(a.friends[0].badge(), Some("лок."));
+    }
+
+    #[test]
+    fn офлайн_заявка_не_шлётся_и_объясняет() {
+        let eng = FakeEngine::offline();
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        assert!(!a.add_friend(&eng, [2; 32], ""));
+        assert!(a.friends.is_empty(), "локальной записи не появляется");
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.text.contains("движок") && t.kind == MsgKind::Error),
+            "тост объясняет, что нужен движок: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // Через карточку участника — то же самое.
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(a.friends.is_empty());
+        assert!(eng.sent().is_empty());
     }
 }
