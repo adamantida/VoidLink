@@ -69,11 +69,15 @@ const MESH_INFO_EVERY: Duration = Duration::from_secs(5 * 60);
 /// `SERVER_HINT` серверу (T4): сразу после WELCOME и далее не чаще раза в
 /// 5 минут. Старый сервер тип не знает и молча роняет — шлём всем.
 const SERVER_HINT_EVERY: Duration = Duration::from_secs(5 * 60);
-/// Обслуживание DHT (устаревание, сохранение контактов) раз в 10 секунд:
-/// контакты должны пережить рестарт и мёртвый сервер, но запись файла —
-/// только когда таблица реально изменилась.
+/// Обслуживание DHT (устаревание, сохранение контактов) раз в 10 секунд.
+/// Кэш `mesh.contacts` переживает рестарт процесса и мёртвый сервер в уже
+/// запущенном клиенте, но сам по себе входа в сеть не даёт: ключи групп,
+/// состав и `my_ip` выдаёт сервер. Запись файла — только когда таблица
+/// реально изменилась (issue #27).
 const DHT_EVERY: Duration = Duration::from_secs(10);
-/// Поиск `find_node` для меш-пира не чаще раза в 5 минут.
+/// Поиск `find_node` для меш-пира не чаще раза в 5 минут. Спрашивать есть кого
+/// только при непустой таблице: первый источник контактов — `MESH_SEED` и
+/// состав групп от сервера, кэш `mesh.contacts` — лишь подсказка.
 const LOOKUP_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Сколько кандидатов-реле пробуем на один кадр (L2).
 const RELAY_TRIES: usize = 3;
@@ -992,6 +996,12 @@ impl Engine {
     pub fn group_key(&self, gid: u32) -> Option<(u32, proto::SymKey, u32)> {
         let g = self.env.groups.lock().unwrap();
         g.get(&gid).map(|gs| (gs.epoch, gs.key, gs.my_ip))
+    }
+
+    /// Сколько контактов в таблице DHT (тесты: кэш `mesh.contacts` загружен).
+    #[cfg(test)]
+    pub fn dht_contacts(&self) -> usize {
+        self.env.dht.lock().unwrap().len()
     }
 
     /// Фрейм группы текущим ключом и следующим счётчиком движка, но с
@@ -2059,7 +2069,7 @@ pub fn start_with_tun(
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (in_tx, in_rx) = mpsc::channel::<Input>();
 
-    let (server_label, pinned, mesh_enabled) = {
+    let (server_label, pinned, mesh_enabled, saved_contacts) = {
         let mut c = cfg.lock().unwrap();
         // Автовход — этого сервера (gid у каждого сервера свои).
         if c.activate_server(server) {
@@ -2069,6 +2079,9 @@ pub fn start_with_tun(
             server_label(&c, server),
             c.pinned_paths.clone(),
             c.mesh.enabled,
+            // Кэш DHT: грузим до первого `MESH_SEED`, чтобы серверные данные
+            // перебили сохранённые (issue #27).
+            c.mesh.contacts.clone(),
         )
     };
     let meta = Arc::new(Mutex::new(Meta {
@@ -2094,6 +2107,12 @@ pub fn start_with_tun(
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
     let paths = Arc::new(PathTable::new(&pinned));
     let my_ed = identity.ed_pub();
+    // Таблица DHT стартует с кэша `mesh.contacts` (issue #27): кэш — подсказка,
+    // а не замена серверу. Ключи групп, состав и свой `my_ip` по-прежнему
+    // приходят только в `WELCOME`/`GROUP_STATE`, поэтому без сервера вход в сеть
+    // не поднимется; зато известные адреса пиров не теряются между запусками.
+    let mut dht_table = dht::Dht::new(my_ed);
+    dht_table.load_at(&saved_contacts, epoch_ms());
     let env = Arc::new(Env {
         groups: groups.clone(),
         meta: meta.clone(),
@@ -2109,7 +2128,7 @@ pub fn start_with_tun(
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
         mesh: Arc::new(Mutex::new(mesh::MeshState::new(mesh_enabled))),
-        dht: Arc::new(Mutex::new(dht::Dht::new(my_ed))),
+        dht: Arc::new(Mutex::new(dht_table)),
         mesh_finds: Arc::new(Mutex::new(Vec::new())),
         paths: paths.clone(),
         probes: Arc::new(probe::ProbeState::new()),
@@ -3093,7 +3112,9 @@ fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
                 d.insert(c);
             }
             d.expire(now_ms);
-            d.to_stored()
+            // Прунинг на записи: кэш не больше BUCKETS × K записей и не старше
+            // CACHE_MAX_AGE (7 суток) — файл не должен расти и хранить мусор.
+            d.to_stored_pruned(now_ms)
         };
         if env.cfg.lock().unwrap().mesh.contacts != saved {
             env.update_cfg(|c| c.mesh.contacts = saved);
