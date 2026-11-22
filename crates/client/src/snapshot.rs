@@ -131,6 +131,9 @@ pub struct GroupSnap {
     /// «федерация». `false` — своя группа или сервер без федерации.
     #[serde(default)]
     pub federated: bool,
+    /// Отключён от доставки (issue #20): участник, но кадры не ходят.
+    #[serde(default)]
+    pub detached: bool,
     /// Участники по возрастанию IP.
     pub members: Vec<PeerSnap>,
 }
@@ -151,6 +154,7 @@ impl GroupSnap {
             my_ip: g.my_ip,
             joined_s_ago: now.saturating_duration_since(g.since).as_secs(),
             federated: g.fed_uuid.is_some(),
+            detached: g.detached,
             members,
         }
     }
@@ -456,6 +460,7 @@ mod tests {
                 my_ip: 0x0A00_0002,
                 joined_s_ago: 42,
                 federated: false,
+                detached: false,
                 members: vec![PeerSnap {
                     pubkey: [1; 32],
                     name: "bravo".into(),

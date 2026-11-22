@@ -96,6 +96,9 @@ const DIRECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// LEAVE повторяется, пока сервер не подтвердит выход списком групп.
 const LEAVE_RETRY: Duration = Duration::from_secs(1);
 const LEAVE_GIVE_UP: Duration = Duration::from_secs(20);
+/// GROUP_ATTACH без подтверждения столько — сообщаем, что отключение
+/// (подключение) осталось локальным: старый сервер тип не знает (issue #20).
+const ATTACH_CONFIRM: Duration = Duration::from_secs(5);
 /// Окно INVITE_LIST, которого ждём (после HELLO3 или запрошенное
 /// LIST_INVITES), запрашивается снова, пока не придёт: потерянное окно
 /// иначе прятало бы приглашения до переподключения.
@@ -300,6 +303,15 @@ pub struct GroupSess {
     /// другого сервера, в UI у неё метка «федерация». `None` — своя группа
     /// (сервер uuid не сообщает) или сервер без федерации.
     pub fed_uuid: Option<[u8; 16]>,
+    /// Отключён от доставки (issue #20): кадры группы не отправляются и не
+    /// принимаются, но участие и ключ сохраняются (в отличие от выхода).
+    pub detached: bool,
+    /// Сервер видит нас онлайн в этой группе (свой `MemberInfo.online`) —
+    /// подтверждение `GROUP_ATTACH`. Старый сервер тип игнорирует, значение
+    /// остаётся `true`, и клиент сообщает о локальном отключении.
+    pub server_online: bool,
+    /// Когда отправлен последний `GROUP_ATTACH` (таймаут подтверждения).
+    attach_sent: Option<Instant>,
 }
 
 impl Drop for GroupSess {
@@ -332,6 +344,9 @@ impl GroupSess {
             hint_log: VecDeque::new(),
             state_sess: 0,
             fed_uuid: None,
+            detached: false,
+            server_online: true,
+            attach_sent: None,
         }
     }
 
@@ -851,6 +866,10 @@ pub enum Cmd {
         uuid: [u8; 16],
     },
     Leave(u32),
+    /// Отключиться от доставки группы, оставаясь участником (issue #20).
+    Detach(u32),
+    /// Снова принимать кадры группы.
+    Attach(u32),
     Delete(u32),
     Rename(u32, String),
     Invite(u32, [u8; 32]),
@@ -2142,6 +2161,12 @@ pub fn start_with_tun(
     }
     // Первое подключение — синхронно, чтобы ошибка была видна сразу.
     let mut st = State::new(server_pub);
+    // Неподтверждённые выходы прошлого запуска (issue #20): LEAVE повторится
+    // после первого подключения (restore) и при каждом переподключении, пока
+    // сервер не пришлёт список без этой группы.
+    for gid in env.cfg.lock().unwrap().pending_leave.clone() {
+        st.leaving.insert(gid, Instant::now());
+    }
     st.rx_ctx = Some((env.clone(), in_tx));
     if let Err(e) = first_connect(&env, &in_rx, &mut st) {
         env.quit.store(true, Ordering::Relaxed);
@@ -2659,6 +2684,22 @@ fn restore(env: &Env, st: &mut State) {
     for gid in leaving {
         st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
     }
+    // Отключённые от доставки — GROUP_ATTACH заново в новую сессию: сервер
+    // после своего рестарта считает доставку включённой (issue #20).
+    let detached: Vec<u32> = {
+        let g = env.groups.lock().unwrap();
+        g.iter()
+            .filter(|(_, gs)| gs.detached)
+            .map(|(gid, _)| *gid)
+            .collect()
+    };
+    for gid in detached {
+        st.send_ctrl(
+            env,
+            ctrl::GROUP_ATTACH,
+            &payloads::enc_gid_attach(gid, false),
+        );
+    }
     let declining: Vec<u32> = st.declining.keys().copied().collect();
     for gid in declining {
         st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
@@ -2871,6 +2912,31 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
             for gid in gids {
                 st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
             }
+        }
+        // GROUP_ATTACH без подтверждения: старый сервер неизвестный тип
+        // молча роняет, и отключение остаётся локальным (issue #20). Сообщаем
+        // один раз — повтор каждые 5 с был бы спамом.
+        let unconfirmed: Vec<(u32, String, bool)> = {
+            let g = env.groups.lock().unwrap();
+            g.iter()
+                .filter(|(_, gs)| {
+                    gs.attach_sent
+                        .is_some_and(|t| now.duration_since(t) >= ATTACH_CONFIRM)
+                })
+                // Подтверждено — состояние доставки совпало с желаемым.
+                .filter(|(_, gs)| gs.detached == gs.server_online)
+                .map(|(gid, gs)| (*gid, gs.name.clone(), gs.detached))
+                .collect()
+        };
+        for (gid, name, detached) in unconfirmed {
+            if let Some(gs) = env.groups.lock().unwrap().get_mut(&gid) {
+                gs.attach_sent = None;
+            }
+            env.emit(Event::Notice(if detached {
+                format!("сервер не подтвердил отключение от {gid} «{name}» — оно локальное")
+            } else {
+                format!("сервер не подтвердил возврат доставки в {gid} «{name}»")
+            }));
         }
         if let Some((from, since)) = st.invite_sync
             && now.duration_since(st.last_invite_req) >= INVITE_SYNC_RETRY
@@ -3707,10 +3773,46 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             env.autojoin_remove(gid);
             st.want_group.remove(&gid);
             st.leaving.insert(gid, Instant::now());
+            // Неподтверждённый выход переживает рестарт клиента (issue #20):
+            // иначе приватная группа пустила бы обратно без приглашения.
+            env.update_cfg(|c| {
+                if !c.pending_leave.contains(&gid) {
+                    c.pending_leave.push(gid);
+                }
+            });
             st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
             if let Some(name) = name {
                 env.emit(Event::GroupLeft { gid, name });
             }
+            return;
+        }
+        Cmd::Detach(gid) | Cmd::Attach(gid) => {
+            // Локальное состояние меняется сразу (гейт в route_packet и
+            // handle_group_frame), серверу уходит GROUP_ATTACH. Старый сервер
+            // тип игнорирует — отключение остаётся локальным, о чём клиент
+            // сообщает по таймауту подтверждения (tick).
+            let on = matches!(cmd, Cmd::Attach(_));
+            let mut name = None;
+            {
+                let mut g = env.groups.lock().unwrap();
+                if let Some(gs) = g.get_mut(&gid) {
+                    gs.detached = !on;
+                    gs.attach_sent = Some(Instant::now());
+                    name = Some(gs.name.clone());
+                }
+            }
+            if st.connected() {
+                st.send_ctrl(env, ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, on));
+            }
+            env.emit(match name {
+                Some(name) if on => Event::Notice(format!(
+                    "подключаемся к группе {gid} «{name}» — доставка возвращается"
+                )),
+                Some(name) => Event::Notice(format!(
+                    "отключение от группы {gid} «{name}»: участие сохраняется"
+                )),
+                None => Event::Error(format!("группа {gid} не найдена")),
+            });
             return;
         }
         Cmd::SwitchServer {
@@ -3802,6 +3904,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         Cmd::Join(gid) => {
             st.leaving.remove(&gid);
             st.declining.remove(&gid);
+            // Осознанный повторный вход: неподтверждённый выход больше не
+            // повторяем (issue #20).
+            env.update_cfg(|c| c.pending_leave.retain(|g| *g != gid));
             st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(gid))
         }
         // T4: вход в федерированную группу по uuid. Ответ — обычный
@@ -3866,6 +3971,8 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::DelServer { .. }
         | Cmd::SetPrimaryServer { .. }
         | Cmd::Leave(_)
+        | Cmd::Detach(_)
+        | Cmd::Attach(_)
         | Cmd::PingServer { .. }
         | Cmd::PinPath { .. }
         | Cmd::UnpinPath { .. }
@@ -4124,6 +4231,9 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
     *env.server.lock().unwrap() = addr;
     {
         let mut cfg = env.cfg.lock().unwrap();
+        // gid у каждого сервера свои: неподтверждённые выходы старого сервера
+        // на новом повторились бы в чужие груpпы (issue #20).
+        cfg.pending_leave.clear();
         if cfg.activate_server(addr) {
             (env.save)(&cfg);
         }
@@ -4165,8 +4275,12 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         ctrl::GROUP_LIST => {
             if let Ok(items) = payloads::dec_group_list(payload) {
                 let mine: HashSet<u32> = items.iter().filter(|g| g.mine).map(|g| g.gid).collect();
-                // Сервер подтвердил выход — больше не повторяем LEAVE.
+                // Сервер подтвердил выход — больше не повторяем LEAVE и
+                // забываем неподтверждённые выходы в конфиге (issue #20).
                 st.leaving.retain(|gid, _| mine.contains(gid));
+                if !env.cfg.lock().unwrap().pending_leave.is_empty() {
+                    env.update_cfg(|c| c.pending_leave.retain(|g| mine.contains(g)));
+                }
                 reconcile(env, &mine);
                 // Автовход — только в группы, где сервер нас участником не
                 // считает: свои он и так присылает после HELLO3, а повторный
@@ -4290,6 +4404,9 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 let local = local.map(|(name, _)| name);
                 env.autojoin_remove(k.gid);
                 st.want_group.remove(&k.gid);
+                // Исключённый из группы выход не подтверждает — из
+                // `pending_leave` запись тоже убираем (issue #20).
+                env.update_cfg(|c| c.pending_leave.retain(|g| *g != k.gid));
                 let name = if k.group_name.is_empty() {
                     local.unwrap_or_default()
                 } else {
@@ -4544,6 +4661,12 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
         entry.owner = st.owner;
         entry.private = st.private;
         entry.my_ip = st.my_ip;
+        // Свой MemberInfo — единственный взгляд сервера на нас: `online =
+        // false` при отключённой доставке подтверждает GROUP_ATTACH
+        // (issue #20). Без своего участника (старый сервер?) — не трогаем.
+        if let Some(me) = st.members.iter().find(|m| m.pubkey == my_pub) {
+            entry.server_online = me.online;
+        }
         // Метка «федерация»: gid мог прийти в FED_GROUPS раньше состояния
         // (или это ответ на JOIN_FED — список тоже уже был). Нет в списке —
         // прежняя метка сохраняется до следующего FED_GROUPS.
@@ -4646,6 +4769,10 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
                     // Хвост дельты (§4.2): mesh-контакт изменившегося участника.
                     gs.apply_mesh_tail_for(&m.pubkey, &u.mesh);
                     sync_group_contacts(env, gs);
+                } else {
+                    // Своя дельта приходит и после GROUP_ATTACH: `online =
+                    // false` — сервер принял отключение (issue #20).
+                    gs.server_online = m.online;
                 }
             }
             payloads::GroupDelta::Removed(pk) => {
@@ -4702,6 +4829,11 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         let Some(gs) = g.get_mut(&h.gid) else {
             return FrameVerdict::Drop;
         };
+        // Группа отключена локально (issue #20): кадры не принимаем вовсе —
+        // окно повторов и статистика не тратятся, PING не отвечается.
+        if gs.detached {
+            return FrameVerdict::Drop;
+        }
         match gs.rx_key(h.epoch, now) {
             Some(k) => k,
             None => {
@@ -4818,6 +4950,9 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
 fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
     groups
         .iter()
+        // Отключённая группа не доставляет: пакет ищет другую общую группу
+        // (issue #20). Нет такой — пакет отбрасывается.
+        .filter(|(_, gs)| !gs.detached)
         .filter(|(_, gs)| gs.my_ip != dst)
         .filter_map(|(gid, gs)| gs.members.get(&dst).map(|p| (*gid, p)))
         .min_by_key(|(gid, p)| (p.direct_addr.is_none(), !p.online, *gid))
