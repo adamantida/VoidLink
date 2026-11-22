@@ -1072,6 +1072,7 @@ impl App {
                     name,
                     path: kind,
                     rtt_ms,
+                    ..
                 } => {
                     self.set_peer_path(ip, Some(PathSnap::new(kind, rtt_ms.map(u64::from))));
                     let msg = format!("путь до {name}: {}", self.path_label(&kind));
@@ -1095,6 +1096,11 @@ impl App {
                     if !self.replaying {
                         self.toast(MsgKind::Warn, msg);
                     }
+                }
+                // Авто-откат пути (issue #26): кэш участника обновляем сразу,
+                // политику уведомлений ведёт WS2.
+                E::PathReverted { ip, to, .. } => {
+                    self.set_peer_path(ip, Some(PathSnap::new(to, None)));
                 }
                 // Байты релея приходят и в снимке: обновляем счётчик сразу,
                 // чтобы статус-бар не отставал на тик.
@@ -5038,6 +5044,7 @@ mod tests {
                 name: "bravo".into(),
                 path: PathKind::Server,
                 rtt_ms: Some(48),
+                manual: false,
             }],
             &Snapshot::default(),
         );

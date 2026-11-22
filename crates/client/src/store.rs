@@ -530,4 +530,63 @@ mod tests {
         assert!(!cfg.repin_server(a, &[0xab; 32]));
         assert!(!cfg.repin_server("9.9.9.9:1".parse().unwrap(), &[1; 32]));
     }
+
+    #[test]
+    fn интервал_проб_из_конфига_с_клэмпом() {
+        use std::time::Duration;
+        let d = Config::default();
+        assert_eq!(d.rtt_interval(), Duration::from_secs(5));
+        assert_eq!(d.rtt_interval_ms, DEFAULT_RTT_INTERVAL_MS);
+        // Меньше 2 с — «чаттер», больше 20 с — NAT-маппинг прямого канала
+        // успевает протухнуть (issue #16).
+        for (ms, want) in [
+            (0u64, RTT_INTERVAL_MIN_MS),
+            (500, RTT_INTERVAL_MIN_MS),
+            (2_000, 2_000),
+            (5_000, 5_000),
+            (20_000, 20_000),
+            (60_000, RTT_INTERVAL_MAX_MS),
+            (u64::MAX, RTT_INTERVAL_MAX_MS),
+        ] {
+            let c = Config {
+                rtt_interval_ms: ms,
+                ..Config::default()
+            };
+            assert_eq!(
+                c.rtt_interval(),
+                Duration::from_millis(want),
+                "интервал {ms} мс"
+            );
+        }
+        // Старый client.json без ключа — умолчание.
+        let c: Config = serde_json::from_str(r#"{"name":"a"}"#).unwrap();
+        assert_eq!(c.rtt_interval(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn гистерезис_и_dwell_клэмпятся() {
+        let d = Config::default();
+        assert_eq!(d.path_hysteresis(), DEFAULT_PATH_HYSTERESIS_MS);
+        assert_eq!(d.path_dwell(), DEFAULT_PATH_DWELL_MS);
+        // Ноль разрешён: «без абсолютного порога» и «без удержания».
+        let zero = Config {
+            path_hysteresis_ms: 0,
+            path_dwell_ms: 0,
+            ..Config::default()
+        };
+        assert_eq!(zero.path_hysteresis(), 0);
+        assert_eq!(zero.path_dwell(), 0);
+        // Потолки: больше — только дольше держаться за плохой путь.
+        let wild = Config {
+            path_hysteresis_ms: 10_000,
+            path_dwell_ms: u64::MAX,
+            ..Config::default()
+        };
+        assert_eq!(wild.path_hysteresis(), PATH_HYSTERESIS_MAX_MS);
+        assert_eq!(wild.path_dwell(), PATH_DWELL_MAX_MS);
+        // Старый client.json — умолчания (issue #17).
+        let c: Config = serde_json::from_str(r#"{"name":"a"}"#).unwrap();
+        assert_eq!(c.path_hysteresis(), DEFAULT_PATH_HYSTERESIS_MS);
+        assert_eq!(c.path_dwell(), DEFAULT_PATH_DWELL_MS);
+    }
 }
