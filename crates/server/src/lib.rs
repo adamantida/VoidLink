@@ -6260,7 +6260,15 @@ mod tests {
         assert_eq!(raw, expected, "GROUP_STATE собран без потерь");
         let got = payloads::dec_group_state(&raw).unwrap();
         assert_eq!(got.members.len(), 253);
-        let fake = got.members.iter().find(|m| m.pubkey[31] == 0xEE).unwrap();
+        // Маркер `0xEE` есть у всех подставных участников, но ключ клиента `a`
+        // случайный: с шансом 1/256 его последний байт тоже `0xEE`, и `find`
+        // вернул бы сам запросивший клиент («alpha», пустой статус, без
+        // кандидатов). Поэтому себя исключаем.
+        let fake = got
+            .members
+            .iter()
+            .find(|m| m.pubkey[31] == 0xEE && m.pubkey != a.pk)
+            .unwrap();
         assert_eq!(
             (fake.name.len(), fake.status.len(), fake.candidates.len()),
             (255, 255, 4)
