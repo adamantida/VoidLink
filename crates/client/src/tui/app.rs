@@ -2627,11 +2627,9 @@ impl App {
             InputAction::AddFriend => {
                 let mut it = value.splitn(2, char::is_whitespace);
                 let code = it.next().unwrap_or("").trim().to_string();
-                let alias = it
-                    .next()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| code.clone());
+                // Алиас — только если задан руками: код в роли имени занимал
+                // бы всю строку списка и скрывал ник (issue #24).
+                let alias = it.next().map(|s| s.trim().to_string()).unwrap_or_default();
                 match proto::Identity::parse_friend_code(&code) {
                     Ok(pk) => {
                         if self.friends.iter().any(|f| f.pubkey == pk) {
@@ -2639,7 +2637,13 @@ impl App {
                             return;
                         }
                         if self.add_friend(eng, pk, &alias) {
-                            self.toast(MsgKind::Ok, format!("друг добавлен: {alias}"));
+                            // Это заявка, а не дружба (issue #24).
+                            let who = if alias.is_empty() {
+                                short_code(&pk)
+                            } else {
+                                alias
+                            };
+                            self.toast(MsgKind::Ok, format!("заявка отправлена: {who}"));
                         }
                     }
                     Err(e) => {
