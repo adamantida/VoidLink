@@ -587,6 +587,7 @@ mod tests {
                     my_ip: 0x6442_0002,
                     joined_s_ago: 5,
                     federated: false,
+                    detached: false,
                     members: Vec::new(),
                 }],
                 meta: MetaSnap {
