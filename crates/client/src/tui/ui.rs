@@ -449,6 +449,10 @@ fn draw_groups(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             if g.private {
                 spans.push(Span::styled(" [priv]", th.warn));
             }
+            // Отключён от доставки, но остаётся участником (issue #20).
+            if g.detached {
+                spans.push(Span::styled(" [отключён]", th.offline));
+            }
             if fed {
                 spans.push(Span::styled("  [федерация]", th.accent));
             } else if g.mine {

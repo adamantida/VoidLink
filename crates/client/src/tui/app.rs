@@ -1196,9 +1196,18 @@ impl App {
                     }
                 }
                 // Авто-откат пути (issue #26): кэш участника обновляем сразу,
-                // политику уведомлений ведёт WS2.
+                // в лог и статус — без тоста (issue #23).
                 E::PathReverted { ip, to, .. } => {
                     self.set_peer_path(ip, Some(PathSnap::new(to, None)));
+                    // Авто-откат (issue #26) — не тост (issue #23), но в лог и
+                    // статус: пользователь должен видеть, что путь вернули.
+                    let msg = format!(
+                        "путь до {} возвращён: {} (новый оказался хуже)",
+                        proto::ip_str(ip),
+                        self.path_label(&to)
+                    );
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.status_msg = msg;
                 }
                 // Байты релея приходят и в снимке: обновляем счётчик сразу,
                 // чтобы статус-бар не отставал на тик.
@@ -1455,6 +1464,11 @@ impl App {
     /// Вернуть отложенные приглашения в очередь показа («o», `:invites`).
     pub fn reopen_invites(&mut self) {
         if self.later_invites.is_empty() && self.invites.is_empty() {
+            // Заявка в друзья — тоже «неотвеченное»: окно закрывается по Esc,
+            // и без этого принять её было бы нечем (issue #24).
+            if self.reopen_friend_req() {
+                return;
+            }
             self.toast(MsgKind::Info, "нет неотвеченных приглашений".into());
             return;
         }
@@ -1462,6 +1476,25 @@ impl App {
             self.invites.push_front(inv);
         }
         self.pump_invites();
+    }
+
+    /// Открыть окно входящей заявки в друзья, если она ждёт ответа.
+    fn reopen_friend_req(&mut self) -> bool {
+        let Some((pubkey, name)) = self
+            .friends
+            .iter()
+            .find(|f| f.state == crate::store::FriendState::PendingIn)
+            .map(|f| (f.pubkey, f.display()))
+        else {
+            return false;
+        };
+        self.stack.push(Popup::FriendReq(FriendReqPopup {
+            pubkey,
+            name,
+            received_at: Instant::now(),
+            expires_at: None,
+        }));
+        true
     }
 
     /// Клавиша в окне приглашения. Возвращает команду движку (если есть).
@@ -1689,6 +1722,11 @@ impl App {
             KeyCode::Char('b') => self.open_pick(PickMode::Ban),
             KeyCode::Char('j') => self.join_selected(eng),
             KeyCode::Char('x') => self.open_leave_group(),
+            KeyCode::Char('a') if self.focus == Focus::Peers => {
+                // «a» в панели участников — заявка в друзья из списка, без
+                // кода (issue #24); в остальных местах — ввод friend code.
+                self.open_pick(PickMode::AddFriend);
+            }
             KeyCode::Char('a') => self.open_add_friend(),
             KeyCode::Char('d') if self.focus == Focus::Friends => self.open_del_friend(),
             // В группах/участниках `d` — отключиться от доставки, не выходя
@@ -2047,8 +2085,20 @@ impl App {
         match self.focus {
             Focus::Friends => {
                 if let Some(f) = self.selected_friend() {
-                    let pk = f.pubkey;
-                    let alias = f.alias.clone();
+                    let (pk, alias, state, name) =
+                        (f.pubkey, f.alias.clone(), f.state, f.display());
+                    // Входящая заявка (issue #24): Enter открывает её окно, а
+                    // не карточку — окно приходит только событием, и после Esc
+                    // или рестарта TUI принять заявку было бы нечем.
+                    if state == crate::store::FriendState::PendingIn {
+                        self.stack.push(Popup::FriendReq(FriendReqPopup {
+                            pubkey: pk,
+                            name,
+                            received_at: Instant::now(),
+                            expires_at: None,
+                        }));
+                        return;
+                    }
                     self.stack.push(Popup::FriendCard(FriendCardPopup {
                         alias,
                         pubkey: pk,
@@ -6023,5 +6073,71 @@ mod friends_tests {
         a.handle_popup_key(key(KeyCode::Char('a')), &eng);
         assert!(a.friends.is_empty());
         assert!(eng.sent().is_empty());
+    }
+
+    #[test]
+    fn входящая_заявка_открывается_enter_из_списка_друзей() {
+        // Окно заявки приходит только событием: после Esc или перезапуска
+        // TUI принять её было бы нечем (issue #24). Enter по записи
+        // `PendingIn` должен снова открыть окно.
+        let mut a = app();
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bob".into(),
+            state: store::FriendState::PendingIn,
+            pubkey: [2; 32],
+            online: false,
+            shared_groups: 0,
+        }];
+        a.focus = Focus::Friends;
+        a.sel_friend = Some([2; 32]);
+        let eng = FakeEngine::new(Snapshot::default());
+        a.activate(&eng);
+        match a.stack.last() {
+            Some(Popup::FriendReq(req)) => assert_eq!(req.pubkey, [2; 32]),
+            Some(_) => panic!("ожидалось окно заявки, получено другое окно"),
+            None => panic!("окно заявки не открылось"),
+        }
+    }
+
+    #[test]
+    fn o_возвращает_входящую_заявку_если_приглашений_нет() {
+        let mut a = app();
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bob".into(),
+            state: store::FriendState::PendingIn,
+            pubkey: [2; 32],
+            online: false,
+            shared_groups: 0,
+        }];
+        a.reopen_invites();
+        assert!(
+            matches!(a.stack.last(), Some(Popup::FriendReq(_))),
+            "«o» должен открыть заявку в друзья"
+        );
+    }
+
+    #[test]
+    fn a_в_панели_участников_открывает_список_друзей() {
+        // «a» в панели участников — заявка из списка, без кода (issue #24);
+        // в остальных фокусах — ввод friend code.
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.focus = Focus::Peers;
+        a.handle_key(key(KeyCode::Char('a')), &eng);
+        match a.stack.last() {
+            Some(Popup::PeerPick(p)) => {
+                assert!(matches!(p.mode, PickMode::AddFriend), "не тот режим выбора")
+            }
+            Some(_) => panic!("ожидался выбор участника, получено другое окно"),
+            None => panic!("список участников не открылся"),
+        }
+        let mut b = app();
+        b.handle_key(key(KeyCode::Char('a')), &eng);
+        assert!(
+            matches!(b.stack.last(), Some(Popup::Input(_))),
+            "вне панели участников «a» — ввод кода"
+        );
     }
 }

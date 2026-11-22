@@ -107,6 +107,9 @@ impl PeerSnap {
             .and_then(|ip| paths.current(ip))
             .map(|kind| {
                 let m = paths.metrics(p.ip).unwrap_or_default();
+                // До первой пробы jitter/loss — «неизвестно», а не нули:
+                // иначе карточка показывала бы «0 мс · 0 %» без данных.
+                let probed = paths.has_probes(p.ip);
                 PathSnap {
                     kind,
                     // Честный end-to-end RTT выбранного пути (issue #15):
@@ -118,8 +121,10 @@ impl PeerSnap {
                         .then(|| paths.server_rtt())
                         .flatten()
                         .map(u64::from),
-                    jitter_ms: Some(m.jitter_ms),
-                    loss_pm: Some(m.loss_pm),
+                    // Джиттер имеет смысл с первой пробы: до неё вариации
+                    // просто не наблюдали, и «0 мс» было бы выдумкой.
+                    jitter_ms: probed.then_some(m.jitter_ms),
+                    loss_pm: probed.then_some(m.loss_pm),
                     hist: m.hist,
                 }
             });

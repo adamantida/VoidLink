@@ -230,10 +230,12 @@ impl LossWindow {
         }
     }
 
-    /// Ответ на последнюю пробу.
+    /// Ответ на пробу: отмечается самая старая непрошедшая проба, а не
+    /// последняя. PONG может прийти не в порядке отправки (разные группы,
+    /// разные пути), и один ответ не должен «закрывать» чужую пробу.
     fn answered(&mut self) {
-        if let Some(last) = self.probes.back_mut() {
-            *last = true;
+        if let Some(pos) = self.probes.iter().rposition(|ok| !*ok) {
+            self.probes[pos] = true;
         }
     }
 
@@ -720,6 +722,23 @@ impl PathTable {
         })
     }
 
+    /// Есть ли по получателю хоть одна проба: до неё jitter/loss — не нули,
+    /// а «неизвестно» (issue #26).
+    pub fn has_probes(&self, ip: u32) -> bool {
+        let p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        p.targets
+            .get(&ip)
+            .is_some_and(|t| !t.loss.probes.is_empty())
+    }
+
+    /// Последний end-to-end замер маршрута через сервер до получателя
+    /// (issue #15). Плечо до сервера сюда не подставляется.
+    pub fn server_path_rtt(&self, ip: u32) -> Option<u32> {
+        let p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let t = p.targets.get(&ip)?;
+        t.server_e2e_fresh(p.now_ms, p.policy)
+    }
+
     /// Пересчитать пути всех получателей. Возвращает изменения — движок
     /// рассылает их событиями. `server_up` — есть ли связь с сервером.
     pub fn recalc(&self, now_ms: u64, server_up: bool) -> Vec<PathChange> {
@@ -1035,8 +1054,9 @@ pub fn send_addr(path: PathKind, direct: Option<SocketAddr>, server: SocketAddr)
     match path {
         PathKind::Direct => direct.unwrap_or(server),
         PathKind::Server => server,
-        // Релей L2 в T1 не транспортируется: до реализации mesh (T3) кадр
-        // идёт сервером — трафик не теряется.
+        // Релей L2 транспортируется mesh-сессией (`route_packet` →
+        // `try_relay`), а здесь адрес — запасной: сервер доставит, если реле
+        // не приняло. Так кадр не теряется.
         PathKind::PeerRelay { .. } => server,
     }
 }
@@ -1066,6 +1086,37 @@ mod tests {
     fn one(changes: Vec<PathChange>) -> PathChange {
         assert_eq!(changes.len(), 1, "ожидалось одно изменение: {changes:?}");
         changes[0]
+    }
+
+    #[test]
+    fn ответ_закрывает_самую_старую_пробу() {
+        // У пира в нескольких общих группах за раунд уходит несколько проб, а
+        // PONG приходят в произвольном порядке. Один ответ не должен
+        // «закрывать» чужую пробу: иначе здоровая пара показывала бы потери
+        // (issue #26).
+        let mut w = LossWindow::default();
+        w.sent();
+        w.sent();
+        assert_eq!(w.loss_pm(), 1000);
+        w.answered();
+        assert_eq!(w.loss_pm(), 500, "ответ закрыл не одну пробу");
+        w.answered();
+        assert_eq!(w.loss_pm(), 0, "две пробы и два ответа — потерь нет");
+        // Лишний ответ (повтор PONG) не портит окно.
+        w.answered();
+        assert_eq!(w.loss_pm(), 0);
+    }
+
+    #[test]
+    fn потери_и_джиттер_неизвестны_до_первой_пробы() {
+        // Карточка не должна показывать «0 мс · 0 %» без данных (issue #26).
+        let t = table();
+        t.record_server_rtt(5, 0);
+        t.ensure_target(IP);
+        t.recalc(0, true);
+        assert!(!t.has_probes(IP), "пробы ещё не было");
+        t.record_probe_sent(IP);
+        assert!(t.has_probes(IP), "проба отмечена");
     }
 
     #[test]

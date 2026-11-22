@@ -3211,7 +3211,9 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
                     gs.attach_sent
                         .is_some_and(|t| now.duration_since(t) >= ATTACH_CONFIRM)
                 })
-                // Подтверждено — состояние доставки совпало с желаемым.
+                // Подтверждено — состояние доставки совпало с желаемым:
+                // остались только те, где желаемое (`detached`) ещё не равно
+                // серверному (`server_online`).
                 .filter(|(_, gs)| gs.detached == gs.server_online)
                 .map(|(gid, gs)| (*gid, gs.name.clone(), gs.detached))
                 .collect()
@@ -4353,8 +4355,16 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
                     decline_friend(env, st, pk);
                 }
                 Some(store::FriendState::PendingOut) => {
-                    env.emit(Event::Error(
-                        "заявка уже отправлена — отменить её нельзя, она истечёт сама".into(),
+                    // Сервер не умеет отменять заявку (кадра нет), но старая
+                    // локальная запись не должна залипать навсегда: снимаем
+                    // её у себя, серверная заявка истечёт по TTL (issue #24).
+                    st.friends.on_removed(&pk);
+                    env.update_cfg(|c| {
+                        c.friends
+                            .retain(|f| proto::hex_to_bytes(&f.pubkey).ok() != Some(pk.to_vec()));
+                    });
+                    env.emit(Event::Notice(
+                        "заявка снята локально; на сервере она истечёт сама".into(),
                     ));
                 }
                 // Локальная запись (или её уже нет) — снимаем у себя.
@@ -5424,6 +5434,9 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
     let my_pub = env.identity.ed_pub();
     let now = Instant::now();
     let mut events: Vec<Event> = Vec::new();
+    // Адреса участников, удалённых из группы: их записи в таблице путей
+    // снимаются после отпускания блокировки (issue #20/утечка замеров).
+    let mut removed_ips: Vec<u32> = Vec::new();
     {
         let mut g = env.groups.lock().unwrap();
         let Some(gs) = g.get_mut(&u.gid) else { return };
@@ -5450,7 +5463,17 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
             }
             payloads::GroupDelta::Removed(pk) => {
                 if *pk != my_pub {
+                    // Адрес нужен до удаления: после `remove_member` его уже
+                    // не найти по ключу.
+                    let ip = gs
+                        .members
+                        .iter()
+                        .find(|(_, p)| p.pubkey == *pk)
+                        .map(|(ip, _)| *ip);
                     gs.remove_member(pk);
+                    if let Some(ip) = ip {
+                        removed_ips.push(ip);
+                    }
                 }
             }
             payloads::GroupDelta::Meta {
@@ -5466,6 +5489,21 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
         gs.rev = u.rev;
     }
     drop_offline_paths(env, &events);
+    // Удалённые из группы участники: запись в таблице путей снимается, если
+    // их больше нет ни в одной общей группе (issue #20, утечка замеров).
+    if !removed_ips.is_empty() {
+        let alive: HashSet<u32> = {
+            let g = env.groups.lock().unwrap();
+            g.values()
+                .flat_map(|gs| gs.members.keys().copied())
+                .collect()
+        };
+        for ip in removed_ips {
+            if !alive.contains(&ip) {
+                env.paths.clear_target(ip);
+            }
+        }
+    }
     for ev in events {
         env.emit(ev);
     }
@@ -5862,7 +5900,9 @@ fn path_rtt_ms(env: &Env, ip: u32, kind: PathKind, now_ms: u64) -> Option<f64> {
                 .find_map(|gs| gs.members.get(&ip).and_then(|p| p.rtt_ms))
                 .map(|r| r as f64)
         }
-        PathKind::Server => env.paths.server_rtt().map(f64::from),
+        // Честный e2e-замер (issue #15): плечо до сервера сравнивать с прямым
+        // путём нельзя — оно всегда «лучше» и перекосило бы выбор копий.
+        PathKind::Server => env.paths.server_path_rtt(ip).map(f64::from),
         PathKind::PeerRelay { via } => {
             let d = env.dup.lock().unwrap();
             d.relay
@@ -5986,12 +6026,20 @@ fn rtt_round(env: &Env, connected: bool, now: Instant, interval: Duration) {
     let mut direct_rtts: Vec<(u32, u32)> = Vec::new();
     // Получатели, которым реально ушла проба (для учёта потерь, issue #26).
     let mut probes: Vec<u32> = Vec::new();
+    // Уникальные получатели раунда: у пира может быть несколько общих групп.
+    let mut seen_probes: HashSet<u32> = HashSet::new();
     let mut failures: Vec<u32> = Vec::new();
     let timeout = direct_timeout(interval);
     {
         let server = env.server();
         let mut g = env.groups.lock().unwrap();
         for (gid, gs) in g.iter_mut() {
+            // Отключённая группа (issue #20): доставки нет, проб не шлём —
+            // иначе «отключённый» оставался бы для пиров живым, а его
+            // собственные потери были бы 100 %.
+            if gs.detached {
+                continue;
+            }
             let ips: Vec<u32> = gs.members.keys().copied().collect();
             for ip in ips {
                 let Some(peer) = gs.members.get_mut(&ip) else {
@@ -6042,6 +6090,12 @@ fn rtt_round(env: &Env, connected: bool, now: Instant, interval: Duration) {
         env.paths.record_direct_rtt(ip, rtt, now_ms);
     }
     for ip in probes {
+        // Один получатель может быть в нескольких общих группах: проб на него
+        // за раунд несколько, а окно потерь — одно. Иначе здоровая пара
+        // показывала бы 500 ‰ (issue #26).
+        if !seen_probes.insert(ip) {
+            continue;
+        }
         env.paths.record_probe_sent(ip);
     }
     for ev in events {
@@ -6071,6 +6125,10 @@ fn punch_round(env: &Env, now: Instant) {
     {
         let mut g = env.groups.lock().unwrap();
         for (gid, gs) in g.iter_mut() {
+            // Отключённая группа (issue #20): PUNCH — тоже доставка, её нет.
+            if gs.detached {
+                continue;
+            }
             let targets: Vec<(u32, Vec<SocketAddr>)> = gs
                 .members
                 .iter()
