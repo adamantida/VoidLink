@@ -211,6 +211,24 @@ pub fn dec_u32(p: &[u8]) -> Result<u32> {
     dec_gid(p)
 }
 
+/// GROUP_ATTACH (issue #20): `gid u32 | attached u8`. `attached = 0` —
+/// остаться участником, но не получать кадры группы (и не слать их);
+/// `1` — снова принимать. Ключ группы при этом **не** ротируется — этим
+/// действие отличается от LEAVE_GROUP.
+pub fn enc_gid_attach(gid: u32, attached: bool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(5);
+    put_u32(&mut v, gid);
+    put_bool(&mut v, attached);
+    v
+}
+
+pub fn dec_gid_attach(p: &[u8]) -> Result<(u32, bool)> {
+    let mut r = Reader::new(p);
+    let gid = r.u32()?;
+    let attached = r.boolean()?;
+    Ok((gid, attached))
+}
+
 /// INVITE / KICK / BAN / UNBAN / TRANSFER_OWNER: gid + pubkey цели.
 pub fn enc_gid_target(gid: u32, target: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(36);
@@ -1044,6 +1062,184 @@ pub fn dec_friend_groups(p: &[u8]) -> Result<FriendGroups> {
     Ok(FriendGroups { target, groups })
 }
 
+// ---------- друзья (issue #24) ----------
+
+/// Состояние друга в `FRIEND_LIST` (`FriendInfo::state`).
+///
+/// `0` не занят: запись без состояния читается как неизвестная и
+/// отбрасывается, чтобы старый клиент не показывал друга, которого сервер
+/// таковым не считает.
+pub mod friend_state {
+    /// Заявку отправили мы, ответа ещё нет.
+    pub const PENDING_OUT: u8 = 1;
+    /// Заявка пришла нам, ответа ещё нет.
+    pub const PENDING_IN: u8 = 2;
+    /// Дружба подтверждена взаимно (пара на сервере).
+    pub const ACCEPTED: u8 = 3;
+
+    /// Состояние известно (запись имеет смысл показывать).
+    pub fn known(v: u8) -> bool {
+        matches!(v, PENDING_OUT | PENDING_IN | ACCEPTED)
+    }
+}
+
+/// Элемент `FRIEND_LIST`: одна связь с другой identity и её состояние.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendInfo {
+    /// ed25519 второй стороны.
+    pub pk: [u8; 32],
+    /// Ник с сервера (последнее известное имя); пусто — имени нет.
+    pub name: String,
+    /// `friend_state::*`.
+    pub state: u8,
+    /// unix мс: когда заявка отправлена или когда дружба принята.
+    pub since_ms: u64,
+}
+
+const FRIEND_INFO_MIN: usize = 32 + 1 + 1 + 8;
+
+fn put_friend_info(v: &mut Vec<u8>, f: &FriendInfo) {
+    put_pub(v, &f.pk);
+    put_str(v, &f.name);
+    v.push(f.state);
+    put_u64(v, f.since_ms);
+}
+
+fn read_friend_info(r: &mut Reader) -> Result<FriendInfo> {
+    Ok(FriendInfo {
+        pk: r.pub_key()?,
+        name: r.str()?,
+        state: r.u8()?,
+        since_ms: r.u64()?,
+    })
+}
+
+/// FRIEND_REQ_RCVD: кто и на сколько времени прислал заявку.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendReqRcvd {
+    pub from: [u8; 32],
+    pub from_name: String,
+    /// Сколько секунд заявка ещё действует.
+    pub expires_in: u32,
+}
+
+pub fn enc_friend_req_rcvd(f: &FriendReqRcvd) -> Vec<u8> {
+    let mut v = Vec::new();
+    put_pub(&mut v, &f.from);
+    put_str(&mut v, &f.from_name);
+    put_u32(&mut v, f.expires_in);
+    v
+}
+
+pub fn dec_friend_req_rcvd(p: &[u8]) -> Result<FriendReqRcvd> {
+    let mut r = Reader::new(p);
+    Ok(FriendReqRcvd {
+        from: r.pub_key()?,
+        from_name: r.str()?,
+        expires_in: r.u32()?,
+    })
+}
+
+/// FRIEND_LIST — окно списка друзей: записи с pubkey ≥ `from` по возрастанию
+/// ключа (сервер шлёт не больше 16 за раз). `complete` — после последней
+/// записи в окне на сервере больше ничего нет.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendList {
+    pub from: [u8; 32],
+    pub items: Vec<FriendInfo>,
+    pub complete: bool,
+}
+
+impl FriendList {
+    /// Достоверен ли список для `pk`: окно покрывает ключи от `from` до
+    /// последнего в нём (полное — и дальше). Нет `pk` в покрытом окне —
+    /// связи с ним на сервере нет.
+    pub fn covers(&self, pk: &[u8; 32]) -> bool {
+        pk >= &self.from && (self.complete || self.items.last().is_some_and(|l| &l.pk >= pk))
+    }
+
+    /// Начало следующего окна (список неполный), иначе `None`. Ключ, которым
+    /// заканчивается окно, повторяется первым в следующем: пропустить его
+    /// нельзя, а сдвиг на единицу для 32 байт — это ещё один кодек.
+    pub fn next_from(&self) -> Option<[u8; 32]> {
+        if self.complete {
+            return None;
+        }
+        self.items.last().map(|l| l.pk)
+    }
+}
+
+/// FRIEND_LIST: `from pk(32) | complete bool | n u8 × FriendInfo`. Больше 255
+/// записей не кодируется (тогда и `complete` снимается).
+pub fn enc_friend_list(l: &FriendList) -> Vec<u8> {
+    let items = &l.items[..l.items.len().min(255)];
+    let mut v = Vec::new();
+    put_pub(&mut v, &l.from);
+    put_bool(&mut v, l.complete && items.len() == l.items.len());
+    v.push(items.len() as u8);
+    for f in items {
+        put_friend_info(&mut v, f);
+    }
+    v
+}
+
+pub fn dec_friend_list(p: &[u8]) -> Result<FriendList> {
+    let mut r = Reader::new(p);
+    let from = r.pub_key()?;
+    let complete = r.boolean()?;
+    let n = r.u8()? as usize;
+    let mut items = Vec::with_capacity(r.capacity_for(n, FRIEND_INFO_MIN));
+    for _ in 0..n {
+        items.push(read_friend_info(&mut r)?);
+    }
+    Ok(FriendList {
+        from,
+        items,
+        complete,
+    })
+}
+
+/// FRIEND_REQ_ACCEPTED / FRIEND_REQ_DECLINED: кто ответил на заявку.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendVerdict {
+    pub by: [u8; 32],
+    pub by_name: String,
+}
+
+pub fn enc_friend_accepted(v: &FriendVerdict) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_pub(&mut b, &v.by);
+    put_str(&mut b, &v.by_name);
+    b
+}
+
+pub fn dec_friend_accepted(p: &[u8]) -> Result<FriendVerdict> {
+    let mut r = Reader::new(p);
+    Ok(FriendVerdict {
+        by: r.pub_key()?,
+        by_name: r.str()?,
+    })
+}
+
+pub fn enc_friend_declined(v: &FriendVerdict) -> Vec<u8> {
+    enc_friend_accepted(v)
+}
+
+pub fn dec_friend_declined(p: &[u8]) -> Result<FriendVerdict> {
+    dec_friend_accepted(p)
+}
+
+/// FRIEND_REMOVED: кто снял дружбу (вторая сторона убирает запись).
+pub fn enc_friend_removed(by: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::new();
+    put_pub(&mut v, by);
+    v
+}
+
+pub fn dec_friend_removed(p: &[u8]) -> Result<[u8; 32]> {
+    Reader::new(p).pub_key()
+}
+
 /// RTT-зонд (grp::PING / PONG): 8-байтовая метка времени.
 pub fn enc_ping(nonce: u64) -> Vec<u8> {
     nonce.to_be_bytes().to_vec()
@@ -1380,6 +1576,149 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn заявка_в_друзья_туда_обратно() {
+        let r = FriendReqRcvd {
+            from: [7; 32],
+            from_name: "bravo".into(),
+            expires_in: 600,
+        };
+        let enc = enc_friend_req_rcvd(&r);
+        assert_eq!(dec_friend_req_rcvd(&enc).unwrap(), r);
+        truncations_fail(&enc, dec_friend_req_rcvd);
+        // Пустое имя — не ошибка: сервер мог не знать имени отправителя.
+        let anon = FriendReqRcvd {
+            from_name: String::new(),
+            ..r.clone()
+        };
+        assert_eq!(
+            dec_friend_req_rcvd(&enc_friend_req_rcvd(&anon)).unwrap(),
+            anon
+        );
+        // Ответ на заявку: приняли и отклонили — один формат.
+        let v = FriendVerdict {
+            by: [8; 32],
+            by_name: "charlie".into(),
+        };
+        let enc_a = enc_friend_accepted(&v);
+        assert_eq!(dec_friend_accepted(&enc_a).unwrap(), v);
+        truncations_fail(&enc_a, dec_friend_accepted);
+        let enc_d = enc_friend_declined(&v);
+        assert_eq!(dec_friend_declined(&enc_d).unwrap(), v);
+        truncations_fail(&enc_d, dec_friend_declined);
+        // Снятие дружбы: только ключ, хвост допустим (расширение без версии).
+        let mut enc = enc_friend_removed(&[9; 32]);
+        assert_eq!(dec_friend_removed(&enc).unwrap(), [9; 32]);
+        truncations_fail(&enc, dec_friend_removed);
+        enc.push(0xAA);
+        assert_eq!(
+            dec_friend_removed(&enc).unwrap(),
+            [9; 32],
+            "хвост игнорируется"
+        );
+    }
+
+    #[test]
+    fn список_друзей_туда_обратно() {
+        let l = FriendList {
+            from: [0; 32],
+            items: vec![
+                FriendInfo {
+                    pk: [1; 32],
+                    name: "alpha".into(),
+                    state: friend_state::PENDING_IN,
+                    since_ms: 1_700_000_000_000,
+                },
+                FriendInfo {
+                    pk: [2; 32],
+                    name: "bravo".into(),
+                    state: friend_state::ACCEPTED,
+                    since_ms: 1_700_000_000_500,
+                },
+                FriendInfo {
+                    pk: [3; 32],
+                    name: String::new(),
+                    state: friend_state::PENDING_OUT,
+                    since_ms: 0,
+                },
+            ],
+            complete: true,
+        };
+        let enc = enc_friend_list(&l);
+        assert_eq!(dec_friend_list(&enc).unwrap(), l);
+        truncations_fail(&enc, dec_friend_list);
+        let empty = FriendList {
+            from: [5; 32],
+            items: Vec::new(),
+            complete: false,
+        };
+        assert_eq!(dec_friend_list(&enc_friend_list(&empty)).unwrap(), empty);
+        // Состояние 0 не занято: запись с ним — «неизвестно», а не дружба.
+        assert!(friend_state::known(friend_state::ACCEPTED));
+        assert!(!friend_state::known(0) && !friend_state::known(4));
+        // Больше 255 записей не кодируется — `complete` снимается.
+        let many = FriendList {
+            from: [0; 32],
+            items: (0..300)
+                .map(|i| FriendInfo {
+                    pk: [(i % 256) as u8; 32],
+                    name: String::new(),
+                    state: friend_state::ACCEPTED,
+                    since_ms: i as u64,
+                })
+                .collect(),
+            complete: true,
+        };
+        let dec = dec_friend_list(&enc_friend_list(&many)).unwrap();
+        assert_eq!(dec.items.len(), 255);
+        assert!(!dec.complete, "обрезанный список не полный");
+    }
+
+    #[test]
+    fn окно_списка_друзей_покрывает_от_from_до_последнего() {
+        // Неполное окно: достоверно от `from` до последнего ключа включительно.
+        let win = FriendList {
+            from: [10; 32],
+            items: vec![
+                FriendInfo {
+                    pk: [10; 32],
+                    name: String::new(),
+                    state: friend_state::ACCEPTED,
+                    since_ms: 0,
+                },
+                FriendInfo {
+                    pk: [20; 32],
+                    name: String::new(),
+                    state: friend_state::ACCEPTED,
+                    since_ms: 0,
+                },
+            ],
+            complete: false,
+        };
+        assert!(!win.covers(&[9; 32]), "до окна — ничего не известно");
+        assert!(win.covers(&[10; 32]));
+        assert!(win.covers(&[15; 32]), "дырка внутри окна — связи нет");
+        assert!(win.covers(&[20; 32]));
+        assert!(!win.covers(&[21; 32]), "за последним — не покрыто");
+        assert_eq!(win.next_from(), Some([20; 32]), "дочитывать с последнего");
+        // Полное окно покрывает всё начиная с `from`.
+        let all = FriendList {
+            complete: true,
+            ..win.clone()
+        };
+        assert!(all.covers(&[0xFF; 32]));
+        assert!(!all.covers(&[9; 32]));
+        assert_eq!(all.next_from(), None);
+        // Пустое неполное окно: дочитывать не с чего.
+        let none = FriendList {
+            from: [1; 32],
+            items: Vec::new(),
+            complete: false,
+        };
+        assert!(!none.covers(&[2; 32]));
+        assert_eq!(none.next_from(), None);
+    }
+
+    #[test]
     fn admin_info_обрезается_под_frag() {
         let long = "ж".repeat(127);
         let a = AdminInfo {
@@ -1448,6 +1787,26 @@ pub(crate) mod tests {
         assert!(dec_presence(&enc_presence(true)).unwrap());
         assert!(!dec_presence(&enc_presence(false)).unwrap());
         assert!(dec_presence(&[]).is_err());
+    }
+
+    /// GROUP_ATTACH (issue #20): ровно 5 байт, усечение — ошибка разбора, а
+    /// не «по умолчанию подключён» (иначе обрезанный кадр включал бы приём).
+    #[test]
+    fn gid_attach_туда_обратно_и_усечение() {
+        for attached in [true, false] {
+            let enc = enc_gid_attach(17, attached);
+            assert_eq!(enc.len(), 5, "формат: gid u32 | attached u8");
+            assert_eq!(dec_gid_attach(&enc).unwrap(), (17, attached));
+            assert!(dec_gid_attach(&enc[..4]).is_err(), "нет байта attached");
+            assert!(dec_gid_attach(&enc[..2]).is_err());
+            assert!(dec_gid_attach(&[]).is_err());
+        }
+        // Любой ненулевой байт — «подключён»; хвост допускается (расширение
+        // без смены версии).
+        assert_eq!(dec_gid_attach(&[0, 0, 0, 3, 0x7f]).unwrap(), (3, true));
+        let mut with_tail = enc_gid_attach(3, false);
+        with_tail.push(0xEE);
+        assert_eq!(dec_gid_attach(&with_tail).unwrap(), (3, false));
     }
 
     #[test]

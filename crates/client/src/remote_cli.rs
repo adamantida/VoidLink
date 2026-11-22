@@ -85,6 +85,9 @@ pub fn is_engine_cmd(cmd: &str) -> bool {
             | "delete"
             | "friend-groups"
             | "add-friend"
+            | "accept-friend"
+            | "decline-friend"
+            | "remove-friend"
             | "del-friend"
             | "friends"
             | "alias"
@@ -600,24 +603,105 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
         "add-friend" => {
             let code = rest.first().context("usage: add-friend <code> [alias]")?;
             let pubkey = proto::Identity::parse_friend_code(code)?;
-            let alias = rest.get(1).cloned().unwrap_or_else(|| code.clone());
-            if s.snap
+            let hex = proto::hex_of(&pubkey);
+            // Алиас — только если задан руками: код друга в качестве имени
+            // (issue #24) занимал всю строку в списке и скрывал ник.
+            let alias = rest.get(1).cloned().unwrap_or_default();
+            let known = s
+                .snap
                 .cfg
                 .friends
                 .iter()
-                .any(|f| f.pubkey == proto::hex_of(&pubkey))
-            {
+                .find(|f| f.pubkey == hex)
+                .map(|f| f.state);
+            if known == Some(store::FriendState::Accepted) {
                 bail!("друг уже добавлен");
+            }
+            if known == Some(store::FriendState::PendingOut) {
+                bail!("заявка уже отправлена — ждём ответа");
             }
             s.req(Cmd::AddFriend {
                 pubkey,
                 alias: alias.clone(),
             })?;
-            let hex = proto::hex_of(&pubkey);
-            s.until("друг в конфиге", |x| {
-                x.cfg.friends.iter().any(|f| f.pubkey == hex)
+            // Заявка уходит серверу; движок сразу помечает запись «ждёт
+            // ответа» (снимок конфига).
+            s.until("заявка отправлена", |x| {
+                x.cfg
+                    .friends
+                    .iter()
+                    .any(|f| f.pubkey == hex && f.state != store::FriendState::Legacy)
             })?;
-            writeln!(out, "друг добавлен: {alias} ({})", proto::hex_of(&pubkey))?;
+            let state = s
+                .snap
+                .cfg
+                .friends
+                .iter()
+                .find(|f| f.pubkey == hex)
+                .map(|f| f.state)
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "заявка отправлена: {} ({}) — {}",
+                if alias.is_empty() {
+                    crate::friends::short_code(&pubkey)
+                } else {
+                    alias
+                },
+                hex,
+                crate::friends::state_marker(state)
+            )?;
+        }
+        // Ответ на входящую заявку (issue #24). Без аргумента — первая
+        // входящая из списка друзей.
+        "accept-friend" | "decline-friend" => {
+            let accept = cmd == "accept-friend";
+            let usage = if accept {
+                "usage: accept-friend <friend (code|hex|alias|ник)>"
+            } else {
+                "usage: decline-friend <friend (code|hex|alias|ник)>"
+            };
+            let cfg = s.cfg();
+            let pk = match rest.first() {
+                Some(peer) => store::resolve_peer(&cfg, peer)?,
+                None => {
+                    let hex = cfg
+                        .friends
+                        .iter()
+                        .find(|f| f.state == store::FriendState::PendingIn)
+                        .map(|f| f.pubkey.clone())
+                        .context(format!("{usage} (входящих заявок нет)"))?;
+                    crate::friends::parse_pk(&hex)?
+                }
+            };
+            let hex = proto::hex_of(&pk);
+            if accept {
+                s.req(Cmd::AcceptFriend(pk))?;
+                s.until("дружба подтверждена", |x| {
+                    x.cfg
+                        .friends
+                        .iter()
+                        .any(|f| f.pubkey == hex && f.state == store::FriendState::Accepted)
+                })?;
+                writeln!(out, "принято: {hex} — теперь вы друзья")?;
+            } else {
+                s.req(Cmd::DeclineFriend(pk))?;
+                s.until("заявка отклонена", |x| {
+                    !x.cfg.friends.iter().any(|f| f.pubkey == hex)
+                })?;
+                writeln!(out, "отклонено: {hex}")?;
+            }
+        }
+        "remove-friend" => {
+            let peer = rest.first().context("usage: remove-friend <peer>")?;
+            let cfg = s.cfg();
+            let pk = store::resolve_peer(&cfg, peer)?;
+            let hex = proto::hex_of(&pk);
+            s.req(Cmd::RemoveFriend(pk))?;
+            s.until("дружба снята", |x| {
+                !x.cfg.friends.iter().any(|f| f.pubkey == hex)
+            })?;
+            writeln!(out, "дружба снята: {hex}")?;
         }
         "del-friend" => {
             let alias = rest.first().context("usage: del-friend <alias>")?;

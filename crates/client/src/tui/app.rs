@@ -13,6 +13,7 @@ use tunnel_protocol as proto;
 
 use crate::api::{EngineApi, EngineMode};
 use crate::engine::{Cmd, Event};
+use crate::friends::short_code;
 use crate::path::{self, PathKind};
 use crate::probe::KeyMatch;
 use crate::snapshot::{FedGroupSnap, PathSnap, Snapshot};
@@ -127,15 +128,36 @@ pub struct GroupView {
     pub total: u32,
     pub my_ip: Option<u32>,
     pub owner_is_me: bool,
+    /// Отключён от доставки (issue #20): остаётся участником, кадры не ходят.
+    pub detached: bool,
     pub peers: Vec<PeerView>,
 }
 
 #[derive(Clone)]
 pub struct FriendView {
     pub alias: String,
+    /// Ник с сервера (issue #24): показывается, когда ручного алиаса нет.
+    pub nick: String,
+    /// Состояние дружбы (issue #24): локальная запись, заявка, дружба.
+    pub state: crate::store::FriendState,
     pub pubkey: [u8; 32],
     pub online: bool,
     pub shared_groups: usize,
+}
+
+impl FriendView {
+    /// Как показывать друга: алиас → ник → короткий код (issue #24).
+    pub fn display(&self) -> String {
+        crate::friends::display_name(&self.alias, &self.nick, &self.pubkey)
+    }
+
+    /// Маркер состояния для панели друзей (`None` — обычная дружба).
+    pub fn badge(&self) -> Option<&'static str> {
+        match self.state {
+            crate::store::FriendState::Accepted => None,
+            other => Some(crate::friends::state_badge(other)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -186,6 +208,8 @@ pub struct InputPopup {
 pub enum ConfirmAction {
     DeleteGroup(u32),
     LeaveGroup(u32),
+    /// Отключиться от доставки группы / снова подключиться (issue #20).
+    DetachGroup(u32),
     DeleteFriend(String),
 }
 
@@ -200,6 +224,8 @@ pub enum PickMode {
     Invite,
     Kick,
     Ban,
+    /// Добавить участника в друзья (issue #24): заявка, а не локальная запись.
+    AddFriend,
 }
 
 #[derive(Clone)]
@@ -225,8 +251,9 @@ pub struct FriendCardPopup {
     pub loading: bool,
 }
 
-/// Карточка участника: путь доставки, закрепление, реле (этап 9).
-/// Открывается Enter по строке в таблице участников.
+/// Карточка участника (Enter в таблице участников): путь доставки,
+/// закрепление, реле (этап 9) и «a — добавить в друзья» (issue #24).
+#[derive(Clone)]
 pub struct PeerCardPopup {
     pub pubkey: [u8; 32],
 }
@@ -305,6 +332,18 @@ pub enum InviteAnswer {
     Later,
 }
 
+/// Входящая заявка в друзья (issue #24): окно «принять/отклонить».
+/// Устроено как окно приглашения, но проще: сервер держит заявку
+/// `friend_req_ttl`, а «позже» ничего не тратит — окно просто закрывается.
+#[derive(Clone)]
+pub struct FriendReqPopup {
+    pub pubkey: [u8; 32],
+    pub name: String,
+    pub received_at: Instant,
+    /// Когда заявка истекает на сервере (None — неизвестно).
+    pub expires_at: Option<Instant>,
+}
+
 pub enum Popup {
     Help,
     Input(InputPopup),
@@ -319,6 +358,8 @@ pub enum Popup {
     Settings(SettingsPopup),
     Profile,
     Invite(InvitePopup),
+    /// Входящая заявка в друзья (issue #24).
+    FriendReq(FriendReqPopup),
     /// Управление своей группой: баны, приглашения, передача владения.
     Admin(AdminView),
     /// Экран «Серверы»: переключение, добавление/удаление, адаптер.
@@ -329,11 +370,12 @@ pub enum Popup {
 
 /// Кнопки панели действий под шапкой: подпись и клавиша, которую «нажимает»
 /// клик (дальше работает та же логика, что и с клавиатуры).
-pub const TOOLBAR: [(&str, KeyCode, KeyModifiers); 11] = [
+pub const TOOLBAR: [(&str, KeyCode, KeyModifiers); 12] = [
     ("F1 справка", KeyCode::F(1), KeyModifiers::NONE),
     ("F2 создать", KeyCode::F(2), KeyModifiers::NONE),
     ("j войти", KeyCode::Char('j'), KeyModifiers::NONE),
     ("x выйти", KeyCode::Char('x'), KeyModifiers::NONE),
+    ("d отключ.", KeyCode::Char('d'), KeyModifiers::NONE),
     ("i пригласить", KeyCode::Char('i'), KeyModifiers::NONE),
     ("k исключить", KeyCode::Char('k'), KeyModifiers::NONE),
     ("a друг", KeyCode::Char('a'), KeyModifiers::NONE),
@@ -703,6 +745,7 @@ impl App {
                 total: peers.len() as u32 + 1,
                 my_ip: Some(gs.my_ip),
                 owner_is_me: gs.owner == self.my_pub,
+                detached: gs.detached,
                 peers,
             });
         }
@@ -717,6 +760,7 @@ impl App {
                     total: s.total,
                     my_ip: None,
                     owner_is_me: false,
+                    detached: false,
                     peers: Vec::new(),
                 });
             }
@@ -749,12 +793,15 @@ impl App {
                     .count();
                 friends.push(FriendView {
                     alias: f.alias.clone(),
+                    nick: f.nick.clone(),
+                    state: f.state,
                     pubkey: pk,
                     online: known.contains(&pk),
                     shared_groups: shared,
                 });
             }
-            friends.sort_by_key(|a| a.alias.to_lowercase());
+            // Сортировка по тому, что видно: алиас, иначе ник, иначе код.
+            friends.sort_by_key(|a| a.display().to_lowercase());
             self.friends = friends;
             self.my_name = cfg.name.clone();
             self.my_status = cfg.status.clone();
@@ -875,12 +922,14 @@ impl App {
                     self.toast(MsgKind::Error, msg);
                 }
                 E::DirectLost { gid, ip, name } => {
+                    // Автоматика, а не действие пользователя (issue #23):
+                    // прямой канал теряется сам, тост на старте — спам.
                     let msg = format!(
                         "прямой канал с {name} ({}) в {gid} потерян — через релей",
                         proto::ip_str(ip)
                     );
                     self.log(MsgKind::Warn, msg.clone());
-                    self.toast(MsgKind::Warn, msg);
+                    self.status_msg = msg;
                 }
                 E::ServerKeyRotated { addr, new_code } => {
                     let msg = format!("ключ сервера {addr} сменён по цепочке ротации: {new_code}");
@@ -931,15 +980,20 @@ impl App {
                     );
                 }
                 E::PeerOffline { gid, ip, name } => {
+                    // Путь офлайн-участника снимаем сразу: кэш не должен
+                    // расходиться со снимком (issue #18).
+                    self.set_peer_path(ip, None);
                     self.log(
                         MsgKind::Info,
                         format!("{name} ({}) офлайн в {gid}", proto::ip_str(ip)),
                     );
                 }
                 E::Direct { gid, ip, name } => {
+                    // Установка прямого канала — автоматика (issue #23):
+                    // лог и статус, без тоста.
                     let msg = format!("прямой канал с {name} ({}) в {gid}", proto::ip_str(ip));
                     self.log(MsgKind::Ok, msg.clone());
-                    self.toast(MsgKind::Ok, msg);
+                    self.status_msg = msg;
                 }
                 E::Invite {
                     gid,
@@ -1002,6 +1056,54 @@ impl App {
                 // Ответ на чужой запрос из истории — карточку не открываем.
                 E::FriendGroups { .. } if self.replaying => {}
                 E::FriendGroups { pubkey, items } => self.on_friend_groups(pubkey, items),
+                // ---------- друзья (issue #24) ----------
+                //
+                // История демона — только в лог: окно заявки всплывало бы
+                // заново при каждом переподключении TUI.
+                E::FriendRequest {
+                    pubkey,
+                    name,
+                    expires_in,
+                } => {
+                    if self.replaying {
+                        self.log(
+                            MsgKind::Info,
+                            format!("заявка в друзья от {name} ({})", short_code(&pubkey)),
+                        );
+                    } else {
+                        self.stack.push(Popup::FriendReq(FriendReqPopup {
+                            pubkey,
+                            name,
+                            received_at: Instant::now(),
+                            expires_at: (expires_in > 0)
+                                .then(|| Instant::now() + Duration::from_secs(expires_in as u64)),
+                        }));
+                    }
+                }
+                E::FriendAccepted { pubkey, name } => {
+                    let who = self.friend_name(&pubkey).unwrap_or(name);
+                    let msg = format!("{who} принял заявку — теперь вы друзья");
+                    self.log(MsgKind::Ok, msg.clone());
+                    self.toast(MsgKind::Ok, msg);
+                }
+                E::FriendDeclined { pubkey, name } => {
+                    let who = self.friend_name(&pubkey).unwrap_or(name);
+                    let msg = format!("{who} отклонил заявку в друзья");
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.toast(MsgKind::Warn, msg);
+                }
+                E::FriendRemoved { pubkey } => {
+                    let who = self
+                        .friend_name(&pubkey)
+                        .unwrap_or_else(|| short_code(&pubkey));
+                    self.friends.retain(|f| f.pubkey != pubkey);
+                    let msg = format!("{who} снял дружбу");
+                    self.log(MsgKind::Info, msg.clone());
+                    self.toast(MsgKind::Info, msg);
+                }
+                // Состояния уже пришли снимком конфига; неполное окно движок
+                // дочитывает сам (LIST_FRIENDS).
+                E::FriendsSynced { .. } => {}
                 E::ServerPingResult {
                     addr,
                     rtt_ms,
@@ -1065,42 +1167,47 @@ impl App {
                         }
                     }
                 }
-                // Путь доставки выбран или потерян (этап 9): строка в логе,
-                // отметка в статусе и сразу в кэше участников — снимок догонит.
+                // Путь доставки выбран (этап 9): строка в логе, отметка в
+                // статусе и сразу в кэше участников — снимок догонит. Тост не
+                // поднимаем (issue #23): путь меняет автоматика, тост на
+                // каждую смену — спам; тост бывает только на свою команду.
                 E::PathChanged {
                     ip,
                     name,
                     path: kind,
                     rtt_ms,
+                    ..
                 } => {
-                    self.set_peer_path(
-                        ip,
-                        Some(PathSnap {
-                            kind,
-                            rtt_ms: rtt_ms.map(u64::from),
-                        }),
-                    );
+                    let snap = self.path_after_event(ip, kind, rtt_ms);
+                    self.set_peer_path(ip, Some(snap));
                     let msg = format!("путь до {name}: {}", self.path_label(&kind));
                     self.log(MsgKind::Info, msg.clone());
-                    self.status_msg = msg.clone();
-                    // В истории демона — только лог: тосты о давних сменах
-                    // пути всплывали бы пачкой при подключении.
-                    if !self.replaying {
-                        let level = match kind {
-                            PathKind::Direct => MsgKind::Ok,
-                            _ => MsgKind::Warn,
-                        };
-                        self.toast(level, msg);
-                    }
+                    self.status_msg = msg;
                 }
                 E::PathLost { ip, name } => {
                     self.set_peer_path(ip, None);
                     let msg = format!("путь до {name} потерян");
                     self.log(MsgKind::Warn, msg.clone());
                     self.status_msg = msg.clone();
-                    if !self.replaying {
+                    // Тост — только если путь был закреплён вручную: это
+                    // последствие команды пользователя (issue #23).
+                    if self.pinned_paths.contains_key(&path::ip_key(ip)) {
                         self.toast(MsgKind::Warn, msg);
                     }
+                }
+                // Авто-откат пути (issue #26): кэш участника обновляем сразу,
+                // в лог и статус — без тоста (issue #23).
+                E::PathReverted { ip, to, .. } => {
+                    self.set_peer_path(ip, Some(PathSnap::new(to, None)));
+                    // Авто-откат (issue #26) — не тост (issue #23), но в лог и
+                    // статус: пользователь должен видеть, что путь вернули.
+                    let msg = format!(
+                        "путь до {} возвращён: {} (новый оказался хуже)",
+                        proto::ip_str(ip),
+                        self.path_label(&to)
+                    );
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.status_msg = msg;
                 }
                 // Байты релея приходят и в снимке: обновляем счётчик сразу,
                 // чтобы статус-бар не отставал на тик.
@@ -1166,6 +1273,14 @@ impl App {
             .iter()
             .find(|f| f.pubkey == *pk)
             .map(|f| f.alias.clone())
+    }
+
+    /// Имя друга по pubkey для сообщений: алиас → ник → короткий код.
+    pub fn friend_name(&self, pk: &[u8; 32]) -> Option<String> {
+        self.friends
+            .iter()
+            .find(|f| f.pubkey == *pk)
+            .map(|f| f.display())
     }
 
     /// Кто пригласил: алиас друга, иначе имя, которое прислал сервер.
@@ -1252,6 +1367,7 @@ impl App {
             !matches!(
                 p,
                 Popup::Invite(_)
+                    | Popup::FriendReq(_)
                     | Popup::PeerPick(_)
                     | Popup::FriendCard(_)
                     | Popup::Confirm(ConfirmPopup {
@@ -1348,6 +1464,11 @@ impl App {
     /// Вернуть отложенные приглашения в очередь показа («o», `:invites`).
     pub fn reopen_invites(&mut self) {
         if self.later_invites.is_empty() && self.invites.is_empty() {
+            // Заявка в друзья — тоже «неотвеченное»: окно закрывается по Esc,
+            // и без этого принять её было бы нечем (issue #24).
+            if self.reopen_friend_req() {
+                return;
+            }
             self.toast(MsgKind::Info, "нет неотвеченных приглашений".into());
             return;
         }
@@ -1355,6 +1476,25 @@ impl App {
             self.invites.push_front(inv);
         }
         self.pump_invites();
+    }
+
+    /// Открыть окно входящей заявки в друзья, если она ждёт ответа.
+    fn reopen_friend_req(&mut self) -> bool {
+        let Some((pubkey, name)) = self
+            .friends
+            .iter()
+            .find(|f| f.state == crate::store::FriendState::PendingIn)
+            .map(|f| (f.pubkey, f.display()))
+        else {
+            return false;
+        };
+        self.stack.push(Popup::FriendReq(FriendReqPopup {
+            pubkey,
+            name,
+            received_at: Instant::now(),
+            expires_at: None,
+        }));
+        true
     }
 
     /// Клавиша в окне приглашения. Возвращает команду движку (если есть).
@@ -1582,10 +1722,26 @@ impl App {
             KeyCode::Char('b') => self.open_pick(PickMode::Ban),
             KeyCode::Char('j') => self.join_selected(eng),
             KeyCode::Char('x') => self.open_leave_group(),
+            KeyCode::Char('a') if self.focus == Focus::Peers => {
+                // «a» в панели участников — заявка в друзья из списка, без
+                // кода (issue #24); в остальных местах — ввод friend code.
+                self.open_pick(PickMode::AddFriend);
+            }
             KeyCode::Char('a') => self.open_add_friend(),
-            KeyCode::Char('d') => self.open_del_friend(),
+            KeyCode::Char('d') if self.focus == Focus::Friends => self.open_del_friend(),
+            // В группах/участниках `d` — отключиться от доставки, не выходя
+            // из группы (issue #20): второе действие рядом с `x`.
+            KeyCode::Char('d') => self.open_detach_group(),
             KeyCode::Char('c') => self.copy_context(),
-            KeyCode::Char('p') => self.open_profile_or_path(),
+            // «p» — карточка профиля в любом фокусе, «P» — путь до выбранного
+            // участника (issue #22): раньше «p» в панели участников открывала
+            // только путь, и профиль из группы был недоступен.
+            KeyCode::Char('p') => self.stack.push(Popup::Profile),
+            KeyCode::Char('P') => {
+                if let Err(e) = self.open_selected_path() {
+                    self.status_msg = e.to_string();
+                }
+            }
             KeyCode::Char('o') => self.reopen_invites(),
             KeyCode::Char('m') => {
                 if let Some(cmd) = self.open_admin() {
@@ -1929,8 +2085,20 @@ impl App {
         match self.focus {
             Focus::Friends => {
                 if let Some(f) = self.selected_friend() {
-                    let pk = f.pubkey;
-                    let alias = f.alias.clone();
+                    let (pk, alias, state, name) =
+                        (f.pubkey, f.alias.clone(), f.state, f.display());
+                    // Входящая заявка (issue #24): Enter открывает её окно, а
+                    // не карточку — окно приходит только событием, и после Esc
+                    // или рестарта TUI принять заявку было бы нечем.
+                    if state == crate::store::FriendState::PendingIn {
+                        self.stack.push(Popup::FriendReq(FriendReqPopup {
+                            pubkey: pk,
+                            name,
+                            received_at: Instant::now(),
+                            expires_at: None,
+                        }));
+                        return;
+                    }
                     self.stack.push(Popup::FriendCard(FriendCardPopup {
                         alias,
                         pubkey: pk,
@@ -1967,6 +2135,69 @@ impl App {
     }
 
     // ---------- пути доставки (этап 9) ----------
+
+    /// Заявка в друзья из карточки участника (issue #24): себя, уже друзей и
+    /// уже отправленные заявки отсекаем здесь, а не на сервере — иначе
+    /// пользователь видел бы «заявка отправлена» на самого себя.
+    fn add_friend_from_card(&mut self, eng: &dyn EngineApi, card: &PeerCardPopup) {
+        let pk = card.pubkey;
+        let me = self.my_pubkey();
+        if me == Some(pk) {
+            self.toast(MsgKind::Warn, "это вы — себя в друзья не добавить".into());
+            return;
+        }
+        // Что уже известно про этого человека — копией, чтобы не держать
+        // заимствование списка на время `send`.
+        let known = self
+            .friends
+            .iter()
+            .find(|f| f.pubkey == pk)
+            .map(|f| (f.display(), f.state));
+        match known {
+            Some((who, crate::store::FriendState::Accepted)) => {
+                self.toast(MsgKind::Warn, format!("{who} уже в друзьях"));
+                return;
+            }
+            Some((who, crate::store::FriendState::PendingOut)) => {
+                self.toast(
+                    MsgKind::Warn,
+                    format!("заявка {who} уже отправлена — ждём ответа"),
+                );
+                return;
+            }
+            Some((who, crate::store::FriendState::PendingIn)) => {
+                // Встречная заявка: заявка в ответ = автопринятие на сервере,
+                // но понятнее сразу принять.
+                if self.send(eng, Cmd::AcceptFriend(pk)) {
+                    let msg = format!("заявка от {who} принята — теперь вы друзья");
+                    self.log(MsgKind::Ok, msg.clone());
+                    self.toast(MsgKind::Ok, msg);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if self.add_friend(eng, pk, "") {
+            let who = self.peer_name(pk).unwrap_or_else(|| short_code(&pk));
+            let msg = format!("заявка в друзья отправлена: {who}");
+            self.log(MsgKind::Ok, msg.clone());
+            self.toast(MsgKind::Ok, msg);
+        }
+    }
+
+    /// Имя участника по pubkey (из любой группы) — для сообщений.
+    fn peer_name(&self, pk: [u8; 32]) -> Option<String> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.peers.iter())
+            .find(|p| p.pubkey == pk)
+            .map(|p| p.name.clone())
+    }
+
+    /// Свой pubkey (для отсечения «себя» в списках участников).
+    pub fn my_pubkey(&self) -> Option<[u8; 32]> {
+        (self.my_pub != [0u8; 32]).then_some(self.my_pub)
+    }
 
     /// Имя пира по ключу: текущая группа, другие группы, иначе — первые
     /// 6 hex-символов ключа (реле может быть ещё не в списке участников).
@@ -2008,13 +2239,42 @@ impl App {
         }
     }
 
-    /// «p»: в таблице участников — выбор пути до выбранного пира, иначе профиль.
-    fn open_profile_or_path(&mut self) {
-        match self.sel_peer {
-            Some(pk) if self.focus == Focus::Peers && self.selected_peer().is_some() => {
-                self.open_path_pin(pk)
+    /// Путь участника в кэше (таблица участников и группы).
+    fn peer_path(&self, ip: u32) -> Option<&PathSnap> {
+        self.peers
+            .iter()
+            .chain(self.groups.iter().flat_map(|g| g.peers.iter()))
+            .find(|p| p.ip == ip)
+            .and_then(|p| p.path.as_ref())
+    }
+
+    /// Снимок пути из события `PathChanged`. Метрики `jitter`/`loss`/`hist`
+    /// (issue #26) приходят только в снимке: при смене маршрута они устарели и
+    /// сбрасываются, а если путь тот же (обновился только RTT) — сохраняются,
+    /// чтобы спарклайн в карточке не мигал между событием и снимком.
+    fn path_after_event(&self, ip: u32, kind: PathKind, rtt_ms: Option<u32>) -> PathSnap {
+        let mut snap = PathSnap::new(kind, rtt_ms.map(u64::from));
+        if let Some(old) = self.peer_path(ip).filter(|p| p.kind == kind) {
+            snap.leg_ms = old.leg_ms;
+            snap.jitter_ms = old.jitter_ms;
+            snap.loss_pm = old.loss_pm;
+            snap.hist.clone_from(&old.hist);
+        }
+        snap
+    }
+
+    /// «P» и `:path`: окно пути до выбранного участника — в любом фокусе.
+    /// Без выбранного участника окно не открывается: подсказка в статусе
+    /// (а команда ещё и возвращает ошибку).
+    fn open_selected_path(&mut self) -> Result<()> {
+        match self.sel_peer.filter(|_| self.selected_peer().is_some()) {
+            Some(pk) => {
+                self.open_path_pin(pk);
+                Ok(())
             }
-            _ => self.stack.push(Popup::Profile),
+            None => Err(anyhow!(
+                "не выбран участник: путь — Shift+P в панели участников"
+            )),
         }
     }
 
@@ -2049,11 +2309,15 @@ impl App {
     }
 
     /// Закрепить путь до `ip`; закрепление запоминаем сразу — снимок догонит.
+    /// Тост — потому что это действие пользователя (issue #23): автосмена
+    /// пути идёт только в лог/статус.
     fn pin_path(&mut self, eng: &dyn EngineApi, ip: u32, kind: PathKind) {
         let what = self.path_label(&kind);
         if self.send(eng, Cmd::PinPath { ip, path: kind }) {
             self.pinned_paths.insert(path::ip_key(ip), kind.to_config());
-            self.status_msg = format!("путь закреплён: {what}");
+            let msg = format!("путь закреплён: {what}");
+            self.status_msg = msg.clone();
+            self.toast(MsgKind::Ok, msg);
         }
     }
 
@@ -2061,7 +2325,9 @@ impl App {
     fn unpin_path(&mut self, eng: &dyn EngineApi, ip: u32) {
         if self.send(eng, Cmd::UnpinPath { ip }) {
             self.pinned_paths.remove(&path::ip_key(ip));
-            self.status_msg = "путь снова автоматический".into();
+            let msg = "путь снова автоматический".to_string();
+            self.status_msg = msg.clone();
+            self.toast(MsgKind::Ok, msg);
         }
     }
 
@@ -2136,11 +2402,28 @@ impl App {
                             }
                             PickMode::Kick => {
                                 self.send(eng, Cmd::Kick(p.gid, item.pubkey));
-                                self.toast(MsgKind::Warn, format!("исключён: {}", item.label));
+                                // Результат решает сервер (права, лимиты):
+                                // тост «исключён» до его ответа был бы ложью
+                                // (issue #19). Только нейтральная запись.
+                                let msg = format!("запрос на исключение отправлен: {}", item.label);
+                                self.log(MsgKind::Info, msg.clone());
+                                self.status_msg = msg;
                             }
                             PickMode::Ban => {
                                 self.send(eng, Cmd::Ban(p.gid, item.pubkey));
-                                self.toast(MsgKind::Warn, format!("забанен: {}", item.label));
+                                let msg = format!("запрос на бан отправлен: {}", item.label);
+                                self.log(MsgKind::Info, msg.clone());
+                                self.status_msg = msg;
+                            }
+                            // Заявка в друзья, а не локальная запись: вторая
+                            // сторона узнает о ней от сервера.
+                            PickMode::AddFriend => {
+                                if self.add_friend(eng, item.pubkey, "") {
+                                    self.toast(
+                                        MsgKind::Ok,
+                                        format!("заявка в друзья отправлена: {}", item.label),
+                                    );
+                                }
                             }
                         }
                     }
@@ -2157,13 +2440,40 @@ impl App {
                 }
             }
             Popup::PeerCard(card) => {
-                // «p» из карточки — тоже выбор пути (Esc вернёт карточку).
-                if let KeyCode::Char('p') = key.code {
+                // «P» из карточки — тоже выбор пути (Esc вернёт карточку):
+                // «p» везде означает профиль (issue #22).
+                if let KeyCode::Char('P') = key.code {
                     let pubkey = card.pubkey;
                     self.stack.push(Popup::PeerCard(card));
                     self.open_path_pin(pubkey);
+                } else if let KeyCode::Char('a') = key.code {
+                    // «a» — заявка в друзья прямо из карточки участника
+                    // (issue #24): код друга вручную набирать не нужно.
+                    self.stack.push(Popup::PeerCard(card.clone()));
+                    self.add_friend_from_card(eng, &card);
                 }
             }
+            // Окно заявки в друзья (issue #24): Enter/y — принять,
+            // n/т — отклонить, Esc — закрыть (заявка останется на сервере до
+            // истечения срока).
+            Popup::FriendReq(req) => match key.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    if self.send(eng, Cmd::AcceptFriend(req.pubkey)) {
+                        let msg = format!("заявка от {} принята — теперь вы друзья", req.name);
+                        self.log(MsgKind::Ok, msg.clone());
+                        self.toast(MsgKind::Ok, msg);
+                    }
+                }
+                KeyCode::Char('n' | 'N' | 'т' | 'Т') => {
+                    if self.send(eng, Cmd::DeclineFriend(req.pubkey)) {
+                        let msg = format!("заявка от {} отклонена", req.name);
+                        self.log(MsgKind::Info, msg.clone());
+                        self.toast(MsgKind::Info, msg);
+                    }
+                }
+                KeyCode::Esc => {}
+                _ => self.stack.push(Popup::FriendReq(req)),
+            },
             Popup::PathPin(p) => match key.code {
                 // «0 авто» — снять закрепление, путь снова выбирает движок.
                 KeyCode::Char('0') => self.unpin_path(eng, p.ip),
@@ -2317,11 +2627,9 @@ impl App {
             InputAction::AddFriend => {
                 let mut it = value.splitn(2, char::is_whitespace);
                 let code = it.next().unwrap_or("").trim().to_string();
-                let alias = it
-                    .next()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| code.clone());
+                // Алиас — только если задан руками: код в роли имени занимал
+                // бы всю строку списка и скрывал ник (issue #24).
+                let alias = it.next().map(|s| s.trim().to_string()).unwrap_or_default();
                 match proto::Identity::parse_friend_code(&code) {
                     Ok(pk) => {
                         if self.friends.iter().any(|f| f.pubkey == pk) {
@@ -2329,7 +2637,13 @@ impl App {
                             return;
                         }
                         if self.add_friend(eng, pk, &alias) {
-                            self.toast(MsgKind::Ok, format!("друг добавлен: {alias}"));
+                            // Это заявка, а не дружба (issue #24).
+                            let who = if alias.is_empty() {
+                                short_code(&pk)
+                            } else {
+                                alias
+                            };
+                            self.toast(MsgKind::Ok, format!("заявка отправлена: {who}"));
                         }
                     }
                     Err(e) => {
@@ -2365,6 +2679,31 @@ impl App {
             ConfirmAction::LeaveGroup(gid) => {
                 self.send(eng, Cmd::Leave(gid));
                 self.toast(MsgKind::Info, format!("выходим из {gid}"));
+            }
+            // Отключение — локальное действие, но подтверждение сервера не
+            // гарантировано (старый сервер тип не знает): сообщение
+            // нейтральное, результат покажет колонка группы и статус.
+            ConfirmAction::DetachGroup(gid) => {
+                let off = self
+                    .groups
+                    .iter()
+                    .find(|g| g.gid == gid)
+                    .is_some_and(|g| !g.detached);
+                self.send(
+                    eng,
+                    if off {
+                        Cmd::Detach(gid)
+                    } else {
+                        Cmd::Attach(gid)
+                    },
+                );
+                let msg = if off {
+                    format!("отключение от {gid} отправлено: участие сохраняется")
+                } else {
+                    format!("подключение к {gid} отправлено")
+                };
+                self.log(MsgKind::Info, msg.clone());
+                self.status_msg = msg;
             }
             ConfirmAction::DeleteFriend(alias) => match self.del_friend(eng, &alias) {
                 Ok(true) => self.toast(MsgKind::Ok, format!("друг {alias} удалён")),
@@ -2435,6 +2774,35 @@ impl App {
         }
     }
 
+    /// Отключиться от доставки группы / подключиться (issue #20). Подтверждение
+    /// по образцу выхода: это заметное действие, но участие сохраняется.
+    fn open_detach_group(&mut self) {
+        match self.selected_group() {
+            Some(g) if g.mine => {
+                let gid = g.gid;
+                let name = g.name.clone();
+                let off = !g.detached;
+                self.stack.push(Popup::Confirm(ConfirmPopup {
+                    title: if off {
+                        "Отключиться от группы?".into()
+                    } else {
+                        "Подключиться к группе?".into()
+                    },
+                    message: if off {
+                        format!(
+                            "группа {gid} «{name}»: останетесь участником, но кадры не будут ходить"
+                        )
+                    } else {
+                        format!("группа {gid} «{name}»: доставка снова включится")
+                    },
+                    action: ConfirmAction::DetachGroup(gid),
+                }));
+            }
+            Some(_) => self.toast(MsgKind::Warn, "вы не состоите в группе".into()),
+            None => self.toast(MsgKind::Warn, "не выбрана группа".into()),
+        }
+    }
+
     fn open_add_friend(&mut self) {
         self.stack.push(Popup::Input(InputPopup {
             title: "Добавить друга".into(),
@@ -2459,6 +2827,19 @@ impl App {
         }
     }
 
+    /// UX-предпроверка прав владельца (issue #19): сервер остаётся
+    /// единственным авторитетом, но если группа есть в снимке и мы не её
+    /// владелец — команду не отправляем. Группы нет в снимке — решает сервер.
+    fn deny_not_owner(&mut self, gid: u32) -> bool {
+        match self.groups.iter().find(|g| g.gid == gid) {
+            Some(g) if !g.owner_is_me => {
+                self.toast(MsgKind::Warn, "исключить может только владелец".into());
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn open_pick(&mut self, mode: PickMode) {
         let gid = match self.selected_group() {
             Some(g) => g.gid,
@@ -2467,6 +2848,11 @@ impl App {
                 return;
             }
         };
+        // Выбор участника для кика/бана открываем только владельцу (issue #19):
+        // иначе сервер откажет уже после отправки, а окно выбора обманывало.
+        if matches!(mode, PickMode::Kick | PickMode::Ban) && self.deny_not_owner(gid) {
+            return;
+        }
         let mut items: Vec<PeerChoice> = Vec::new();
         match mode {
             PickMode::Invite => {
@@ -2510,6 +2896,36 @@ impl App {
                     }
                 }
             }
+            // Добавление в друзья из списка участников (issue #24): себя, уже
+            // друзей и уже отправленные заявки не показываем вовсе.
+            PickMode::AddFriend => {
+                let me = self.my_pubkey();
+                if let Some(g) = self.groups.iter().find(|g| g.gid == gid) {
+                    for p in g.peers.iter() {
+                        if Some(p.pubkey) == me {
+                            continue;
+                        }
+                        match self.friends.iter().find(|f| f.pubkey == p.pubkey) {
+                            Some(f)
+                                if matches!(
+                                    f.state,
+                                    crate::store::FriendState::Accepted
+                                        | crate::store::FriendState::PendingOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        items.push(PeerChoice {
+                            pubkey: p.pubkey,
+                            label: p.name.clone(),
+                            sub: proto::ip_str(p.ip),
+                            online: p.online,
+                        });
+                    }
+                }
+            }
         }
         if items.is_empty() {
             self.toast(MsgKind::Warn, "некого выбирать".into());
@@ -2519,6 +2935,7 @@ impl App {
             PickMode::Invite => format!("Пригласить в группу {gid}"),
             PickMode::Kick => format!("Исключить из группы {gid}"),
             PickMode::Ban => format!("Забанить в группе {gid}"),
+            PickMode::AddFriend => format!("Добавить в друзья из группы {gid}"),
         };
         self.stack.push(Popup::PeerPick(PeerPickPopup {
             gid,
@@ -2626,8 +3043,9 @@ impl App {
         Ok(())
     }
 
-    /// Друг в конфиг движка (`Cmd::AddFriend`); в своём списке — сразу.
-    /// Отказ — тост, `false`.
+    /// Заявка в друзья (`Cmd::AddFriend`, issue #24): вторая сторона узнает о
+    /// ней от сервера, поэтому локально сразу «ждёт ответа», а не «друг».
+    /// Отказ (нет связи, движка) — тост, `false`.
     fn add_friend(&mut self, eng: &dyn EngineApi, pk: [u8; 32], alias: &str) -> bool {
         if !self.send(
             eng,
@@ -2638,24 +3056,36 @@ impl App {
         ) {
             return false;
         }
-        if !self.friends.iter().any(|f| f.pubkey == pk) {
-            self.friends.push(FriendView {
+        match self.friends.iter_mut().find(|f| f.pubkey == pk) {
+            Some(f) => {
+                if !alias.is_empty() {
+                    f.alias = alias.to_string();
+                }
+                if f.state != crate::store::FriendState::Accepted {
+                    f.state = crate::store::FriendState::PendingOut;
+                }
+            }
+            None => self.friends.push(FriendView {
                 alias: alias.to_string(),
+                nick: String::new(),
+                state: crate::store::FriendState::PendingOut,
                 pubkey: pk,
                 online: false,
                 shared_groups: 0,
-            });
+            }),
         }
+        self.friends.sort_by_key(|a| a.display().to_lowercase());
         true
     }
 
-    /// Удалить друзей с алиасом `alias` (`Cmd::DelFriend`). `Err` — такого
-    /// нет; `Ok(false)` — движок отказал (тост уже показан).
+    /// Удалить друзей с именем `alias` (`Cmd::DelFriend`). Сравниваем и с
+    /// алиасом, и с отображаемым именем: у друга без алиаса в списке стоит ник
+    /// или код. `Err` — такого нет; `Ok(false)` — движок отказал.
     fn del_friend(&mut self, eng: &dyn EngineApi, alias: &str) -> Result<bool> {
         let pks: Vec<[u8; 32]> = self
             .friends
             .iter()
-            .filter(|f| f.alias == alias)
+            .filter(|f| f.alias == alias || f.display() == alias)
             .map(|f| f.pubkey)
             .collect();
         if pks.is_empty() {
@@ -2696,6 +3126,7 @@ impl App {
                 .map(|f| StoredFriend {
                     pubkey: proto::hex_of(&f.pubkey),
                     alias: f.alias.clone(),
+                    ..Default::default()
                 })
                 .collect(),
             autojoin: self.autojoin.clone(),
@@ -3200,6 +3631,20 @@ impl App {
             Command::Leave(gid) => {
                 self.send(eng, Cmd::Leave(gid));
             }
+            // Второе действие рядом с выходом (issue #20): остаться участником,
+            // но разорвать доставку.
+            Command::Detach(gid) => {
+                self.send(eng, Cmd::Detach(gid));
+                let msg = format!("отключение от {gid} отправлено: участие сохраняется");
+                self.log(MsgKind::Info, msg.clone());
+                self.status_msg = msg;
+            }
+            Command::Attach(gid) => {
+                self.send(eng, Cmd::Attach(gid));
+                let msg = format!("подключение к {gid} отправлено");
+                self.log(MsgKind::Info, msg.clone());
+                self.status_msg = msg;
+            }
             Command::Create { name, private } => {
                 self.send(eng, Cmd::Create { name, private });
             }
@@ -3214,10 +3659,18 @@ impl App {
                 self.send(eng, Cmd::Invite(gid, pk));
             }
             Command::Kick(gid, peer) => {
+                // Предпроверка прав (issue #19): группу знаем и она не наша —
+                // команду не отправляем, сервер всё равно отказал бы.
+                if self.deny_not_owner(gid) {
+                    return Ok(());
+                }
                 let pk = self.resolve_peer(&peer)?;
                 self.send(eng, Cmd::Kick(gid, pk));
             }
             Command::Ban(gid, peer) => {
+                if self.deny_not_owner(gid) {
+                    return Ok(());
+                }
                 let pk = self.resolve_peer(&peer)?;
                 self.send(eng, Cmd::Ban(gid, pk));
             }
@@ -3237,6 +3690,8 @@ impl App {
                 self.send(eng, cmd);
             }
             Command::Servers => self.open_servers(),
+            // Путь до выбранного участника без Shift (issue #22).
+            Command::Path => self.open_selected_path()?,
             Command::Invisible(on) => {
                 self.send(eng, Cmd::SetInvisible(on));
                 self.invisible = on;
@@ -3328,6 +3783,9 @@ pub enum Command {
     /// Показать отложенные приглашения.
     Invites,
     Leave(u32),
+    /// Отключиться от доставки группы / снова подключиться (issue #20).
+    Detach(u32),
+    Attach(u32),
     Create {
         name: String,
         private: bool,
@@ -3343,6 +3801,9 @@ pub enum Command {
     Admin(Option<u32>),
     /// Экран «Серверы».
     Servers,
+    /// Окно пути до выбранного участника: `:path` / `:путь` (issue #22) —
+    /// тот же выбор, что Shift+P, но без модификатора.
+    Path,
     /// Вход в федерированную группу (`:joinfed <uuid-hex|gid>`).
     JoinFed(String),
     Invisible(bool),
@@ -3388,6 +3849,9 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "decline" => Command::Decline(gid_of(0)?),
         "invites" => Command::Invites,
         "leave" => Command::Leave(gid_of(0)?),
+        // Отключиться/подключиться, оставаясь участником (issue #20).
+        "detach" => Command::Detach(gid_of(0)?),
+        "attach" => Command::Attach(gid_of(0)?),
         "create" => {
             let private = rest.contains(&"--private");
             let name = rest
@@ -3446,6 +3910,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
             Some(gid_of(0)?)
         }),
         "servers" => Command::Servers,
+        "path" | "путь" => Command::Path,
         "invisible" => {
             Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
                 Some("on") => true,
@@ -3463,10 +3928,9 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .first()
                 .ok_or_else(|| anyhow!("нужен friend code"))?
                 .to_string();
-            let alias = rest
-                .get(1)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| code.clone());
+            // Без имени — не подставляем код: в панели друзей покажется ник с
+            // сервера, а код в имени скрывал бы его (issue #24).
+            let alias = rest.get(1).map(|s| s.to_string()).unwrap_or_default();
             Command::AddFriend { code, alias }
         }
         "delfriend" => Command::DelFriend(
@@ -3612,13 +4076,46 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    fn app() -> App {
+    pub(super) fn app() -> App {
         let cfg = Config {
             name: "alpha".into(),
             status: "тест".into(),
             ..Config::default()
         };
         App::new([7; 32], "TUN-TEST-CODE", &cfg)
+    }
+
+    /// Участник `pk` с именем `name` в группе 1.
+    pub(super) fn peer(pk: [u8; 32], name: &str) -> PeerView {
+        PeerView {
+            pubkey: pk,
+            name: name.into(),
+            ip: 0x6442_0000 + pk[0] as u32,
+            online: true,
+            direct: false,
+            rtt_ms: Some(10),
+            status: String::new(),
+            path: None,
+        }
+    }
+
+    /// App с группой 1 и участниками `peers`.
+    pub(super) fn with_peers(peers: Vec<PeerView>) -> App {
+        let mut a = online();
+        a.groups = vec![GroupView {
+            gid: 1,
+            name: "gamers".into(),
+            private: false,
+            mine: true,
+            online: peers.len() as u32,
+            total: peers.len() as u32 + 1,
+            my_ip: Some(0x6442_0007),
+            owner_is_me: true,
+            detached: false,
+            peers,
+        }];
+        a.sel_group = Some(1);
+        a
     }
 
     #[test]
@@ -3673,6 +4170,7 @@ mod tests {
                 total: 3,
                 my_ip: Some(0x6442_0002),
                 owner_is_me: true,
+                detached: false,
                 peers: vec![],
             },
             GroupView {
@@ -3684,11 +4182,14 @@ mod tests {
                 total: 1,
                 my_ip: None,
                 owner_is_me: false,
+                detached: false,
                 peers: vec![],
             },
         ];
         a.friends = vec![FriendView {
             alias: "bravo".into(),
+            nick: String::new(),
+            state: store::FriendState::Accepted,
             pubkey: [1; 32],
             online: true,
             shared_groups: 1,
@@ -3738,7 +4239,7 @@ mod tests {
     }
 
     /// Онлайн-приложение с выключенной защитой от случайного нажатия.
-    fn online() -> App {
+    pub(super) fn online() -> App {
         let mut a = app();
         a.connected = true;
         a
@@ -4165,6 +4666,8 @@ mod tests {
         assert_eq!(a.invite_from_label(&inv(1)), "bravo-srv");
         a.friends = vec![FriendView {
             alias: "Боря".into(),
+            nick: String::new(),
+            state: store::FriendState::Accepted,
             pubkey: [2; 32],
             online: true,
             shared_groups: 0,
@@ -4193,6 +4696,7 @@ mod tests {
                 total: 2,
                 my_ip: Some(0x6442_0102),
                 owner_is_me: true,
+                detached: false,
                 peers: vec![PeerView {
                     pubkey: [2; 32],
                     name: "bravo".into(),
@@ -4213,6 +4717,7 @@ mod tests {
                 total: 2,
                 my_ip: Some(0x6442_0202),
                 owner_is_me: false,
+                detached: false,
                 peers: vec![],
             },
         ];
@@ -4300,6 +4805,147 @@ mod tests {
         assert!(admin_view(&a).bans.is_empty());
         assert!(a.admin_key(key(KeyCode::Esc)).is_empty());
         assert!(a.stack.is_empty());
+    }
+
+    // ---------- issue #19: кик/бан не подтверждаются локально ----------
+
+    /// Тост успеха до ответа сервера — ложь: после отправки кика его нет,
+    /// есть нейтральная запись «запрос отправлен».
+    #[test]
+    fn кик_не_подтверждается_локально_до_ответа() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = owner_app();
+        a.connected = true;
+        a.handle_key(key(KeyCode::Char('k')), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::PeerPick(_))));
+        a.handle_key(key(KeyCode::Enter), &eng);
+        assert!(
+            matches!(eng.sent()[..], [Cmd::Kick(1, pk)] if pk == [2; 32]),
+            "{:?}",
+            eng.sent()
+        );
+        let texts: Vec<&str> = a.toasts.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("исключён")),
+            "оптимистичный тост успеха: {texts:?}"
+        );
+        assert!(
+            !a.log.iter().any(|l| l.text.contains("исключён")),
+            "успех кика записан в лог до ответа сервера"
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("запрос на исключение отправлен")),
+            "нет нейтральной записи о запросе"
+        );
+        assert!(a.status_msg.contains("запрос на исключение"));
+    }
+
+    /// Не-владельцу выбор участника для кика не открывается и команда не
+    /// уходит (сервер остаётся авторитетом — группу он всё равно проверит).
+    #[test]
+    fn не_владелец_не_открывает_выбор_для_кика() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = owner_app();
+        a.sel_group = Some(2); // группа есть в снимке, но не наша
+        a.handle_key(key(KeyCode::Char('k')), &eng);
+        assert!(
+            !matches!(a.stack.last(), Some(Popup::PeerPick(_))),
+            "выбор участника открыт не владельцу"
+        );
+        assert!(a.toasts.iter().any(|t| t.text.contains("только владелец")));
+        assert!(eng.sent().is_empty(), "команда ушла: {:?}", eng.sent());
+        // Палитра — та же предпроверка (peer даже не разбирается).
+        a.toasts.clear();
+        a.run_command("kick 2 deadbeef", &eng).unwrap();
+        assert!(a.toasts.iter().any(|t| t.text.contains("только владелец")));
+        assert!(
+            eng.sent().is_empty(),
+            "палитра отправила кик: {:?}",
+            eng.sent()
+        );
+        // Группы нет в снимке — решает сервер, команда уходит.
+        let hex = "11".repeat(32);
+        a.run_command(&format!("kick 9 {hex}"), &eng).unwrap();
+        assert!(
+            matches!(eng.sent().last(), Some(Cmd::Kick(9, pk)) if *pk == [0x11; 32]),
+            "серверу не отдан кик неизвестной группы: {:?}",
+            eng.sent()
+        );
+    }
+
+    /// Ошибка сервера на кик — единственный результат: тоста успеха нет.
+    #[test]
+    fn ошибка_сервера_на_кик_без_успеха() {
+        let eng = FakeEngine::new(Snapshot::default());
+        eng.push(Event::Error("может только владелец".into()));
+        let mut a = owner_app();
+        a.connected = true;
+        a.sync(&eng);
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.kind == MsgKind::Error && t.text.contains("владелец")),
+            "ошибка сервера не показана"
+        );
+        assert!(
+            !a.toasts.iter().any(|t| t.text.contains("исключён")),
+            "рядом с ошибкой — успех"
+        );
+        assert!(!a.log.iter().any(|l| l.text.contains("исключён")));
+    }
+
+    /// В группе доступны оба действия: «x» — выйти, «d» — отключиться от
+    /// доставки, оставаясь участником (issue #20).
+    #[test]
+    fn в_приватной_группе_есть_выйти_и_отключиться() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = owner_app();
+        a.connected = true;
+        a.groups[0].private = true;
+        // «x» — выход (прежнее действие).
+        a.handle_key(key(KeyCode::Char('x')), &eng);
+        assert!(
+            matches!(a.stack.last(), Some(Popup::Confirm(c)) if matches!(c.action, ConfirmAction::LeaveGroup(1))),
+            "x не открывает выход"
+        );
+        a.stack.clear();
+        // «d» в группе — отключение, подтверждение шлёт Cmd::Detach.
+        a.handle_key(key(KeyCode::Char('d')), &eng);
+        assert!(
+            matches!(a.stack.last(), Some(Popup::Confirm(c)) if matches!(c.action, ConfirmAction::DetachGroup(1))),
+            "d не открывает отключение"
+        );
+        a.handle_key(key(KeyCode::Char('y')), &eng);
+        assert!(
+            matches!(eng.sent()[..], [Cmd::Detach(1)]),
+            "{:?}",
+            eng.sent()
+        );
+        assert!(
+            !a.toasts.iter().any(|t| t.text.contains("отключено")),
+            "отключение подтверждено локально до сервера"
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("отключение от 1 отправлено"))
+        );
+        // Кнопка панели действий и командная строка знают оба действия.
+        assert!(TOOLBAR.iter().any(|(l, ..)| l.contains("отключ")));
+        assert_eq!(parse_command("detach 3").unwrap(), Command::Detach(3));
+        assert_eq!(parse_command("attach 3").unwrap(), Command::Attach(3));
+        a.stack.clear();
+        a.run_command("attach 1", &eng).unwrap();
+        assert!(matches!(eng.sent().last(), Some(Cmd::Attach(1))));
+        // В друзьях «d» по-прежнему удаляет друга, а не отключает группу.
+        a.focus = Focus::Friends;
+        a.handle_key(key(KeyCode::Char('d')), &eng);
+        assert!(
+            !matches!(a.stack.last(), Some(Popup::Confirm(c)) if matches!(c.action, ConfirmAction::DetachGroup(_))),
+            "d в друзьях открыл отключение группы"
+        );
     }
 
     #[test]
@@ -4498,10 +5144,12 @@ mod tests {
                 StoredFriend {
                     pubkey: proto::hex_of(&[2; 32]),
                     alias: "bob".into(),
+                    ..Default::default()
                 },
                 StoredFriend {
                     pubkey: proto::hex_of(&[3; 32]),
                     alias: "eve".into(),
+                    ..Default::default()
                 },
             ],
             ..Config::default()
@@ -4543,6 +5191,13 @@ mod tests {
         assert!(matches!(a.stack.last(), Some(Popup::Profile)));
         a.handle_key(key(KeyCode::Esc), &eng);
         assert!(a.stack.is_empty());
+        // «З» = Shift+P — окно пути до выбранного участника (issue #22).
+        let mut paths = path_app();
+        paths.handle_key(ch('З'), &eng);
+        assert!(
+            matches!(paths.stack.last(), Some(Popup::PathPin(_))),
+            "«З» не открыла окно пути"
+        );
         // «Ж» = «:» — командная строка; в ней кириллица остаётся кириллицей.
         a.handle_key(ch('Ж'), &eng);
         a.handle_key(ch('ы'), &eng);
@@ -4700,15 +5355,17 @@ mod tests {
     // ---------- проба серверов (этап 9, §3.7) ----------
 
     /// Движок-заглушка: события кладём руками, команды TUI — в `sent`.
-    struct FakeEngine {
+    pub(super) struct FakeEngine {
         snap: Mutex<Snapshot>,
         events: Mutex<VecDeque<Event>>,
         sent: Mutex<Vec<Cmd>>,
         me: crate::api::Me,
+        /// Движка нет (офлайн-TUI): сетевые команды отвергаются.
+        offline: bool,
     }
 
     impl FakeEngine {
-        fn new(snap: Snapshot) -> Self {
+        pub(super) fn new(snap: Snapshot) -> Self {
             FakeEngine {
                 snap: Mutex::new(snap),
                 events: Mutex::new(VecDeque::new()),
@@ -4717,6 +5374,16 @@ mod tests {
                     my_pub: [7; 32],
                     my_code: "TUN-TEST".into(),
                 },
+                offline: false,
+            }
+        }
+
+        /// Офлайн-фронтенд без движка: `send` отвечает ошибкой, как
+        /// `offline::OfflineEngine` для сетевых команд (issue #24).
+        pub(super) fn offline() -> Self {
+            FakeEngine {
+                offline: true,
+                ..FakeEngine::new(Snapshot::default())
             }
         }
 
@@ -4724,7 +5391,7 @@ mod tests {
             self.events.lock().unwrap().push_back(ev);
         }
 
-        fn sent(&self) -> Vec<Cmd> {
+        pub(super) fn sent(&self) -> Vec<Cmd> {
             self.sent.lock().unwrap().clone()
         }
     }
@@ -4737,6 +5404,9 @@ mod tests {
             self.events.lock().unwrap().drain(..).collect()
         }
         fn send(&self, cmd: Cmd) -> anyhow::Result<()> {
+            if self.offline {
+                anyhow::bail!("нужен запущенный движок: команда не отправлена");
+            }
             self.sent.lock().unwrap().push(cmd);
             Ok(())
         }
@@ -4901,10 +5571,7 @@ mod tests {
             direct: true,
             rtt_ms: Some(7),
             status: "ok".into(),
-            path: Some(PathSnap {
-                kind: PathKind::Direct,
-                rtt_ms: Some(7),
-            }),
+            path: Some(PathSnap::new(PathKind::Direct, Some(7))),
         };
         let mut a = app();
         a.groups = vec![GroupView {
@@ -4916,6 +5583,7 @@ mod tests {
             total: 2,
             my_ip: Some(0x6442_0102),
             owner_is_me: true,
+            detached: false,
             peers: vec![peer.clone()],
         }];
         a.sel_group = Some(1);
@@ -4925,12 +5593,14 @@ mod tests {
         a
     }
 
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
     #[test]
-    fn путь_окно_по_p_и_закрепление_сервера() {
+    fn путь_окно_по_P_и_закрепление_сервера() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
-        // «p» при фокусе на участниках — окно пути, а не профиль.
-        a.handle_key(ch('p'), &eng);
+        // «P» — окно пути, а не профиль (issue #22).
+        a.handle_key(ch('P'), &eng);
         match a.stack.last() {
             Some(Popup::PathPin(p)) => {
                 assert_eq!(p.name, "bravo");
@@ -4957,12 +5627,14 @@ mod tests {
         );
     }
 
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
     #[test]
-    fn путь_окно_ноль_снимает_закрепление() {
+    fn путь_окно_ноль_снимает_закрепление_по_P() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
         a.pinned_paths.insert("100.66.1.3".into(), "server".into());
-        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('P'), &eng);
         assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
         a.handle_key(ch('0'), &eng);
         assert!(a.stack.is_empty(), "окно не закрылось");
@@ -4973,8 +5645,10 @@ mod tests {
         assert!(a.pinned_paths.is_empty(), "закрепление осталось в кэше");
     }
 
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
     #[test]
-    fn путь_окно_реле_шлёт_peerrelay() {
+    fn путь_окно_реле_шлёт_peerrelay_по_P() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
         // Второй участник группы — кандидат в реле для bravo.
@@ -4984,7 +5658,7 @@ mod tests {
         relay_peer.ip = 0x6442_0104;
         a.peers.push(relay_peer);
         a.groups[0].peers = a.peers.clone();
-        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('P'), &eng);
         let Some(Popup::PathPin(p)) = a.stack.last() else {
             panic!("нет окна выбора пути");
         };
@@ -5004,10 +5678,10 @@ mod tests {
     }
 
     #[test]
-    fn путь_окно_без_реле_не_шлёт_и_профиль_не_сломан() {
+    fn путь_окно_без_реле_не_шлёт_и_p_открывает_профиль() {
         let eng = FakeEngine::new(Snapshot::default());
         let mut a = path_app();
-        a.handle_key(ch('p'), &eng);
+        a.handle_key(ch('P'), &eng);
         a.handle_key(ch('3'), &eng);
         assert!(
             eng.sent().is_empty(),
@@ -5023,16 +5697,194 @@ mod tests {
         assert!(a.stack.is_empty(), "Esc не закрыл окно");
         assert!(eng.sent().is_empty(), "Esc ничего не шлёт");
 
-        // Фокус не на участниках — «p» по-прежнему открывает профиль.
-        a.focus = Focus::Groups;
-        a.handle_key(ch('p'), &eng);
-        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
-        a.stack.clear();
-        // Участники, но никто не выбран — тоже профиль.
-        a.focus = Focus::Peers;
+        // «p» теперь профиль в любом фокусе, в том числе на участниках.
+        for focus in [Focus::Groups, Focus::Peers] {
+            a.focus = focus;
+            a.stack.clear();
+            a.handle_key(ch('p'), &eng);
+            assert!(matches!(a.stack.last(), Some(Popup::Profile)), "{focus:?}");
+        }
+    }
+
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
+    #[test]
+    fn p_профиль_и_P_путь_во_всех_фокусах() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        for focus in [Focus::Groups, Focus::Friends, Focus::Peers, Focus::Log] {
+            a.focus = focus;
+            a.stack.clear();
+            // «p» — карточка профиля (issue #22: раньше в участниках это был
+            // только путь, и профиль из группы был недоступен).
+            a.handle_key(ch('p'), &eng);
+            assert!(
+                matches!(a.stack.last(), Some(Popup::Profile)),
+                "{focus:?}: «p» не профиль"
+            );
+            a.stack.clear();
+            // «P» — путь до выбранного участника, тоже в любом фокусе.
+            a.handle_key(ch('P'), &eng);
+            match a.stack.last() {
+                Some(Popup::PathPin(p)) => assert_eq!(p.pubkey, [2; 32]),
+                _ => panic!("{focus:?}: «P» не открыл окно пути"),
+            }
+        }
+    }
+
+    // «P» в имени — клавиша Shift+P (issue #22), а не нарушение snake_case.
+    #[allow(non_snake_case)]
+    #[test]
+    fn P_без_выбранного_участника_пишет_в_статус() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
         a.sel_peer = None;
-        a.handle_key(ch('p'), &eng);
-        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
+        a.handle_key(ch('P'), &eng);
+        assert!(a.stack.is_empty(), "окно пути открылось без участника");
+        assert!(
+            a.status_msg.contains("не выбран участник"),
+            "нет подсказки в статусе: {:?}",
+            a.status_msg
+        );
+        // Команда `:path` — тот же выбор: без участника ошибка, с участником
+        // окно (это снимает возражение про регистр как модификатор).
+        assert!(a.run_command("path", &eng).is_err());
+        assert!(a.stack.is_empty());
+        a.sel_peer = Some([2; 32]);
+        a.run_command("path", &eng).unwrap();
+        assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
+        // Кириллическое имя команды — тоже.
+        a.stack.clear();
+        a.run_command("путь", &eng).unwrap();
+        assert!(matches!(a.stack.last(), Some(Popup::PathPin(_))));
+    }
+
+    #[test]
+    fn смена_пути_не_поднимает_тост() {
+        let mut a = path_app();
+        a.toasts.clear();
+        a.apply_events(
+            vec![Event::PathChanged {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+                path: PathKind::Server,
+                rtt_ms: Some(48),
+                manual: false,
+            }],
+            &Snapshot::default(),
+        );
+        assert!(
+            a.toasts.is_empty(),
+            "смена пути подняла тост: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // Лог и статус на месте: смена видна, но не всплывает.
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("путь до bravo: сервер"))
+        );
+        assert_eq!(a.status_msg, "путь до bravo: сервер");
+        // Потеря незакреплённого пути — тоже без тоста (issue #23).
+        a.apply_events(
+            vec![Event::PathLost {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+            }],
+            &Snapshot::default(),
+        );
+        assert!(a.toasts.is_empty(), "потеря пути подняла тост");
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("путь до bravo потерян"))
+        );
+    }
+
+    #[test]
+    fn старт_без_тостов_о_пути() {
+        // События, которые движок шлёт на старте: прямой канал, его потеря и
+        // смена пути. Тост — только на действие пользователя (issue #23).
+        let mut a = path_app();
+        a.toasts.clear();
+        a.apply_events(
+            vec![
+                Event::Direct {
+                    gid: 1,
+                    ip: 0x6442_0103,
+                    name: "bravo".into(),
+                },
+                Event::DirectLost {
+                    gid: 1,
+                    ip: 0x6442_0103,
+                    name: "bravo".into(),
+                },
+                Event::PathChanged {
+                    ip: 0x6442_0103,
+                    name: "bravo".into(),
+                    path: PathKind::Direct,
+                    rtt_ms: Some(7),
+                    manual: false,
+                },
+            ],
+            &Snapshot::default(),
+        );
+        assert!(
+            a.toasts.is_empty(),
+            "старт поднял тосты о пути: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("прямой канал с bravo"))
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("потерян — через релей"))
+        );
+        assert!(a.status_msg.contains("путь до bravo"));
+    }
+
+    #[test]
+    fn закрепление_пути_тост_по_команде_пользователя() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = path_app();
+        a.toasts.clear();
+        a.handle_key(ch('P'), &eng);
+        a.handle_key(ch('2'), &eng);
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.kind == MsgKind::Ok && t.text.contains("путь закреплён")),
+            "нет тоста о закреплении: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // Закреплённый путь потерян — тост есть: это последствие своей команды.
+        a.toasts.clear();
+        a.apply_events(
+            vec![Event::PathLost {
+                ip: 0x6442_0103,
+                name: "bravo".into(),
+            }],
+            &Snapshot::default(),
+        );
+        assert!(
+            a.toasts.iter().any(|t| t.text.contains("потерян")),
+            "нет тоста о потере закреплённого пути"
+        );
+        // Снятие закрепления — тоже своё действие, тоже тост.
+        a.toasts.clear();
+        a.handle_key(ch('P'), &eng);
+        a.handle_key(ch('0'), &eng);
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.kind == MsgKind::Ok && t.text.contains("автоматический")),
+            "нет тоста о снятии закрепления: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -5044,6 +5896,7 @@ mod tests {
                 name: "bravo".into(),
                 path: PathKind::Server,
                 rtt_ms: Some(48),
+                manual: false,
             }],
             &Snapshot::default(),
         );
@@ -5070,6 +5923,225 @@ mod tests {
                 .iter()
                 .any(|l| l.text.contains("путь до bravo потерян")),
             "нет строки лога о потере пути"
+        );
+    }
+}
+
+#[cfg(test)]
+mod friends_tests {
+    //! Друзья в TUI (issue #24): добавление из списка участников и карточки,
+    //! отсечение себя и уже добавленных, ник вместо кода, офлайн-отказ.
+
+    use super::tests::{FakeEngine, app, peer, with_peers};
+    use super::*;
+
+    #[test]
+    fn добавление_из_списка_участников_шлёт_заявку() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.open_pick(PickMode::AddFriend);
+        let Some(Popup::PeerPick(p)) = a.stack.last() else {
+            panic!("окно выбора участника открыто")
+        };
+        assert_eq!(p.items.len(), 1, "только кандидат, без «ввести код»");
+        assert_eq!(p.items[0].pubkey, [2; 32]);
+        a.handle_popup_key(key(KeyCode::Enter), &eng);
+        assert!(
+            matches!(eng.sent().as_slice(), [Cmd::AddFriend { pubkey, alias }]
+                if *pubkey == [2; 32] && alias.is_empty()),
+            "ждали AddFriend, пришло {:?}",
+            eng.sent()
+        );
+        // В своём списке — «ждёт ответа», а не «друг».
+        assert_eq!(a.friends.len(), 1);
+        assert_eq!(a.friends[0].state, store::FriendState::PendingOut);
+        assert!(a.toasts.iter().any(|t| t.text.contains("заявка")));
+    }
+
+    #[test]
+    fn карточка_участника_добавляет_в_друзья() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = with_peers(vec![peer([3; 32], "charlie")]);
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [3; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(
+            matches!(eng.sent().as_slice(), [Cmd::AddFriend { pubkey, .. }] if *pubkey == [3; 32]),
+            "ждали AddFriend, пришло {:?}",
+            eng.sent()
+        );
+        assert!(a.friends.iter().any(|f| f.pubkey == [3; 32]));
+    }
+
+    #[test]
+    fn себя_и_уже_друга_не_добавляем() {
+        let eng = FakeEngine::new(Snapshot::default());
+        // Себя: my_pub приложения — [7; 32].
+        let mut a = with_peers(vec![peer([7; 32], "я")]);
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [7; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(eng.sent().is_empty(), "себе заявку не шлём");
+        assert!(a.friends.is_empty());
+        assert!(a.toasts.iter().any(|t| t.text.contains("это вы")));
+
+        // Уже друг.
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bravo".into(),
+            state: store::FriendState::Accepted,
+            pubkey: [2; 32],
+            online: true,
+            shared_groups: 1,
+        }];
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(eng.sent().is_empty(), "другу заявку не шлём");
+        assert!(a.toasts.iter().any(|t| t.text.contains("уже в друзьях")));
+
+        // Заявка уже отправлена — второй раз не шлём.
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bravo".into(),
+            state: store::FriendState::PendingOut,
+            pubkey: [2; 32],
+            online: true,
+            shared_groups: 1,
+        }];
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(eng.sent().is_empty(), "повтор заявки не шлём");
+        assert!(a.toasts.iter().any(|t| t.text.contains("уже отправлена")));
+        // В списке выбора участников таких кандидатов нет вовсе.
+        a.stack.clear();
+        a.open_pick(PickMode::AddFriend);
+        assert!(
+            !matches!(a.stack.last(), Some(Popup::PeerPick(_))),
+            "некого выбирать — окно не открывается"
+        );
+    }
+
+    #[test]
+    fn панель_друзей_показывает_ник_а_не_код() {
+        // Друг без алиаса: в списке ник с сервера, а не friend code.
+        let pk = [0xAB; 32];
+        let code = proto::friend_code_of(&pk);
+        let mut a = app();
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bravo".into(),
+            state: store::FriendState::Accepted,
+            pubkey: pk,
+            online: true,
+            shared_groups: 1,
+        }];
+        assert_eq!(a.friends[0].display(), "bravo");
+        assert_ne!(a.friends[0].display(), code);
+        // Нет ника — короткий код, а не 52 символа.
+        a.friends[0].nick.clear();
+        let shown = a.friends[0].display();
+        assert_eq!(shown, crate::friends::short_code(&pk));
+        assert!(shown.len() < 20, "{shown}");
+        // Алиас перекрывает ник.
+        a.friends[0].nick = "bravo".into();
+        a.friends[0].alias = "мой".into();
+        assert_eq!(a.friends[0].display(), "мой");
+        // Маркер состояния: у обычной дружбы его нет, у заявки — есть.
+        assert!(a.friends[0].badge().is_none());
+        a.friends[0].state = store::FriendState::PendingIn;
+        assert_eq!(a.friends[0].badge(), Some("←"));
+        a.friends[0].state = store::FriendState::Legacy;
+        assert_eq!(a.friends[0].badge(), Some("лок."));
+    }
+
+    #[test]
+    fn офлайн_заявка_не_шлётся_и_объясняет() {
+        let eng = FakeEngine::offline();
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        assert!(!a.add_friend(&eng, [2; 32], ""));
+        assert!(a.friends.is_empty(), "локальной записи не появляется");
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.text.contains("движок") && t.kind == MsgKind::Error),
+            "тост объясняет, что нужен движок: {:?}",
+            a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // Через карточку участника — то же самое.
+        a.stack
+            .push(Popup::PeerCard(PeerCardPopup { pubkey: [2; 32] }));
+        a.handle_popup_key(key(KeyCode::Char('a')), &eng);
+        assert!(a.friends.is_empty());
+        assert!(eng.sent().is_empty());
+    }
+
+    #[test]
+    fn входящая_заявка_открывается_enter_из_списка_друзей() {
+        // Окно заявки приходит только событием: после Esc или перезапуска
+        // TUI принять её было бы нечем (issue #24). Enter по записи
+        // `PendingIn` должен снова открыть окно.
+        let mut a = app();
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bob".into(),
+            state: store::FriendState::PendingIn,
+            pubkey: [2; 32],
+            online: false,
+            shared_groups: 0,
+        }];
+        a.focus = Focus::Friends;
+        a.sel_friend = Some([2; 32]);
+        let eng = FakeEngine::new(Snapshot::default());
+        a.activate(&eng);
+        match a.stack.last() {
+            Some(Popup::FriendReq(req)) => assert_eq!(req.pubkey, [2; 32]),
+            Some(_) => panic!("ожидалось окно заявки, получено другое окно"),
+            None => panic!("окно заявки не открылось"),
+        }
+    }
+
+    #[test]
+    fn o_возвращает_входящую_заявку_если_приглашений_нет() {
+        let mut a = app();
+        a.friends = vec![FriendView {
+            alias: String::new(),
+            nick: "bob".into(),
+            state: store::FriendState::PendingIn,
+            pubkey: [2; 32],
+            online: false,
+            shared_groups: 0,
+        }];
+        a.reopen_invites();
+        assert!(
+            matches!(a.stack.last(), Some(Popup::FriendReq(_))),
+            "«o» должен открыть заявку в друзья"
+        );
+    }
+
+    #[test]
+    fn a_в_панели_участников_открывает_список_друзей() {
+        // «a» в панели участников — заявка из списка, без кода (issue #24);
+        // в остальных фокусах — ввод friend code.
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = with_peers(vec![peer([2; 32], "bravo")]);
+        a.focus = Focus::Peers;
+        a.handle_key(key(KeyCode::Char('a')), &eng);
+        match a.stack.last() {
+            Some(Popup::PeerPick(p)) => {
+                assert!(matches!(p.mode, PickMode::AddFriend), "не тот режим выбора")
+            }
+            Some(_) => panic!("ожидался выбор участника, получено другое окно"),
+            None => panic!("список участников не открылся"),
+        }
+        let mut b = app();
+        b.handle_key(key(KeyCode::Char('a')), &eng);
+        assert!(
+            matches!(b.stack.last(), Some(Popup::Input(_))),
+            "вне панели участников «a» — ввод кода"
         );
     }
 }

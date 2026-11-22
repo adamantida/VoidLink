@@ -27,9 +27,12 @@
 //!   rename <gid> <имя>          — переименовать (владелец)
 //!   delete <gid>                — удалить группу (владелец)
 //!   friend-groups <peer>        — группы друга
-//!   add-friend <code> [alias]   — добавить друга локально
-//!   del-friend <alias>          — удалить друга
-//!   friends                     — список друзей
+//!   add-friend <code> [alias]   — заявка в друзья (нужен движок)
+//!   accept-friend [peer]        — принять входящую заявку
+//!   decline-friend [peer]       — отклонить входящую заявку
+//!   remove-friend <peer>        — снять дружбу (у обоих)
+//!   del-friend <имя>            — убрать запись из своего списка
+//!   friends                     — список друзей (алиас → ник → код)
 //!   alias <friend> <имя>        — переименовать друга локально
 //!   export-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]
 //!                               — выгрузить identity (перенос на другую машину)
@@ -67,7 +70,7 @@ use tunnel_client::remote_cli::{self, Route};
 use tunnel_client::{engine, profile, store, tui};
 use tunnel_ipc::{InstanceLock, LockError};
 
-use store::{Config, StoredFriend, StoredServer};
+use store::{Config, StoredServer};
 
 /// Режим TUI, заданный флагом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,19 +809,21 @@ fn main() -> Result<()> {
             );
         }
         "add-friend" => {
-            let code = rest.first().context("usage: add-friend <code> [alias]")?;
-            let pk = proto::Identity::parse_friend_code(code)?;
-            let alias = rest.get(1).cloned().unwrap_or_else(|| code.clone());
-            if cfg.friends.iter().any(|f| f.pubkey == proto::hex_of(&pk)) {
-                bail!("друг уже добавлен");
-            }
-            cfg.friends.push(StoredFriend {
-                pubkey: proto::hex_of(&pk),
-                alias: alias.clone(),
-            });
-            save(&cfg)?;
-            println!("друг добавлен: {} ({})", alias.clone(), proto::hex_of(&pk));
+            // Issue #24: заявка в друзья — сетевой кадр `FRIEND_REQ`, вторая
+            // сторона узнаёт о ней от сервера. Без движка доставлять некому,
+            // поэтому — понятная ошибка, а не молчаливая локальная запись
+            // (именно из-за неё вторая сторона раньше ничего не знала).
+            let _code = rest.first().context("usage: add-friend <code> [alias]")?;
+            bail!(
+                "заявка в друзья отправляется через сервер — нужен запущенный движок \
+                 (tunnel-client run или демон TunnelDaemon); без связи она не дойдёт"
+            );
         }
+        // Ответ на входящую заявку — тоже сетевой кадр.
+        "accept-friend" | "decline-friend" | "remove-friend" => bail!(
+            "команда {cmd:?} отправляется через сервер — нужен запущенный движок \
+             (tunnel-client run или демон TunnelDaemon)"
+        ),
         "del-friend" => {
             let alias = rest.first().context("usage: del-friend <alias>")?;
             let before = cfg.friends.len();
@@ -1288,7 +1293,11 @@ global: --dir <path> --profile <имя> --debug --server <N|addr|label> (по у
   transfer <gid> <peer>       передать группу участнику
   rename <gid> <имя>
   friend-groups <peer>
-  add-friend <code> [alias] | del-friend <alias> | friends
+  add-friend <code> [alias]   заявка в друзья (нужен движок: через сервер)
+  accept-friend [peer]        принять входящую заявку
+  decline-friend [peer]       отклонить входящую заявку
+  remove-friend <peer>        снять дружбу (у второй стороны тоже)
+  del-friend <имя> | friends  убрать запись у себя / список друзей
   alias <friend> <имя>        переименовать друга локально
   export-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]
   import-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]

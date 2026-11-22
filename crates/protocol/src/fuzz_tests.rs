@@ -63,6 +63,8 @@ fn feed_all(
     let _ = dec_create_group(b);
     let _ = dec_gid(b);
     let _ = dec_gid_target(b);
+    // GROUP_ATTACH (issue #20): gid + attached.
+    let _ = dec_gid_attach(b);
     let _ = dec_rename(b);
     let _ = dec_status(b);
     let _ = dec_pubkey(b);
@@ -78,6 +80,13 @@ fn feed_all(
     let _ = dec_admin_info(b);
     let _ = dec_error(b);
     let _ = dec_friend_groups(b);
+    // Issue #24: друзья. `covers`/`next_from` — тоже на мусоре: они считают
+    // границы окна и не должны паниковать на пустом/битом списке.
+    let _ = dec_friend_req_rcvd(b);
+    let _ = dec_friend_list(b).map(|l| (l.covers(&[0u8; 32]), l.next_from()));
+    let _ = dec_friend_accepted(b);
+    let _ = dec_friend_declined(b);
+    let _ = dec_friend_removed(b);
     let _ = dec_ping(b);
     // Этап 9: mesh, probe, hint/fed/seed.
     let _ = dec_mesh_info(b);
@@ -479,6 +488,45 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
                 shared: false,
             }],
         }),
+        // Issue #24: все кадры друзей — чтобы мутации заходили в поля
+        // (состояние, ключ окна, счётчик элементов), а не только в длины.
+        enc_friend_req_rcvd(&FriendReqRcvd {
+            from: [4; 32],
+            from_name: "delta".into(),
+            expires_in: 600,
+        }),
+        enc_friend_list(&FriendList {
+            from: [0; 32],
+            items: vec![
+                FriendInfo {
+                    pk: [1; 32],
+                    name: "alpha".into(),
+                    state: friend_state::PENDING_IN,
+                    since_ms: 1_700_000_000_000,
+                },
+                FriendInfo {
+                    pk: [2; 32],
+                    name: "bravo".into(),
+                    state: friend_state::ACCEPTED,
+                    since_ms: 1_700_000_000_500,
+                },
+            ],
+            complete: false,
+        }),
+        enc_friend_list(&FriendList {
+            from: [2; 32],
+            items: Vec::new(),
+            complete: true,
+        }),
+        enc_friend_accepted(&FriendVerdict {
+            by: [5; 32],
+            by_name: "echo".into(),
+        }),
+        enc_friend_declined(&FriendVerdict {
+            by: [6; 32],
+            by_name: String::new(),
+        }),
+        enc_friend_removed(&[7; 32]),
         Hello3::encode(&client, &c_eph.public(), "alpha", 1, Some(&[5; 16])),
         Hello3::encode(&client, &c_eph.public(), "alpha", 0, None),
         handshake::enc_challenge(&[6; 16]),

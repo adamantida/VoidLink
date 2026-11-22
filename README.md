@@ -11,7 +11,7 @@
 ![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
 ![Protocol](https://img.shields.io/badge/протокол-v4%2B-6f42c1)
 ![Platforms](https://img.shields.io/badge/Windows%20·%20Linux%20·%20macOS-0a7bbb)
-![Tests](https://img.shields.io/badge/тесты-580-2ea44f)
+![Tests](https://img.shields.io/badge/тесты-695-2ea44f)
 ![Self-hosted](https://img.shields.io/badge/self--hosted-100%25-111)
 
 [**Быстрый старт**](#-быстрый-старт) ·
@@ -220,7 +220,7 @@ Workspace на Rust 2024, семь крейтов:
 | `groups` · `create <имя> [--private]` · `join` · `leave` · `delete <gid>` | группы |
 | `invite` · `kick` · `ban` · `unban <gid> <peer>` · `bans <gid>` · `transfer <gid> <peer>` | администрирование |
 | `invites` · `decline <gid>` | входящие приглашения |
-| `add-friend <code> [alias]` · `alias` · `del-friend` · `friends` | друзья |
+| `add-friend <code> [alias]` · `accept-friend <code>` · `decline-friend <code>` · `remove-friend <code>` · `alias` · `del-friend` · `friends` | друзья (заявка, принятие, снятие) |
 | `set-transport auto\|udp\|tcp` · `set-mtu <N>` · `dns on\|off` | сеть |
 | `export-identity <file>` · `import-identity <file>` · `--profile <имя>` | identity и профили |
 | `tui [--remote\|--embedded]` · `run` | интерфейс и туннель |
@@ -257,7 +257,7 @@ tunnel-daemon console | service | install | uninstall [--purge]
 
 ## 📈 Качество
 
-- **580 автотестов**: юнит-тесты, фаззинг декодеров, e2e с настоящим сервером и
+- **695 автотестов**: юнит-тесты, фаззинг декодеров, e2e с настоящим сервером и
   движками (3+ клиента, кик, подмена отправителя, повторы, ротация ключей при
   потере пакетов, TCP-фолбэк, DNS/IPv6, IPC демона, mesh-кодеки и таблица
   путей этапа 9).

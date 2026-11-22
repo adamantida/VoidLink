@@ -431,22 +431,27 @@ fn нет_сервера_затем_add_server() {
         AckResult::Err(_)
     ));
 
-    // Правки конфига без движка: имя, друг — в снимке и на диске.
+    // Правки конфига без движка: имя — в снимке и на диске.
     assert_eq!(
         c.request(json!({ "SetName": "алиса" }), T).unwrap(),
         AckResult::Ok
     );
+    // Заявка в друзья — сетевая команда (issue #24): без движка её некуда
+    // отправить, поэтому Err и никакой локальной записи «друг, которого нет».
     let fpk = [9u8; 32];
     let add = serde_json::to_value(Cmd::AddFriend {
         pubkey: fpk,
         alias: "друг".into(),
     })
     .unwrap();
-    assert_eq!(c.request(add, T).unwrap(), AckResult::Ok);
+    assert!(matches!(c.request(add, T).unwrap(), AckResult::Err(_)));
     wait_for(
         &mut c,
-        "имя и друг в снимке",
-        snap_where(|s| s["cfg"]["name"] == "алиса" && s["cfg"]["friends"][0]["alias"] == "друг"),
+        "имя в снимке, друга нет",
+        snap_where(|s| {
+            s["cfg"]["name"] == "алиса"
+                && s["cfg"]["friends"].as_array().is_some_and(|f| f.is_empty())
+        }),
     );
     assert_eq!(
         starts.load(Ordering::SeqCst),
@@ -473,7 +478,8 @@ fn нет_сервера_затем_add_server() {
         serde_json::from_slice(&std::fs::read(d.dir.join("client.json")).unwrap()).unwrap();
     assert_eq!(saved.servers.len(), 1);
     assert_eq!(saved.name, "алиса");
-    assert_eq!(saved.friends.len(), 1);
+    // Заявка без движка не сохранялась (issue #24): список друзей пуст.
+    assert_eq!(saved.friends.len(), 0);
     assert_eq!(
         saved.identity.as_ref().map(|i| &i.ed_seed),
         cfg2.identity.as_ref().map(|i| &i.ed_seed),

@@ -117,6 +117,23 @@ pub mod ctrl {
     pub const SERVER_HINT: u8 = 0x18;
     /// Вход в федерированную группу: `uuid(16)` (T4).
     pub const JOIN_FED: u8 = 0x19;
+    /// Отключиться от группы, оставаясь участником (issue #20):
+    /// `gid(4) | attached(1)` (`payloads::enc_gid_attach`). Mutation.
+    /// В отличие от LEAVE_GROUP ключ группы **не** ротируется: участие и
+    /// доступ сохраняются, рвётся только доставка. Старые серверы тип не
+    /// знают и молча роняют — клиент остаётся на локальном отключении.
+    pub const GROUP_ATTACH: u8 = 0x1A;
+    /// Заявка в друзья: `target pk(32)` (issue #24). Mutation.
+    pub const FRIEND_REQ: u8 = 0x1B;
+    /// Принять входящую заявку: `pk(32)`. Mutation.
+    pub const FRIEND_ACCEPT: u8 = 0x1C;
+    /// Отклонить входящую заявку: `pk(32)`. Mutation.
+    pub const FRIEND_DECLINE: u8 = 0x1D;
+    /// Снять дружбу с любой стороны: `pk(32)`. Mutation.
+    pub const FRIEND_REMOVE: u8 = 0x1E;
+    /// Окно списка друзей с pubkey ≥ from (`from pk(32)`, `[0;32]` — с
+    /// начала), ответ — FRIEND_LIST. Без побочных эффектов.
+    pub const LIST_FRIENDS: u8 = 0x1F;
 
     /// Открытым текстом, `handshake::Welcome`.
     pub const WELCOME: u8 = 0x81;
@@ -165,6 +182,19 @@ pub mod ctrl {
     /// gid(4) | name str | owner(32) | members(2))` (`payloads::enc_fed_groups`).
     /// Сервер → клиент (T4).
     pub const FED_GROUPS: u8 = 0x95;
+    /// Входящая заявка в друзья (issue #24): `from pk(32) | from_name str |
+    /// expires_in u32` (`payloads::enc_friend_req_rcvd`). Сервер → клиент.
+    pub const FRIEND_REQ_RCVD: u8 = 0x96;
+    /// Окно списка друзей: `from pk(32) | complete(1) | n u8 × FriendInfo`
+    /// (`payloads::enc_friend_list`). Сервер → клиент; авторитетный список,
+    /// по нему клиент снимает устаревшие записи.
+    pub const FRIEND_LIST: u8 = 0x97;
+    /// Заявку приняли: `by pk(32) | by_name str`. Сервер → клиент.
+    pub const FRIEND_REQ_ACCEPTED: u8 = 0x98;
+    /// Заявку отклонили: `by pk(32) | by_name str`. Сервер → клиент.
+    pub const FRIEND_REQ_DECLINED: u8 = 0x99;
+    /// Дружбу снял он: `by pk(32)`. Сервер → клиент.
+    pub const FRIEND_REMOVED: u8 = 0x9A;
 
     /// Фреймы, которые ходят открытым текстом (всё прочее — шифрованные ctrl
     /// или фреймы группы).

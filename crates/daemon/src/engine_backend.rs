@@ -6,8 +6,10 @@
 //!   приглашения — всё это строит `tunnel_client::api::LocalEngine` (тот же
 //!   код, что у embedded TUI, поэтому снимки совпадают — PLAN.md 7.7);
 //! - события — `Event` движка в JSON (serde, внешний тег);
-//! - команды — JSON-форма `Cmd` движка; правки конфига (`AddFriend`,
+//! - команды — JSON-форма `Cmd` движка; правки конфига (`SetName`,
 //!   `DelServer`…) проверяются до отправки, отказ уходит клиенту в `Ack`.
+//!   `AddFriend` — не правка конфига, а сетевая заявка (issue #24): без
+//!   движка она получает отказ, локальной записи не появляется.
 //!
 //! [`DaemonEngine`] — бэкенд режимов `console` и `service`: конфиг и identity
 //! каталога данных демона, движок с настоящим TUN ([`real_start`]: Wintun /
@@ -444,7 +446,9 @@ impl Inner {
             Cmd::SetStatus(_) => "статус сохранён".to_string(),
             Cmd::SetInvisible(on) => format!("невидимка: {}", if *on { "вкл" } else { "выкл" }),
             Cmd::ToggleAutojoin(gid) => format!("автовход: группа {gid}"),
-            Cmd::AddFriend { alias, .. } => format!("друг добавлен: {alias}"),
+            // `AddFriend` здесь нет: с issue #24 это сетевая команда (заявка),
+            // и без движка её некуда отправить — локальная запись показывала
+            // бы друга, которого на сервере нет. Ветка `_` вернёт отказ.
             Cmd::DelFriend(_) => "друг удалён".to_string(),
             Cmd::SetAlias { alias, .. } => format!("alias: {alias}"),
             Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
