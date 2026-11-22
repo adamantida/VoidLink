@@ -621,14 +621,18 @@ mod tests {
     fn idle_timeout_closes() {
         let (h, rx) = collector();
         let limits = TcpLimits {
-            idle_timeout: Duration::from_millis(300),
+            // Запас по времени намеренно большой: на macOS SO_RCVTIMEO
+            // округляется и планировщик CI дёргает поток с задержкой, из-за
+            // чего запись «вовремя» прилетала уже после закрытия (BrokenPipe).
+            // Тест про механизм продления, а не про точность таймера.
+            idle_timeout: Duration::from_secs(1),
             ..TcpLimits::default()
         };
         let t = TcpTransport::start(loopback(), h, limits).unwrap();
         let mut c = TcpStream::connect(t.local_addr()).unwrap();
         // Активность продлевает жизнь соединения.
         for _ in 0..3 {
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(200));
             c.write_all(&encode_frame(b"ping")).unwrap();
         }
         for _ in 0..3 {
@@ -637,7 +641,7 @@ mod tests {
         assert_eq!(t.sender().conn_count(), 1);
         let started = Instant::now();
         assert!(is_closed(&mut c));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert!(wait_until(|| t.sender().conn_count() == 0));
     }
 
