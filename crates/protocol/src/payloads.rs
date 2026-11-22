@@ -211,6 +211,24 @@ pub fn dec_u32(p: &[u8]) -> Result<u32> {
     dec_gid(p)
 }
 
+/// GROUP_ATTACH (issue #20): `gid u32 | attached u8`. `attached = 0` —
+/// остаться участником, но не получать кадры группы (и не слать их);
+/// `1` — снова принимать. Ключ группы при этом **не** ротируется — этим
+/// действие отличается от LEAVE_GROUP.
+pub fn enc_gid_attach(gid: u32, attached: bool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(5);
+    put_u32(&mut v, gid);
+    put_bool(&mut v, attached);
+    v
+}
+
+pub fn dec_gid_attach(p: &[u8]) -> Result<(u32, bool)> {
+    let mut r = Reader::new(p);
+    let gid = r.u32()?;
+    let attached = r.boolean()?;
+    Ok((gid, attached))
+}
+
 /// INVITE / KICK / BAN / UNBAN / TRANSFER_OWNER: gid + pubkey цели.
 pub fn enc_gid_target(gid: u32, target: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(36);
@@ -1448,6 +1466,26 @@ pub(crate) mod tests {
         assert!(dec_presence(&enc_presence(true)).unwrap());
         assert!(!dec_presence(&enc_presence(false)).unwrap());
         assert!(dec_presence(&[]).is_err());
+    }
+
+    /// GROUP_ATTACH (issue #20): ровно 5 байт, усечение — ошибка разбора, а
+    /// не «по умолчанию подключён» (иначе обрезанный кадр включал бы приём).
+    #[test]
+    fn gid_attach_туда_обратно_и_усечение() {
+        for attached in [true, false] {
+            let enc = enc_gid_attach(17, attached);
+            assert_eq!(enc.len(), 5, "формат: gid u32 | attached u8");
+            assert_eq!(dec_gid_attach(&enc).unwrap(), (17, attached));
+            assert!(dec_gid_attach(&enc[..4]).is_err(), "нет байта attached");
+            assert!(dec_gid_attach(&enc[..2]).is_err());
+            assert!(dec_gid_attach(&[]).is_err());
+        }
+        // Любой ненулевой байт — «подключён»; хвост допускается (расширение
+        // без смены версии).
+        assert_eq!(dec_gid_attach(&[0, 0, 0, 3, 0x7f]).unwrap(), (3, true));
+        let mut with_tail = enc_gid_attach(3, false);
+        with_tail.push(0xEE);
+        assert_eq!(dec_gid_attach(&with_tail).unwrap(), (3, false));
     }
 
     #[test]

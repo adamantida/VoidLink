@@ -1922,6 +1922,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
             "федеративная группа: метка «федерация», вход по uuid/gid",
         ),
         kv("x", "покинуть группу"),
+        kv(
+            "d",
+            "отключиться от доставки / подключиться (участие сохраняется)",
+        ),
         kv("i", "пригласить друга в группу"),
         kv("k / b", "исключить / забанить участника"),
         kv(
@@ -1936,7 +1940,7 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         Line::from(""),
         head("Друзья и профиль"),
         kv("a", "добавить друга по friend code"),
-        kv("d", "удалить друга (с подтверждением)"),
+        kv("d (в друзьях)", "удалить друга (с подтверждением)"),
         kv("r (в друзьях)", "переименовать друга (:alias друг имя)"),
         kv("c", "скопировать IP / pubkey / friend code"),
         kv("p", "карточка профиля"),
@@ -2047,6 +2051,7 @@ mod tests {
                 total: 2,
                 my_ip: Some(0x6442_0102),
                 owner_is_me: true,
+                detached: false,
                 peers: vec![PeerView {
                     pubkey: [2; 32],
                     name: "bravo".into(),
@@ -2067,6 +2072,7 @@ mod tests {
                 total: 1,
                 my_ip: None,
                 owner_is_me: false,
+                detached: false,
                 peers: vec![],
             },
         ];
@@ -2312,7 +2318,9 @@ mod tests {
     #[test]
     fn мышь_попадание_в_панели_и_кнопки() {
         let app = demo_app();
-        let s = frame(&app, 140, 40);
+        // 150 колонок: панель действий выросла на кнопку «d отключ.», и на
+        // 140 последняя кнопка перестала влезать (не влезшие не рисуются).
+        let s = frame(&app, 150, 40);
 
         let (x, y) = find(&s, "secret", 0);
         assert_eq!(app.hit(x, y), Hit::Item(Focus::Groups, 1));
@@ -2651,6 +2659,7 @@ mod tests {
                 total: i + 1,
                 my_ip: None,
                 owner_is_me: false,
+                detached: false,
                 peers: vec![],
             });
         }

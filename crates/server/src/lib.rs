@@ -287,9 +287,12 @@ impl Server {
                 sessions: HashMap::new(),
                 by_pub: HashMap::new(),
                 groups: loaded.groups,
+                deleted: loaded.deleted,
                 leases: loaded.leases,
                 next_gid: loaded.next_gid,
                 invite_ttl_ms: duration_ms(cfg.limits.invite_ttl),
+                tomb_ttl_ms: duration_ms(cfg.limits.tomb_ttl),
+                left_ttl_ms: duration_ms(cfg.limits.left_ttl),
                 retired_eph: HashMap::new(),
                 fed_dirty: HashSet::new(),
                 fed_deleted: Vec::new(),
@@ -695,9 +698,16 @@ struct Group {
     invites: HashMap<[u8; 32], Invite>,
     /// Лимит входов не-участников (`Limits::join_rate`), не сохраняется.
     joins: Bucket,
-    /// Недавно вышедшие (LEAVE) → когда: повторный вход без приглашения —
-    /// не раньше `REJOIN_COOLDOWN`. Не сохраняется.
-    left: HashMap<[u8; 32], Instant>,
+    /// Недавно вышедшие (LEAVE) → когда, unix мс: повторный вход без
+    /// приглашения — не раньше `REJOIN_COOLDOWN`, а в приватную группу —
+    /// только по новому приглашению, пока запись жива (`Limits::left_ttl`).
+    /// Сохраняется в `server.json` (`Persisted::left`, issue #20).
+    left: HashMap<[u8; 32], u64>,
+    /// Отключённые от доставки участники (GROUP_ATTACH, issue #20): остаются
+    /// участниками, но не получают релей группы и не считаются онлайн.
+    /// Ключ группы при этом не ротируется. Не сохраняется: после рестарта
+    /// сервера доставка снова включена (клиент повторит GROUP_ATTACH).
+    detached: HashSet<[u8; 32]>,
     /// uuid группы в федерации (этап 9, T4b1): `None` — группа не
     /// федерирована (сервер без `--federate` либо uuid ещё не назначен).
     fed_uuid: Option<[u8; 16]>,
@@ -779,6 +789,7 @@ impl Group {
             invites: HashMap::new(),
             joins: Bucket::full(),
             left: HashMap::new(),
+            detached: HashSet::new(),
             fed_uuid: Some(rec.uuid),
             fed_origin: Some(from),
         };
@@ -799,16 +810,36 @@ impl Group {
     }
 }
 
+/// Надгробие удалённой группы (issue #20). Живёт `Limits::tomb_ttl` и не даёт
+/// выдать тот же gid новой группе: иначе старый gid вёл бы в чужую группу с
+/// тем же номером, а текст «группа не существует» было бы не отличить от
+/// «группа не найдена».
+#[derive(Clone, Debug)]
+struct Tomb {
+    name: String,
+    owner: [u8; 32],
+    rev: u32,
+    /// unix мс удаления.
+    at_ms: u64,
+}
+
 struct State {
     sessions: HashMap<SocketAddr, Session>,
     /// Индекс: identity → адрес её сессии.
     by_pub: HashMap<[u8; 32], SocketAddr>,
     groups: HashMap<u32, Group>,
+    /// Надгробия удалённых групп (issue #20): gid не переиспользуется, пока
+    /// запись жива (`Limits::tomb_ttl`), а вход по нему даёт «группа не
+    /// существует». Сохраняются в `server.json` (`Persisted::deleted`).
+    deleted: HashMap<u32, Tomb>,
     /// Адрес оверлея identity — один на все её группы.
     leases: leases::Leases,
     next_gid: u32,
     /// `Limits::invite_ttl` в мс (нужен почти всем спискам приглашений).
     invite_ttl_ms: u64,
+    /// `Limits::tomb_ttl` и `Limits::left_ttl` в мс (issue #20).
+    tomb_ttl_ms: u64,
+    left_ttl_ms: u64,
     /// `(ed_pub, eph_pub)` закрытых сессий → когда закрыта. HELLO3 с таким
     /// ключом (старая попытка клиента, повторённая в пределах срока cookie)
     /// игнорируется: иначе он пересоздавал бы живую сессию.
@@ -883,19 +914,42 @@ impl State {
         ip
     }
 
-    /// Свободный gid: начиная с next_gid по кругу (удалённые gid переиспользуются;
-    /// раньше после 254 созданий сервер не мог создать ни одной группы).
-    fn alloc_gid(&mut self) -> Option<u32> {
+    /// Живое надгробие gid (issue #20): вход по нему — «группа не существует»,
+    /// выдать этот gid новой группе нельзя.
+    fn tomb_live(&self, gid: u32, now: u64) -> bool {
+        self.deleted
+            .get(&gid)
+            .is_some_and(|t| now.saturating_sub(t.at_ms) < self.tomb_ttl_ms)
+    }
+
+    /// Свободный gid: начиная с next_gid по кругу, но не с живым надгробием
+    /// (issue #20: удалённый gid не ведёт в чужую группу с тем же номером).
+    /// Все 254 номера заняты надгробиями — вытесняется самое старое.
+    fn alloc_gid(&mut self, now: u64) -> Option<u32> {
         let span = GID_MAX - GID_MIN + 1;
         let start = self.next_gid.clamp(GID_MIN, GID_MAX);
         for i in 0..span {
             let gid = GID_MIN + (start - GID_MIN + i) % span;
-            if !self.groups.contains_key(&gid) {
+            if !self.groups.contains_key(&gid) && !self.tomb_live(gid, now) {
                 self.next_gid = if gid == GID_MAX { GID_MIN } else { gid + 1 };
                 return Some(gid);
             }
         }
-        None
+        // Все номера заняты: вытесняем самое старое надгробие, но только если
+        // его gid не занят живой группой.
+        let oldest = self
+            .deleted
+            .iter()
+            .filter(|(gid, _)| !self.groups.contains_key(gid))
+            .min_by_key(|(_, t)| t.at_ms)
+            .map(|(gid, _)| *gid)?;
+        self.deleted.remove(&oldest);
+        self.next_gid = if oldest == GID_MAX {
+            GID_MIN
+        } else {
+            oldest + 1
+        };
+        Some(oldest)
     }
 
     fn invite_live(&self, inv: &Invite, now_ms: u64) -> bool {
@@ -1214,6 +1268,8 @@ struct Loaded {
     links: Vec<RotationLink>,
     next_gid: u32,
     groups: HashMap<u32, Group>,
+    /// Надгробия удалённых групп (`Persisted::deleted`, issue #20).
+    deleted: HashMap<u32, Tomb>,
     leases: leases::Leases,
     /// Закреплённые TOFU-пиры федерации (`federation.peers`).
     fed_pins: Vec<federation::Pin>,
@@ -1324,6 +1380,7 @@ fn load_state(store: &persist::Store, limits: &Limits) -> Result<Loaded> {
             links: Vec::new(),
             next_gid: GID_MIN,
             groups: HashMap::new(),
+            deleted: HashMap::new(),
             leases: leases::Leases::default(),
             fed_pins: Vec::new(),
             fed_groups: Vec::new(),
@@ -1374,6 +1431,7 @@ fn load_state(store: &persist::Store, limits: &Limits) -> Result<Loaded> {
             invites,
             joins: Bucket::full(),
             left: HashMap::new(),
+            detached: HashSet::new(),
             // uuid/origin федерации подставит загрузка `federation.groups`
             // (по gid) — см. ниже.
             fed_uuid: None,
@@ -1411,6 +1469,31 @@ fn load_state(store: &persist::Store, limits: &Limits) -> Result<Loaded> {
         invites.retain(|pk, _| !members.contains_key(pk) && !banned.contains_key(pk));
         groups.insert(g.id, group);
     }
+    // Недавние выходы (issue #20): приватная группа после выхода пускает
+    // только по новому приглашению, в том числе после рестарта сервера.
+    for l in &p.left {
+        let Ok(pk) = unhex(&l.pk) else { continue };
+        if let Some(g) = groups.get_mut(&l.gid) {
+            g.left.insert(pk, l.at_ms);
+        }
+    }
+    // Надгробия удалённых групп: gid не переиспользуется, вход по нему даёт
+    // «группа не существует». Просроченные записи снимет housekeeping.
+    let mut deleted = HashMap::new();
+    for t in &p.deleted {
+        if !(GID_MIN..=GID_MAX).contains(&t.gid) || groups.contains_key(&t.gid) {
+            continue;
+        }
+        deleted.insert(
+            t.gid,
+            Tomb {
+                name: t.name.clone(),
+                owner: t.owner,
+                rev: t.rev.min(u32::MAX as u64) as u32,
+                at_ms: t.at_ms,
+            },
+        );
+    }
     // Федерация (T4b1): uuid и источник правды группы восстанавливаются по
     // `federation.groups` — gid служит ключом, uuid при рестарте не меняется.
     let me_pub = proto::Identity {
@@ -1440,6 +1523,7 @@ fn load_state(store: &persist::Store, limits: &Limits) -> Result<Loaded> {
         links,
         next_gid: p.next_gid.clamp(GID_MIN, GID_MAX),
         groups,
+        deleted,
         leases,
         fed_pins: federation::load_pins(&p.federation.peers),
         fed_groups: p.federation.groups,
@@ -1539,8 +1623,33 @@ fn snapshot(
                     .collect(),
             })
             .collect(),
-        // Поля issue #20/#21/#24 заполняют свои ветки: пока — пустые значения
-        // (файл без них читается как «ничего не удалялось, не выходили, дружб нет»).
+        // Надгробия удалённых групп (issue #20): gid не переиспользуется,
+        // пока запись жива; вход по нему даёт «группа не существует».
+        deleted: s
+            .deleted
+            .iter()
+            .map(|(gid, t)| persist::PTomb {
+                gid: *gid,
+                name: t.name.clone(),
+                owner: t.owner,
+                rev: u64::from(t.rev),
+                at_ms: t.at_ms,
+            })
+            .collect(),
+        // Недавние выходы (issue #20): приватная группа после выхода
+        // пускает только по новому приглашению, в том числе после рестарта.
+        left: s
+            .groups
+            .values()
+            .flat_map(|g| {
+                g.left.iter().map(move |(pk, at_ms)| persist::PLeft {
+                    pk: hex(pk),
+                    gid: g.id,
+                    at_ms: *at_ms,
+                })
+            })
+            .collect(),
+        // Поля issue #21/#24 заполняют свои ветки: пока — пустые значения.
         ..Default::default()
     }
 }
@@ -1645,6 +1754,7 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        expire_group_memory(&sh);
         // Аренды адресов (issue #21) — не чаще `lease_gc_every` (по
         // умолчанию `LEASE_GC_EVERY`): обход групп небесплатный, а аренда
         // живёт дни.
@@ -1845,6 +1955,10 @@ fn expire_leases(sh: &Shared) {
 /// разослать дельту `Removed` остальным участникам. Реплики федерации не
 /// трогаются: их источник правды — сервер-владелец группы.
 fn evict_from_groups(s: &mut State, pk: &[u8; 32], out: &mut Outbox) {
+    // Выселение — тоже выход (issue #20): метка `left` живёт `left_ttl` и
+    // хранится в unix мс, чтобы правило переживало рестарт сервера.
+    let now = unix_ms();
+    let left_ttl_ms = s.left_ttl_ms;
     for gid in s.groups_of(pk) {
         let base = {
             let Some(g) = s.groups.get_mut(&gid) else {
@@ -1857,13 +1971,37 @@ fn evict_from_groups(s: &mut State, pk: &[u8; 32], out: &mut Outbox) {
             // Устаревшее приглашение не должно всплыть после выселения.
             g.invites.remove(pk);
             // Размер ограничен лимитом входов: выселение — тоже выход.
-            g.left.retain(|_, t| t.elapsed() < REJOIN_COOLDOWN);
-            g.left.insert(*pk, Instant::now());
+            // `left` хранит unix мс (issue #20: переживает рестарт сервера),
+            // поэтому и чистим, и пишем по времени, а не по `Instant`.
+            g.left.retain(|_, t| now.saturating_sub(*t) < left_ttl_ms);
+            g.left.insert(*pk, now);
             g.rotate(true);
             g.bump()
         };
         s.fed_dirty.insert(gid);
         push_update(s, &s.groups[&gid], base, &Change::Removed(*pk), None, out);
+    }
+}
+
+/// Просроченные надгробия и записи о выходе (issue #20): живут `tomb_ttl` и
+/// `left_ttl`. Без чистки `server.json` копил бы их бесконечно, а gid оставался
+/// бы занятым навсегда.
+fn expire_group_memory(sh: &Shared) {
+    let now = unix_ms();
+    let mut s = sh.state.write().unwrap();
+    let (tomb_ttl, left_ttl) = (s.tomb_ttl_ms, s.left_ttl_ms);
+    let tombs_before = s.deleted.len();
+    s.deleted
+        .retain(|_, t| now.saturating_sub(t.at_ms) < tomb_ttl);
+    let mut dropped = s.deleted.len() != tombs_before;
+    for g in s.groups.values_mut() {
+        let before = g.left.len();
+        g.left.retain(|_, at| now.saturating_sub(*at) < left_ttl);
+        dropped |= g.left.len() != before;
+    }
+    drop(s);
+    if dropped {
+        sh.dirty.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1980,6 +2118,11 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         let Some(dst_pk) = g.by_ip.get(&h.dst).copied() else {
             return;
         };
+        // Получатель отключён от доставки (GROUP_ATTACH, issue #20) — кадр
+        // не релеится: участие и ключ сохранены, доставка разорвана.
+        if g.detached.contains(&dst_pk) {
+            return;
+        }
         // Общий с локальным релеем лимит: иначе федеративный релей обходил бы
         // `--relay-rate`.
         if !ses
@@ -2052,10 +2195,19 @@ fn push_error(out: &mut Outbox, addr: SocketAddr, ses: &Session, text: &str) {
 
 /// MemberInfo участника `pk` глазами `viewer`: invisible-участник для
 /// остальных офлайн, без endpoint и кандидатов (релей для него работает).
-fn member_info(s: &State, pk: &[u8; 32], m: &Member, viewer: &[u8; 32]) -> MemberInfo {
+/// `detached` — отключённый от доставки (GROUP_ATTACH): для всех, включая
+/// себя, `online = false` — так клиент видит подтверждение отключения.
+fn member_info(
+    s: &State,
+    pk: &[u8; 32],
+    m: &Member,
+    viewer: &[u8; 32],
+    detached: bool,
+) -> MemberInfo {
     let live = s
         .session_of(pk)
-        .filter(|(_, x)| !x.invisible || pk == viewer);
+        .filter(|(_, x)| !x.invisible || pk == viewer)
+        .filter(|_| !detached);
     MemberInfo {
         pubkey: *pk,
         name: m.name.clone(),
@@ -2081,7 +2233,7 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
     let mut members: Vec<MemberInfo> = g
         .members
         .iter()
-        .map(|(pk, m)| member_info(s, pk, m, viewer))
+        .map(|(pk, m)| member_info(s, pk, m, viewer, g.detached.contains(pk)))
         .collect();
     members.sort_by_key(|m| m.ip);
     // Mesh-метаданные — только у тех, кто их опубликовал (MESH_INFO) и кто
@@ -2280,7 +2432,7 @@ pub(crate) fn fed_apply_group(sh: &Shared, rec: &proto::federation::FedGroup, fr
             }
             Some(gid) => fed_update_group(&mut s, gid, rec, &mut out),
             None => {
-                let Some(gid) = s.alloc_gid() else {
+                let Some(gid) = s.alloc_gid(unix_ms()) else {
                     sh.log("federation: нет свободных gid для реплицированной группы".into());
                     return;
                 };
@@ -2456,6 +2608,17 @@ pub(crate) fn fed_apply_delta(sh: &Shared, d: &proto::federation::FedGroupDelta,
                     push_ctrl(&mut out, addr, ses, ctrl::GROUP_STATE, &frame);
                 }
             }
+            // Надгробие (issue #20): федеративное удаление — такое же удаление,
+            // gid не переиспользуется, вход по нему — «группа не существует».
+            let tomb = s.groups.get(&gid).map(|g| Tomb {
+                name: g.name.clone(),
+                owner: g.owner,
+                rev: g.rev,
+                at_ms: unix_ms(),
+            });
+            if let Some(t) = tomb {
+                s.deleted.insert(gid, t);
+            }
             s.groups.remove(&gid);
             sh.list_dirty.store(true, Ordering::Relaxed);
         } else if changed {
@@ -2492,6 +2655,17 @@ pub(crate) fn fed_delete_repl(sh: &Shared, uuid: &[u8; 16]) {
             if let Some((addr, ses)) = s.session_of(&pk) {
                 push_ctrl(&mut out, addr, ses, ctrl::GROUP_STATE, &frame);
             }
+        }
+        // Надгробие (issue #20): копия группы удалена владельцем — gid не
+        // переиспользуется, вход по нему даёт «группа не существует».
+        let tomb = s.groups.get(&gid).map(|g| Tomb {
+            name: g.name.clone(),
+            owner: g.owner,
+            rev: g.rev,
+            at_ms: unix_ms(),
+        });
+        if let Some(t) = tomb {
+            s.deleted.insert(gid, t);
         }
         s.groups.remove(&gid);
         sh.list_dirty.store(true, Ordering::Relaxed);
@@ -2869,7 +3043,7 @@ fn push_update(
         };
         let delta = match change {
             Change::Member(who) => match g.members.get(who) {
-                Some(m) => GroupDelta::Member(member_info(s, who, m, pk)),
+                Some(m) => GroupDelta::Member(member_info(s, who, m, pk, g.detached.contains(who))),
                 None => continue,
             },
             Change::Removed(who) => GroupDelta::Removed(*who),
@@ -2939,6 +3113,7 @@ fn visible_counts(s: &State) -> Vec<(&Group, u32)> {
             let n = g
                 .members
                 .keys()
+                .filter(|pk| !g.detached.contains(*pk))
                 .filter(|pk| s.session_of(pk).is_some_and(|(_, x)| !x.invisible))
                 .count();
             (g, n as u32)
@@ -2962,7 +3137,8 @@ fn summaries(counts: &[(&Group, u32)], me: &[u8; 32], me_invisible: bool) -> Vec
                 name: g.name.clone(),
                 private: g.private,
                 mine,
-                online: visible + u32::from(mine && me_invisible),
+                // Отключённый от доставки себя онлайн не видит (issue #20).
+                online: visible + u32::from(mine && me_invisible && !g.detached.contains(me)),
                 total: g.members.len() as u32,
                 rev: if mine { g.rev } else { 0 },
                 epoch: if mine { g.epoch } else { 0 },
@@ -3384,6 +3560,8 @@ fn is_mutation(typ: u8) -> bool {
             | ctrl::CREATE_GROUP
             | ctrl::JOIN_GROUP
             | ctrl::LEAVE_GROUP
+            // Отключение/подключение доставки группы (issue #20) — мутация.
+            | ctrl::GROUP_ATTACH
             | ctrl::INVITE
             | ctrl::DECLINE_INVITE
             | ctrl::KICK
@@ -3412,6 +3590,9 @@ fn is_urgent(typ: u8) -> bool {
             | ctrl::BAN
             | ctrl::UNBAN
             | ctrl::LEAVE_GROUP
+            // Отключение от группы: состояние доставки не должно теряться при
+            // падении сразу после команды (issue #20).
+            | ctrl::GROUP_ATTACH
             | ctrl::DELETE_GROUP
             | ctrl::TRANSFER_OWNER
             | ctrl::CREATE_GROUP
@@ -3694,8 +3875,10 @@ fn handle_mutation(
             );
             let ip = s.ip_for(me).context("нет свободных адресов на сервере")?;
             let gid = s
-                .alloc_gid()
+                .alloc_gid(unix_ms())
                 .context("нет свободных номеров групп (все 254 заняты)")?;
+            // Надгробие выбранного gid снимается: номер снова наш (issue #20).
+            s.deleted.remove(&gid);
             let mut key = [0u8; 32];
             rand::rng().fill_bytes(&mut key);
             let mut g = Group {
@@ -3713,6 +3896,7 @@ fn handle_mutation(
                 invites: HashMap::new(),
                 joins: Bucket::full(),
                 left: HashMap::new(),
+                detached: HashSet::new(),
                 // uuid назначится ниже, если федерация включена.
                 fed_uuid: None,
                 fed_origin: None,
@@ -3740,7 +3924,26 @@ fn handle_mutation(
         ctrl::JOIN_GROUP => {
             let gid = pl::dec_gid(payload)?;
             let now = unix_ms();
+            // Приватная группа после выхода (issue #20): живой `left` требует
+            // нового приглашения. Проверка стоит **до** ветки «уже участник»:
+            // сервер мог не получить LEAVE (клиент потерял подтверждение) и
+            // продолжает считать identity участником — иначе повторный JOIN
+            // вернул бы группу без приглашения.
+            if let Some(g) = s.groups.get(&gid)
+                && g.private
+                && g.owner != me
+                && !g.invites.get(&me).is_some_and(|i| s.invite_live(i, now))
+                && g.left
+                    .get(&me)
+                    .is_some_and(|t| now.saturating_sub(*t) < s.left_ttl_ms)
+            {
+                push_invite_list(s, src, &s.sessions[&src], out, invite_window(s, &me, gid));
+                anyhow::bail!("группа приватная: после выхода нужно новое приглашение");
+            }
             let denied = match s.groups.get(&gid) {
+                // Надгробие живо — группы нет и не будет: «не существует», а не
+                // «не найдена» (issue #20).
+                None if s.tomb_live(gid, now) => Some("группа не существует"),
                 None => Some("группа не найдена"),
                 Some(g) if g.banned.contains_key(&me) => Some("вы забанены в этой группе"),
                 Some(g)
@@ -3778,7 +3981,7 @@ fn handle_mutation(
                 && !g.invites.contains_key(&me)
                 && g.left
                     .get(&me)
-                    .is_some_and(|t| t.elapsed() < REJOIN_COOLDOWN)
+                    .is_some_and(|t| now.saturating_sub(*t) < duration_ms(REJOIN_COOLDOWN))
             {
                 anyhow::bail!("недавно вышли из группы — повторите вход позже");
             }
@@ -3796,6 +3999,10 @@ fn handle_mutation(
             // группу по приглашению — тоже снять.
             let consumed = g.invites.remove(&me).is_some();
             let gname = g.name.clone();
+            // Успешный вход снимает запись о выходе: следующий JOIN участника
+            // снова обычный (issue #20).
+            g.left.remove(&me);
+            g.detached.remove(&me);
             g.insert_member(
                 me,
                 Member {
@@ -3828,13 +4035,19 @@ fn handle_mutation(
         }
         ctrl::LEAVE_GROUP => {
             let gid = pl::dec_gid(payload)?;
+            let now = unix_ms();
+            let left_ttl = s.left_ttl_ms;
             let base = s.groups.get_mut(&gid).and_then(|g| {
                 g.remove_member(&me).then(|| {
                     // Устаревшее приглашение не должно всплыть после выхода.
                     g.invites.remove(&me);
                     // Размер ограничен лимитом входов: каждый выход — после входа.
-                    g.left.retain(|_, t| t.elapsed() < REJOIN_COOLDOWN);
-                    g.left.insert(me, Instant::now());
+                    // Запись живёт `left_ttl` (приватная группа всё это время
+                    // пускает только по приглашению) и сохраняется в server.json.
+                    g.left.retain(|_, t| now.saturating_sub(*t) < left_ttl);
+                    g.left.insert(me, now);
+                    // Выход снимает отключение: участие закончилось целиком.
+                    g.detached.remove(&me);
                     g.rotate(true);
                     g.bump()
                 })
@@ -3852,6 +4065,32 @@ fn handle_mutation(
                 // подтвердить списком только ему.
                 None => push_group_list(s, src, &s.sessions[&src], out),
             }
+        }
+        ctrl::GROUP_ATTACH => {
+            let (gid, attached) = pl::dec_gid_attach(payload)?;
+            let g = s.groups.get_mut(&gid).context("группа не найдена")?;
+            anyhow::ensure!(g.members.contains_key(&me), "вы не участник группы");
+            // Ключ группы **не** ротируется: участие и доступ сохранены,
+            // рвётся только доставка (этим GROUP_ATTACH отличается от LEAVE).
+            let changed = if attached {
+                g.detached.remove(&me)
+            } else {
+                g.detached.insert(me)
+            };
+            if changed {
+                let base = g.bump();
+                sh.log(format!(
+                    "attach: {uname} → {gid} {}",
+                    if attached { "on" } else { "off" }
+                ));
+                s.fed_dirty.insert(gid);
+                push_update(s, &s.groups[&gid], base, &Change::Member(me), None, out);
+                sh.list_dirty.store(true, Ordering::Relaxed);
+            }
+            // Подтверждение — всегда, и на повтор: GROUP_STATE с нашим
+            // MemberInfo.online. Старый сервер тип не знает и молчит — клиент
+            // остаётся на локальном отключении (деградация, PROTOCOL §13).
+            push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
         }
         ctrl::INVITE => {
             let (gid, target) = pl::dec_gid_target(payload)?;
@@ -3949,6 +4188,9 @@ fn handle_mutation(
                 "лимит банов в группе ({max_bans}): снимите старые (UNBAN) или исключите без бана"
             );
             let kicked = g.remove_member(&target);
+            // Кик/бан снимает и отключение (issue #20): после возврата в
+            // группу участие начинается заново.
+            g.detached.remove(&target);
             // Приглашение снимают и KICK, и BAN: кикнутому не всплывёт окно
             // старого приглашения, а KICK приглашённого (не участника) —
             // отзыв приглашения.
@@ -4060,7 +4302,16 @@ fn handle_mutation(
             if let Some(snap) = group_snap(g) {
                 s.fed_deleted.push(snap);
             }
+            // Надгробие (issue #20): gid не выдаётся заново, пока живо, а вход
+            // по нему даёт «группа не существует».
+            let tomb = Tomb {
+                name: g.name.clone(),
+                owner: g.owner,
+                rev: g.rev,
+                at_ms: unix_ms(),
+            };
             let removed = s.groups.remove(&gid).unwrap();
+            s.deleted.insert(gid, tomb);
             sh.log(format!("deleted group {gid}"));
             let frame = pl::enc_group_state(&deleted_state(gid));
             // Приглашённым онлайн — тоже: клиент закроет окно приглашения в
@@ -4110,6 +4361,7 @@ mod tests {
             invites: HashMap::new(),
             joins: Bucket::full(),
             left: HashMap::new(),
+            detached: HashSet::new(),
             fed_uuid: None,
             fed_origin: None,
         }
@@ -4120,9 +4372,12 @@ mod tests {
             sessions: HashMap::new(),
             by_pub: HashMap::new(),
             groups: HashMap::new(),
+            deleted: HashMap::new(),
             leases: leases::Leases::default(),
             next_gid: GID_MIN,
             invite_ttl_ms: duration_ms(Limits::default().invite_ttl),
+            tomb_ttl_ms: duration_ms(Limits::default().tomb_ttl),
+            left_ttl_ms: duration_ms(Limits::default().left_ttl),
             retired_eph: HashMap::new(),
             fed_dirty: HashSet::new(),
             fed_deleted: Vec::new(),
@@ -4134,17 +4389,17 @@ mod tests {
         let mut s = empty_state();
         s.next_gid = GID_MAX;
         // Последний gid, затем по кругу с начала.
-        assert_eq!(s.alloc_gid(), Some(GID_MAX));
-        assert_eq!(s.alloc_gid(), Some(GID_MIN));
+        assert_eq!(s.alloc_gid(0), Some(GID_MAX));
+        assert_eq!(s.alloc_gid(0), Some(GID_MIN));
         // Заняты все, кроме 7, — выдаётся 7; заняты все — None.
         for gid in GID_MIN..=GID_MAX {
             if gid != 7 {
                 s.groups.insert(gid, empty_group(gid));
             }
         }
-        assert_eq!(s.alloc_gid(), Some(7));
+        assert_eq!(s.alloc_gid(0), Some(7));
         s.groups.insert(7, empty_group(7));
-        assert_eq!(s.alloc_gid(), None);
+        assert_eq!(s.alloc_gid(0), None);
     }
 
     #[test]
@@ -7552,6 +7807,275 @@ mod tests {
             "адрес чужой identity не зарезервирован после рестарта"
         );
         again.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- issue #19: права кика проверяет сервер ----------
+
+    /// Не-владелец не меняет группу: отказ приходит до любых изменений, у
+    /// цели не рвётся доставка, ревизия и эпоха не двигаются.
+    #[test]
+    fn кик_не_владельцем_не_меняет_состояние() {
+        let (server, dir) = test_server("kick-rights");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        let c = Raw::connect(server.addr, "charlie");
+        c.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        c.state();
+        let (rev, epoch) = {
+            let s = server.shared.state.read().unwrap();
+            (s.groups[&gid].rev, s.groups[&gid].epoch)
+        };
+        c.send(ctrl::KICK, &payloads::enc_gid_target(gid, &b.pk));
+        let err = c.error();
+        assert!(err.contains("может только владелец"), "{err}");
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert_eq!((g.rev, g.epoch), (rev, epoch), "отказ изменил состояние");
+            assert!(
+                g.members.contains_key(&b.pk),
+                "кик не владельцем выкинул участника"
+            );
+        }
+        // У цели не рвётся доставка: ни KICKED, ни ротации.
+        assert!(!b.sync().contains(&ctrl::KICKED), "цели пришёл KICKED");
+        b.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().members.len(), 3, "состав группы изменился");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- issue #20а: надгробия удалённых групп ----------
+
+    #[test]
+    fn вход_в_удалённую_группу_ошибка_группа_не_существует() {
+        let (server, dir) = test_server("tomb-join");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(gid));
+        a.expect(ctrl::GROUP_STATE);
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let err = b.error();
+        assert!(err.contains("не существует"), "{err}");
+        assert!(!err.contains("не найдена"), "старый текст отказа: {err}");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gid_удалённой_группы_не_переиспользуется_пока_tombstone_жив() {
+        let (server, dir) = test_server("tomb-gid");
+        let a = Raw::connect(server.addr, "alpha");
+        let first = a.create("one", false).gid;
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(first));
+        a.expect(ctrl::GROUP_STATE);
+        let second = a.create("two", false).gid;
+        assert_ne!(second, first, "gid удалённой группы выдан заново");
+        // Надгробие истекло — номер снова свободен (с начала круга).
+        {
+            let mut s = server.shared.state.write().unwrap();
+            let t = s.deleted.get_mut(&first).expect("надгробие не создано");
+            t.at_ms = 0;
+            s.next_gid = GID_MIN;
+        }
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(second));
+        a.expect(ctrl::GROUP_STATE);
+        let third = a.create("three", false).gid;
+        assert_eq!(third, first, "истёкшее надгробие не освободило gid");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Все 254 номера в надгробиях: самое старое вытесняется, иначе сервер
+    /// после серии удалений не создал бы ни одной группы.
+    #[test]
+    fn все_gid_в_надгробиях_вытесняется_самое_старое() {
+        let mut s = empty_state();
+        let now = unix_ms();
+        for gid in GID_MIN..=GID_MAX {
+            s.deleted.insert(
+                gid,
+                Tomb {
+                    name: String::new(),
+                    owner: [0; 32],
+                    rev: 1,
+                    // Все живые; самое старое — GID_MIN.
+                    at_ms: now + u64::from(gid),
+                },
+            );
+        }
+        assert_eq!(s.alloc_gid(now), Some(GID_MIN));
+        assert!(!s.deleted.contains_key(&GID_MIN), "надгробие не вытеснено");
+    }
+
+    #[test]
+    fn tombstone_переживает_рестарт() {
+        let dir = temp_dir("tomb-restart");
+        let server = start_in(&dir, Limits::default());
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(gid));
+        a.expect(ctrl::GROUP_STATE);
+        let store = persist::Store::new(&dir);
+        wait_until_srv(Duration::from_secs(5), || {
+            store
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.deleted.iter().any(|t| t.gid == gid))
+        });
+        server.stop();
+        let again = start_in(&dir, Limits::default());
+        let b = Raw::connect(again.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let err = b.error();
+        assert!(err.contains("не существует"), "после рестарта: {err}");
+        again.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- issue #20б: повторный вход в приватную ----------
+
+    #[test]
+    fn повторный_вход_в_приватную_после_выхода_только_по_новому_приглашению() {
+        let (server, dir) = test_server("private-rejoin");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("secret", true).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
+        a.sync();
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
+        b.expect(ctrl::GROUP_LIST);
+        // Живой `left`: без нового приглашения не пускает.
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let err = b.error();
+        assert!(err.contains("приглашение"), "{err}");
+        assert!(err.contains("после выхода"), "старая проверка: {err}");
+        // Выход сохраняется: рестарт сервера правило не сбрасывает.
+        let store = persist::Store::new(&dir);
+        wait_until_srv(Duration::from_secs(5), || {
+            store
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.left.iter().any(|l| l.gid == gid && l.pk == hex(&b.pk)))
+        });
+        // Новое приглашение владельца — вход проходит.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
+        a.sync();
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().gid, gid);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- issue #20в: отключение от группы без выхода ----------
+
+    /// Отключённый не получает релей и не считается онлайн; attach возвращает
+    /// доставку. Ключ при этом не ротируется.
+    #[test]
+    fn отключённый_не_получает_релей_и_не_онлайн() {
+        let (server, dir) = test_server("detach-relay");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let st = b.state();
+        let ip_b = st.my_ip;
+        let ip_a = st.members.iter().find(|m| m.pubkey == a.pk).unwrap().ip;
+
+        // Отключаемся: сервер подтверждает GROUP_STATE, где мы сами офлайн.
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, false));
+        let st_off = b.state();
+        let me = st_off.members.iter().find(|m| m.pubkey == b.pk).unwrap();
+        assert!(!me.online, "отключённый показан онлайн");
+        assert_eq!(st_off.epoch, st.epoch, "отключение ротировало ключ");
+        // Онлайн в списке: только A (total — оба). Сначала барьер: в буфере
+        // мог остаться список времён создания группы.
+        a.sync();
+        a.send(ctrl::LIST_GROUPS, &[]);
+        let list = payloads::dec_group_list(&a.expect(ctrl::GROUP_LIST)).unwrap();
+        let sum = list.iter().find(|s| s.gid == gid).unwrap();
+        assert_eq!(
+            (sum.online, sum.total),
+            (1, 2),
+            "онлайн считает отключённого"
+        );
+
+        // Релей отключённому не идёт.
+        let frame = frame_for(&st, ip_a, ip_b, b"while-off");
+        a.sock.send_to(&frame, server.addr).unwrap();
+        assert!(
+            b.group_frame(Duration::from_millis(700)).is_none(),
+            "отключённому отрелеен кадр"
+        );
+        // Подключаемся обратно — тот же кадр доходит.
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, true));
+        assert!(
+            b.state()
+                .members
+                .iter()
+                .any(|m| m.pubkey == b.pk && m.online)
+        );
+        a.sock.send_to(&frame, server.addr).unwrap();
+        assert_eq!(
+            b.group_frame(Duration::from_secs(3)),
+            Some(frame),
+            "после attach релей не вернулся"
+        );
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отключение не меняет состав и ключ: участие сохраняется, rev растёт
+    /// (видимое изменение), detached снимается при attach.
+    #[test]
+    fn отключение_не_ротирует_ключ_и_не_меняет_состав() {
+        let (server, dir) = test_server("detach-state");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        let (epoch, rev, members) = {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            (g.epoch, g.rev, g.members.len())
+        };
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, false));
+        b.state();
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert_eq!(g.epoch, epoch, "отключение ротировало ключ");
+            assert_eq!(g.members.len(), members, "отключение изменило состав");
+            assert!(g.detached.contains(&b.pk), "detached не записан");
+            assert_eq!(g.rev, rev + 1, "отключение не подняло ревизию");
+        }
+        // Повтор с тем же значением — без роста ревизии, но с подтверждением.
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, false));
+        b.state();
+        assert_eq!(
+            server.shared.state.read().unwrap().groups[&gid].rev,
+            rev + 1,
+            "повтор отключения поднял ревизию"
+        );
+        b.send(ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, true));
+        b.state();
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert!(g.detached.is_empty(), "detached не снят");
+            assert_eq!((g.epoch, g.members.len()), (epoch, members));
+        }
+        server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

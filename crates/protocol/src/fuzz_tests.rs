@@ -63,6 +63,8 @@ fn feed_all(
     let _ = dec_create_group(b);
     let _ = dec_gid(b);
     let _ = dec_gid_target(b);
+    // GROUP_ATTACH (issue #20): gid + attached.
+    let _ = dec_gid_attach(b);
     let _ = dec_rename(b);
     let _ = dec_status(b);
     let _ = dec_pubkey(b);

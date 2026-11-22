@@ -3371,3 +3371,198 @@ fn e2e_новая_identity_занимает_адрес_исчезнувшей() 
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------- issue #19: права кика ----------
+
+/// Не-владелец получает ошибку сервера, а не «успех»: состав и ключ группы
+/// не меняются, доставка всем участникам работает.
+#[test]
+fn не_владелец_кик_получает_error_и_никого_не_выкидывает() {
+    let dir = temp_dir("kick-denied");
+    let server = start_server(&dir, 0);
+    let (a, mut b, c, gid) = three_in_group(&server, false);
+    let (epoch, c_pub) = (a.epoch(gid), c.eng.my_pub);
+    b.eng.cmds.send(Cmd::Kick(gid, c_pub)).unwrap();
+    b.wait(
+        "B: отказ сервера",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("владелец")),
+    );
+    // Никого не выкинуло: C в группе, эпоха и состав прежние.
+    assert!(c.has_group(gid), "C выкинут отказом");
+    assert_eq!(a.epoch(gid), epoch, "отказ ротировал ключ");
+    assert_eq!(a.members(gid), 2, "отказ изменил состав");
+    deliver(&a, &c, gid, "after-denied-kick", T);
+    drop((a, b, c));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- issue #20: удалённые, отключённые и потерянные выходы ----------
+
+/// Вход по gid удалённой группы: «группа не существует», группы нет.
+#[test]
+fn e2e_вход_по_старому_gid_после_удаления_не_пускает() {
+    let dir = temp_dir("old-gid");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let gid = a.create("gone", false);
+    a.eng.cmds.send(Cmd::Delete(gid)).unwrap();
+    a.wait(
+        "группа удалена",
+        T,
+        |e| matches!(e, Event::GroupDeleted { gid: g, .. } if *g == gid),
+    );
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.eng.cmds.send(Cmd::Join(gid)).unwrap();
+    b.wait(
+        "B: «группа не существует»",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("не существует")),
+    );
+    assert!(!b.has_group(gid), "B вошёл по старому gid");
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Отключение от доставки не выходит из группы: участие, ключ и состав
+/// сохраняются, кадры не ходят; attach возвращает доставку.
+#[test]
+fn e2e_отключиться_и_подключиться_сохраняет_участие() {
+    let dir = temp_dir("detach-e2e");
+    let server = start_server(&dir, 0);
+    let (a, b, _c, gid) = three_in_group(&server, false);
+    let (epoch, members) = (a.epoch(gid), a.members(gid));
+    b.eng.cmds.send(Cmd::Detach(gid)).unwrap();
+    wait_until("B отключён локально", T, || {
+        b.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .is_some_and(|g| g.detached)
+    });
+    // Сервер подтвердил: своя запись в GROUP_STATE — офлайн.
+    wait_until(
+        "сервер подтвердил отключение",
+        T,
+        || {
+            b.eng
+                .groups
+                .lock()
+                .unwrap()
+                .get(&gid)
+                .is_some_and(|g| !g.server_online)
+        },
+    );
+    assert!(b.has_group(gid), "отключение вышло из группы");
+    assert_eq!(b.members(gid), 2, "отключение изменило состав");
+    assert_eq!(a.epoch(gid), epoch, "отключение ротировало ключ");
+    assert_eq!(a.members(gid), members);
+    // Пакет в отключённую группу не доставляется (и через сервер, и напрямую).
+    let pkt = ipv4(a.my_ip(gid), b.my_ip(gid), b"while-detached");
+    for _ in 0..10 {
+        a.eng.send_ip_packet(&pkt);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(b.got(&pkt), 0, "отключённому доставлен пакет");
+    // Возврат доставки.
+    b.eng.cmds.send(Cmd::Attach(gid)).unwrap();
+    wait_until("B подключён обратно", T, || {
+        b.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .is_some_and(|g| !g.detached && g.server_online)
+    });
+    deliver(&a, &b, gid, "after-attach", T);
+    assert_eq!(b.epoch(gid), epoch, "attach ротировал ключ");
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Клиент умер, не получив подтверждения выхода: `pending_leave` в конфиге
+/// переживает рестарт, LEAVE повторяется сам, сервер снимает участие.
+#[test]
+fn e2e_потерянный_leave_повторяется_после_рестарта() {
+    let dir = temp_dir("leave-restart");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    a.eng
+        .cmds
+        .send(Cmd::Create {
+            name: "secret".into(),
+            private: true,
+        })
+        .unwrap();
+    let gid = match a.wait("A создал группу", T, |e| {
+        matches!(e, Event::GroupJoined { .. })
+    }) {
+        Event::GroupJoined { gid, .. } => gid,
+        _ => unreachable!(),
+    };
+    a.eng.cmds.send(Cmd::Invite(gid, b_pub)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Первый запуск B: вход по приглашению, затем «падение» без LEAVE.
+    let mut b = Node::start_as("bravo", &server, b_id.clone());
+    b.wait(
+        "B: приглашение",
+        T,
+        |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid),
+    );
+    b.join(gid);
+    // A видит B участником: сервер принял вход.
+    wait_until("A видит B в группе", T, || a.members(gid) == 1);
+    drop(b); // процесс умер: LEAVE не ушёл
+
+    // Второй запуск: в конфиге остался неподтверждённый выход.
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let sink = saved.clone();
+    let cfg = Config {
+        name: "bravo".into(),
+        pending_leave: vec![gid],
+        ..Config::default()
+    };
+    let mut b = Node::start_cfg(
+        cfg,
+        local(server.addr),
+        server.pubkey,
+        b_id,
+        Arc::new(move |c: &Config| sink.lock().unwrap().push(c.clone())),
+    )
+    .unwrap();
+    b.wait("B подключён заново", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    // LEAVE из pending_leave ушёл сам: сервер снял участие и разослал
+    // дельту Removed — A больше B не видит.
+    wait_until("LEAVE повторился: A не видит B", T, || {
+        a.members(gid) == 0
+    });
+    wait_until("pending_leave очищен", T, || {
+        saved
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.pending_leave.is_empty())
+    });
+    assert!(!b.has_group(gid), "B вернулся в группу вместо выхода");
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

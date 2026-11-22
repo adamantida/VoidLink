@@ -127,6 +127,8 @@ pub struct GroupView {
     pub total: u32,
     pub my_ip: Option<u32>,
     pub owner_is_me: bool,
+    /// Отключён от доставки (issue #20): остаётся участником, кадры не ходят.
+    pub detached: bool,
     pub peers: Vec<PeerView>,
 }
 
@@ -186,6 +188,8 @@ pub struct InputPopup {
 pub enum ConfirmAction {
     DeleteGroup(u32),
     LeaveGroup(u32),
+    /// Отключиться от доставки группы / снова подключиться (issue #20).
+    DetachGroup(u32),
     DeleteFriend(String),
 }
 
@@ -329,11 +333,12 @@ pub enum Popup {
 
 /// Кнопки панели действий под шапкой: подпись и клавиша, которую «нажимает»
 /// клик (дальше работает та же логика, что и с клавиатуры).
-pub const TOOLBAR: [(&str, KeyCode, KeyModifiers); 11] = [
+pub const TOOLBAR: [(&str, KeyCode, KeyModifiers); 12] = [
     ("F1 справка", KeyCode::F(1), KeyModifiers::NONE),
     ("F2 создать", KeyCode::F(2), KeyModifiers::NONE),
     ("j войти", KeyCode::Char('j'), KeyModifiers::NONE),
     ("x выйти", KeyCode::Char('x'), KeyModifiers::NONE),
+    ("d отключ.", KeyCode::Char('d'), KeyModifiers::NONE),
     ("i пригласить", KeyCode::Char('i'), KeyModifiers::NONE),
     ("k исключить", KeyCode::Char('k'), KeyModifiers::NONE),
     ("a друг", KeyCode::Char('a'), KeyModifiers::NONE),
@@ -703,6 +708,7 @@ impl App {
                 total: peers.len() as u32 + 1,
                 my_ip: Some(gs.my_ip),
                 owner_is_me: gs.owner == self.my_pub,
+                detached: gs.detached,
                 peers,
             });
         }
@@ -717,6 +723,7 @@ impl App {
                     total: s.total,
                     my_ip: None,
                     owner_is_me: false,
+                    detached: false,
                     peers: Vec::new(),
                 });
             }
@@ -1583,7 +1590,10 @@ impl App {
             KeyCode::Char('j') => self.join_selected(eng),
             KeyCode::Char('x') => self.open_leave_group(),
             KeyCode::Char('a') => self.open_add_friend(),
-            KeyCode::Char('d') => self.open_del_friend(),
+            KeyCode::Char('d') if self.focus == Focus::Friends => self.open_del_friend(),
+            // В группах/участниках `d` — отключиться от доставки, не выходя
+            // из группы (issue #20): второе действие рядом с `x`.
+            KeyCode::Char('d') => self.open_detach_group(),
             KeyCode::Char('c') => self.copy_context(),
             KeyCode::Char('p') => self.open_profile_or_path(),
             KeyCode::Char('o') => self.reopen_invites(),
@@ -2136,11 +2146,18 @@ impl App {
                             }
                             PickMode::Kick => {
                                 self.send(eng, Cmd::Kick(p.gid, item.pubkey));
-                                self.toast(MsgKind::Warn, format!("исключён: {}", item.label));
+                                // Результат решает сервер (права, лимиты):
+                                // тост «исключён» до его ответа был бы ложью
+                                // (issue #19). Только нейтральная запись.
+                                let msg = format!("запрос на исключение отправлен: {}", item.label);
+                                self.log(MsgKind::Info, msg.clone());
+                                self.status_msg = msg;
                             }
                             PickMode::Ban => {
                                 self.send(eng, Cmd::Ban(p.gid, item.pubkey));
-                                self.toast(MsgKind::Warn, format!("забанен: {}", item.label));
+                                let msg = format!("запрос на бан отправлен: {}", item.label);
+                                self.log(MsgKind::Info, msg.clone());
+                                self.status_msg = msg;
                             }
                         }
                     }
@@ -2366,6 +2383,31 @@ impl App {
                 self.send(eng, Cmd::Leave(gid));
                 self.toast(MsgKind::Info, format!("выходим из {gid}"));
             }
+            // Отключение — локальное действие, но подтверждение сервера не
+            // гарантировано (старый сервер тип не знает): сообщение
+            // нейтральное, результат покажет колонка группы и статус.
+            ConfirmAction::DetachGroup(gid) => {
+                let off = self
+                    .groups
+                    .iter()
+                    .find(|g| g.gid == gid)
+                    .is_some_and(|g| !g.detached);
+                self.send(
+                    eng,
+                    if off {
+                        Cmd::Detach(gid)
+                    } else {
+                        Cmd::Attach(gid)
+                    },
+                );
+                let msg = if off {
+                    format!("отключение от {gid} отправлено: участие сохраняется")
+                } else {
+                    format!("подключение к {gid} отправлено")
+                };
+                self.log(MsgKind::Info, msg.clone());
+                self.status_msg = msg;
+            }
             ConfirmAction::DeleteFriend(alias) => match self.del_friend(eng, &alias) {
                 Ok(true) => self.toast(MsgKind::Ok, format!("друг {alias} удалён")),
                 Ok(false) => {}
@@ -2435,6 +2477,35 @@ impl App {
         }
     }
 
+    /// Отключиться от доставки группы / подключиться (issue #20). Подтверждение
+    /// по образцу выхода: это заметное действие, но участие сохраняется.
+    fn open_detach_group(&mut self) {
+        match self.selected_group() {
+            Some(g) if g.mine => {
+                let gid = g.gid;
+                let name = g.name.clone();
+                let off = !g.detached;
+                self.stack.push(Popup::Confirm(ConfirmPopup {
+                    title: if off {
+                        "Отключиться от группы?".into()
+                    } else {
+                        "Подключиться к группе?".into()
+                    },
+                    message: if off {
+                        format!(
+                            "группа {gid} «{name}»: останетесь участником, но кадры не будут ходить"
+                        )
+                    } else {
+                        format!("группа {gid} «{name}»: доставка снова включится")
+                    },
+                    action: ConfirmAction::DetachGroup(gid),
+                }));
+            }
+            Some(_) => self.toast(MsgKind::Warn, "вы не состоите в группе".into()),
+            None => self.toast(MsgKind::Warn, "не выбрана группа".into()),
+        }
+    }
+
     fn open_add_friend(&mut self) {
         self.stack.push(Popup::Input(InputPopup {
             title: "Добавить друга".into(),
@@ -2459,6 +2530,19 @@ impl App {
         }
     }
 
+    /// UX-предпроверка прав владельца (issue #19): сервер остаётся
+    /// единственным авторитетом, но если группа есть в снимке и мы не её
+    /// владелец — команду не отправляем. Группы нет в снимке — решает сервер.
+    fn deny_not_owner(&mut self, gid: u32) -> bool {
+        match self.groups.iter().find(|g| g.gid == gid) {
+            Some(g) if !g.owner_is_me => {
+                self.toast(MsgKind::Warn, "исключить может только владелец".into());
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn open_pick(&mut self, mode: PickMode) {
         let gid = match self.selected_group() {
             Some(g) => g.gid,
@@ -2467,6 +2551,11 @@ impl App {
                 return;
             }
         };
+        // Выбор участника для кика/бана открываем только владельцу (issue #19):
+        // иначе сервер откажет уже после отправки, а окно выбора обманывало.
+        if matches!(mode, PickMode::Kick | PickMode::Ban) && self.deny_not_owner(gid) {
+            return;
+        }
         let mut items: Vec<PeerChoice> = Vec::new();
         match mode {
             PickMode::Invite => {
@@ -3201,6 +3290,20 @@ impl App {
             Command::Leave(gid) => {
                 self.send(eng, Cmd::Leave(gid));
             }
+            // Второе действие рядом с выходом (issue #20): остаться участником,
+            // но разорвать доставку.
+            Command::Detach(gid) => {
+                self.send(eng, Cmd::Detach(gid));
+                let msg = format!("отключение от {gid} отправлено: участие сохраняется");
+                self.log(MsgKind::Info, msg.clone());
+                self.status_msg = msg;
+            }
+            Command::Attach(gid) => {
+                self.send(eng, Cmd::Attach(gid));
+                let msg = format!("подключение к {gid} отправлено");
+                self.log(MsgKind::Info, msg.clone());
+                self.status_msg = msg;
+            }
             Command::Create { name, private } => {
                 self.send(eng, Cmd::Create { name, private });
             }
@@ -3215,10 +3318,18 @@ impl App {
                 self.send(eng, Cmd::Invite(gid, pk));
             }
             Command::Kick(gid, peer) => {
+                // Предпроверка прав (issue #19): группу знаем и она не наша —
+                // команду не отправляем, сервер всё равно отказал бы.
+                if self.deny_not_owner(gid) {
+                    return Ok(());
+                }
                 let pk = self.resolve_peer(&peer)?;
                 self.send(eng, Cmd::Kick(gid, pk));
             }
             Command::Ban(gid, peer) => {
+                if self.deny_not_owner(gid) {
+                    return Ok(());
+                }
                 let pk = self.resolve_peer(&peer)?;
                 self.send(eng, Cmd::Ban(gid, pk));
             }
@@ -3329,6 +3440,9 @@ pub enum Command {
     /// Показать отложенные приглашения.
     Invites,
     Leave(u32),
+    /// Отключиться от доставки группы / снова подключиться (issue #20).
+    Detach(u32),
+    Attach(u32),
     Create {
         name: String,
         private: bool,
@@ -3389,6 +3503,9 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "decline" => Command::Decline(gid_of(0)?),
         "invites" => Command::Invites,
         "leave" => Command::Leave(gid_of(0)?),
+        // Отключиться/подключиться, оставаясь участником (issue #20).
+        "detach" => Command::Detach(gid_of(0)?),
+        "attach" => Command::Attach(gid_of(0)?),
         "create" => {
             let private = rest.contains(&"--private");
             let name = rest
@@ -3674,6 +3791,7 @@ mod tests {
                 total: 3,
                 my_ip: Some(0x6442_0002),
                 owner_is_me: true,
+                detached: false,
                 peers: vec![],
             },
             GroupView {
@@ -3685,6 +3803,7 @@ mod tests {
                 total: 1,
                 my_ip: None,
                 owner_is_me: false,
+                detached: false,
                 peers: vec![],
             },
         ];
@@ -4194,6 +4313,7 @@ mod tests {
                 total: 2,
                 my_ip: Some(0x6442_0102),
                 owner_is_me: true,
+                detached: false,
                 peers: vec![PeerView {
                     pubkey: [2; 32],
                     name: "bravo".into(),
@@ -4214,6 +4334,7 @@ mod tests {
                 total: 2,
                 my_ip: Some(0x6442_0202),
                 owner_is_me: false,
+                detached: false,
                 peers: vec![],
             },
         ];
@@ -4301,6 +4422,147 @@ mod tests {
         assert!(admin_view(&a).bans.is_empty());
         assert!(a.admin_key(key(KeyCode::Esc)).is_empty());
         assert!(a.stack.is_empty());
+    }
+
+    // ---------- issue #19: кик/бан не подтверждаются локально ----------
+
+    /// Тост успеха до ответа сервера — ложь: после отправки кика его нет,
+    /// есть нейтральная запись «запрос отправлен».
+    #[test]
+    fn кик_не_подтверждается_локально_до_ответа() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = owner_app();
+        a.connected = true;
+        a.handle_key(key(KeyCode::Char('k')), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::PeerPick(_))));
+        a.handle_key(key(KeyCode::Enter), &eng);
+        assert!(
+            matches!(eng.sent()[..], [Cmd::Kick(1, pk)] if pk == [2; 32]),
+            "{:?}",
+            eng.sent()
+        );
+        let texts: Vec<&str> = a.toasts.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("исключён")),
+            "оптимистичный тост успеха: {texts:?}"
+        );
+        assert!(
+            !a.log.iter().any(|l| l.text.contains("исключён")),
+            "успех кика записан в лог до ответа сервера"
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("запрос на исключение отправлен")),
+            "нет нейтральной записи о запросе"
+        );
+        assert!(a.status_msg.contains("запрос на исключение"));
+    }
+
+    /// Не-владельцу выбор участника для кика не открывается и команда не
+    /// уходит (сервер остаётся авторитетом — группу он всё равно проверит).
+    #[test]
+    fn не_владелец_не_открывает_выбор_для_кика() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = owner_app();
+        a.sel_group = Some(2); // группа есть в снимке, но не наша
+        a.handle_key(key(KeyCode::Char('k')), &eng);
+        assert!(
+            !matches!(a.stack.last(), Some(Popup::PeerPick(_))),
+            "выбор участника открыт не владельцу"
+        );
+        assert!(a.toasts.iter().any(|t| t.text.contains("только владелец")));
+        assert!(eng.sent().is_empty(), "команда ушла: {:?}", eng.sent());
+        // Палитра — та же предпроверка (peer даже не разбирается).
+        a.toasts.clear();
+        a.run_command("kick 2 deadbeef", &eng).unwrap();
+        assert!(a.toasts.iter().any(|t| t.text.contains("только владелец")));
+        assert!(
+            eng.sent().is_empty(),
+            "палитра отправила кик: {:?}",
+            eng.sent()
+        );
+        // Группы нет в снимке — решает сервер, команда уходит.
+        let hex = "11".repeat(32);
+        a.run_command(&format!("kick 9 {hex}"), &eng).unwrap();
+        assert!(
+            matches!(eng.sent().last(), Some(Cmd::Kick(9, pk)) if *pk == [0x11; 32]),
+            "серверу не отдан кик неизвестной группы: {:?}",
+            eng.sent()
+        );
+    }
+
+    /// Ошибка сервера на кик — единственный результат: тоста успеха нет.
+    #[test]
+    fn ошибка_сервера_на_кик_без_успеха() {
+        let eng = FakeEngine::new(Snapshot::default());
+        eng.push(Event::Error("может только владелец".into()));
+        let mut a = owner_app();
+        a.connected = true;
+        a.sync(&eng);
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.kind == MsgKind::Error && t.text.contains("владелец")),
+            "ошибка сервера не показана"
+        );
+        assert!(
+            !a.toasts.iter().any(|t| t.text.contains("исключён")),
+            "рядом с ошибкой — успех"
+        );
+        assert!(!a.log.iter().any(|l| l.text.contains("исключён")));
+    }
+
+    /// В группе доступны оба действия: «x» — выйти, «d» — отключиться от
+    /// доставки, оставаясь участником (issue #20).
+    #[test]
+    fn в_приватной_группе_есть_выйти_и_отключиться() {
+        let eng = FakeEngine::new(Snapshot::default());
+        let mut a = owner_app();
+        a.connected = true;
+        a.groups[0].private = true;
+        // «x» — выход (прежнее действие).
+        a.handle_key(key(KeyCode::Char('x')), &eng);
+        assert!(
+            matches!(a.stack.last(), Some(Popup::Confirm(c)) if matches!(c.action, ConfirmAction::LeaveGroup(1))),
+            "x не открывает выход"
+        );
+        a.stack.clear();
+        // «d» в группе — отключение, подтверждение шлёт Cmd::Detach.
+        a.handle_key(key(KeyCode::Char('d')), &eng);
+        assert!(
+            matches!(a.stack.last(), Some(Popup::Confirm(c)) if matches!(c.action, ConfirmAction::DetachGroup(1))),
+            "d не открывает отключение"
+        );
+        a.handle_key(key(KeyCode::Char('y')), &eng);
+        assert!(
+            matches!(eng.sent()[..], [Cmd::Detach(1)]),
+            "{:?}",
+            eng.sent()
+        );
+        assert!(
+            !a.toasts.iter().any(|t| t.text.contains("отключено")),
+            "отключение подтверждено локально до сервера"
+        );
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.text.contains("отключение от 1 отправлено"))
+        );
+        // Кнопка панели действий и командная строка знают оба действия.
+        assert!(TOOLBAR.iter().any(|(l, ..)| l.contains("отключ")));
+        assert_eq!(parse_command("detach 3").unwrap(), Command::Detach(3));
+        assert_eq!(parse_command("attach 3").unwrap(), Command::Attach(3));
+        a.stack.clear();
+        a.run_command("attach 1", &eng).unwrap();
+        assert!(matches!(eng.sent().last(), Some(Cmd::Attach(1))));
+        // В друзьях «d» по-прежнему удаляет друга, а не отключает группу.
+        a.focus = Focus::Friends;
+        a.handle_key(key(KeyCode::Char('d')), &eng);
+        assert!(
+            !matches!(a.stack.last(), Some(Popup::Confirm(c)) if matches!(c.action, ConfirmAction::DetachGroup(_))),
+            "d в друзьях открыл отключение группы"
+        );
     }
 
     #[test]
@@ -4916,6 +5178,7 @@ mod tests {
             total: 2,
             my_ip: Some(0x6442_0102),
             owner_is_me: true,
+            detached: false,
             peers: vec![peer.clone()],
         }];
         a.sel_group = Some(1);
