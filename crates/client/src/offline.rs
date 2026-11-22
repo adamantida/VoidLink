@@ -333,7 +333,8 @@ impl Shared {
             Cmd::SetStatus(_) => "статус сохранён".to_string(),
             Cmd::SetInvisible(on) => format!("невидимка: {}", if *on { "вкл" } else { "выкл" }),
             Cmd::ToggleAutojoin(gid) => format!("автовход: группа {gid}"),
-            Cmd::AddFriend { alias, .. } => format!("друг добавлен: {alias}"),
+            // `AddFriend` здесь нет: с issue #24 это сетевая заявка, офлайн её
+            // некуда отправить (см. `is_cfg_cmd` ниже).
             Cmd::DelFriend(_) => "друг удалён".to_string(),
             Cmd::SetAlias { alias, .. } => format!("alias: {alias}"),
             Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
