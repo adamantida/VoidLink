@@ -663,12 +663,12 @@ mod tests {
         // Друг, подходящий и алиасом, и ником, считается один раз.
         cfg.friends[0].alias = "тёзка".into();
         cfg.friends[1].alias.clear();
-        assert_eq!(
+        assert!(
             resolve_peer(&cfg, "тёзка")
                 .unwrap_err()
                 .to_string()
-                .contains("2"),
-            true
+                .contains('2'),
+            "оба тёзки — снова неоднозначно"
         );
     }
 

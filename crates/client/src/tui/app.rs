@@ -3698,10 +3698,9 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .first()
                 .ok_or_else(|| anyhow!("нужен friend code"))?
                 .to_string();
-            let alias = rest
-                .get(1)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| code.clone());
+            // Без имени — не подставляем код: в панели друзей покажется ник с
+            // сервера, а код в имени скрывал бы его (issue #24).
+            let alias = rest.get(1).map(|s| s.to_string()).unwrap_or_default();
             Command::AddFriend { code, alias }
         }
         "delfriend" => Command::DelFriend(
@@ -5364,7 +5363,7 @@ mod friends_tests {
     //! Друзья в TUI (issue #24): добавление из списка участников и карточки,
     //! отсечение себя и уже добавленных, ник вместо кода, офлайн-отказ.
 
-    use super::tests::{FakeEngine, app, online, peer, with_peers};
+    use super::tests::{FakeEngine, app, peer, with_peers};
     use super::*;
 
     #[test]
