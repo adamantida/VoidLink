@@ -333,7 +333,8 @@ impl Shared {
             Cmd::SetStatus(_) => "статус сохранён".to_string(),
             Cmd::SetInvisible(on) => format!("невидимка: {}", if *on { "вкл" } else { "выкл" }),
             Cmd::ToggleAutojoin(gid) => format!("автовход: группа {gid}"),
-            Cmd::AddFriend { alias, .. } => format!("друг добавлен: {alias}"),
+            // `AddFriend` здесь нет: с issue #24 это сетевая заявка, офлайн её
+            // некуда отправить (см. `is_cfg_cmd` ниже).
             Cmd::DelFriend(_) => "друг удалён".to_string(),
             Cmd::SetAlias { alias, .. } => format!("alias: {alias}"),
             Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
@@ -408,6 +409,12 @@ impl Shared {
 
 /// `true` — команду можно применить к конфигу без движка (и повторить
 /// демону позже).
+///
+/// Друзей-заявок здесь нет: `AddFriend` теперь сетевой кадр (`FRIEND_REQ`),
+/// без движка заявку доставить некому — офлайн он даёт ошибку «нужен
+/// запущенный движок», а не молчаливую локальную запись (issue #24).
+/// `DelFriend` и `SetAlias` остались локальными: первый снимает запись у себя,
+/// второй — ручное имя.
 fn is_cfg_cmd(cmd: &Cmd) -> bool {
     matches!(
         cmd,
@@ -415,7 +422,6 @@ fn is_cfg_cmd(cmd: &Cmd) -> bool {
             | Cmd::SetStatus(_)
             | Cmd::SetInvisible(_)
             | Cmd::ToggleAutojoin(_)
-            | Cmd::AddFriend { .. }
             | Cmd::DelFriend(_)
             | Cmd::SetAlias { .. }
             | Cmd::AddServer { .. }
@@ -442,13 +448,6 @@ pub fn apply_cfg_cmd(c: &mut Config, cmd: Cmd) {
                 c.autojoin.remove(i);
             } else {
                 c.autojoin.push(gid);
-            }
-        }
-        Cmd::AddFriend { pubkey, alias } => {
-            let hex = proto::hex_of(&pubkey);
-            match c.friends.iter_mut().find(|f| f.pubkey == hex) {
-                Some(f) => f.alias = alias,
-                None => c.friends.push(store::StoredFriend { pubkey: hex, alias }),
             }
         }
         Cmd::DelFriend(pubkey) => {

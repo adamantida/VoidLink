@@ -439,6 +439,39 @@ fn ipv4(src: u32, dst: u32, data: &[u8]) -> Vec<u8> {
 
 const T: Duration = Duration::from_secs(10);
 
+impl Node {
+    /// Состояние друга в `client.json` движка (issue #24).
+    fn friend_state(&self, pk: &[u8; 32]) -> Option<crate::store::FriendState> {
+        let hex = proto::hex_of(pk);
+        self.eng
+            .cfg
+            .lock()
+            .unwrap()
+            .friends
+            .iter()
+            .find(|f| f.pubkey == hex)
+            .map(|f| f.state)
+    }
+
+    /// Ник друга в `client.json` (кэш из `FRIEND_LIST`).
+    fn friend_nick(&self, pk: &[u8; 32]) -> Option<String> {
+        let hex = proto::hex_of(pk);
+        self.eng
+            .cfg
+            .lock()
+            .unwrap()
+            .friends
+            .iter()
+            .find(|f| f.pubkey == hex)
+            .map(|f| f.nick.clone())
+    }
+
+    /// Сколько записей в списке друзей движка.
+    fn friends_len(&self) -> usize {
+        self.eng.cfg.lock().unwrap().friends.len()
+    }
+}
+
 /// Правило потерь посредника: (к серверу?, тип фрейма, сколько фреймов
 /// каждого типа клиент отправил, включая этот) → потерять.
 type DropRule = Box<dyn FnMut(bool, u8, &HashMap<u8, usize>) -> bool + Send>;
@@ -3254,4 +3287,553 @@ fn e2e_встречные_подсказки_федерации_не_ломаю�
     b.stop();
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+// ---------- #21: аренда адреса с TTL ----------
+
+#[test]
+fn e2e_новая_identity_занимает_адрес_исчезнувшей() {
+    // Удалённый профиль пересоздаётся с новым ключом — прежняя identity не
+    // вернётся. Её аренда адреса без активности истекает (`--lease-ttl-days`),
+    // identity выселяется из групп как по LEAVE, адрес возвращается в пул.
+    let dir = temp_dir("lease");
+    let limits = tunnel_server::Limits {
+        lease_ttl: Duration::from_secs(3),
+        // По умолчанию аренды проверяются раз в минуту — в тесте на каждом
+        // проходе housekeeping (раз в 2 с).
+        lease_gc_every: Duration::from_millis(10),
+        // Сессия брошенного клиента — офлайн по таймауту, а не через 30 с.
+        session_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    // Метрики — авторитетный счётчик аренд: `server.json` пишется раз в 3 с,
+    // и по нему не отличить «аренды не было» от «аренда освобождена».
+    let server = tunnel_server::Server::start(tunnel_server::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        data_dir: dir.clone(),
+        workers: 2,
+        quiet: true,
+        limits: limits.clone(),
+        metrics: Some("127.0.0.1:0".parse().unwrap()),
+        ..Default::default()
+    })
+    .expect("сервер стартует");
+    let metrics = server.metrics_addr.expect("метрики включены");
+    let mut a = Node::start("alpha", &server);
+    a.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let gid = a.create("club", false);
+    let a_ip = a.my_ip(gid);
+    let a_pub = proto::hex_of(&a.eng.my_pub);
+    let mut b = Node::start("bravo", &server);
+    b.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.join(gid);
+    let b_ip = b.my_ip(gid);
+    let b_pub = proto::hex_of(&b.eng.my_pub);
+    assert_ne!(a_ip, b_ip, "у каждой identity свой адрес");
+    wait_until("обе аренды выданы", T, || {
+        metric_value(&metrics_text(metrics), "voidlink_leases") == 2
+    });
+    drop(b); // профиль удалён: identity больше не появится
+
+    // Освобождение: сессия — офлайн по таймауту, аренда — по TTL, проверка —
+    // на проходе housekeeping. Владелец группы аренду не теряет.
+    wait_until(
+        "аренда исчезнувшей освобождена",
+        Duration::from_secs(20),
+        || metric_value(&metrics_text(metrics), "voidlink_leases") == 1,
+    );
+    assert!(
+        metric_value(&metrics_text(metrics), "voidlink_leases_expired_total") >= 1,
+        "счётчик освобождённых аренд"
+    );
+
+    // `server.json`: аренды и «призрачного» участника больше нет, владелец
+    // на месте (запись — в пределах SAVE_EVERY).
+    let path = dir.join("server.json");
+    let state = |p: &std::path::Path| -> serde_json::Value {
+        std::fs::read(p)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    wait_until(
+        "server.json без исчезнувшей",
+        Duration::from_secs(20),
+        || {
+            let j = state(&path);
+            j["user_ips"].get(&b_pub).is_none()
+                && j["lease_seen"].get(&b_pub).is_none()
+                && j["user_ips"].get(&a_pub).is_some()
+        },
+    );
+    let j = state(&path);
+    let members: Vec<String> = j["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|g| g["id"].as_u64() == Some(u64::from(gid)))
+        .flat_map(|g| g["members"].as_array().cloned().unwrap_or_default())
+        .filter_map(|m| m[0].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !members.contains(&b_pub),
+        "«призрачный» участник выселен: {members:?}"
+    );
+    assert!(members.contains(&a_pub), "владелец группы на месте");
+    assert_eq!(j["user_ips"][&a_pub].as_u64(), Some(u64::from(a_ip)));
+
+    // Перезапуск: указатель выдачи не персистится и начинается с начала
+    // пула, поэтому освобождённый адрес достаётся новой identity.
+    drop(a);
+    server.stop();
+    let server = start_server_with(&dir, 0, limits);
+    let mut c = Node::start("charlie", &server);
+    c.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    c.join(gid);
+    assert_eq!(
+        c.my_ip(gid),
+        b_ip,
+        "адрес исчезнувшей identity достался новой"
+    );
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- issue #19: права кика ----------
+
+/// Не-владелец получает ошибку сервера, а не «успех»: состав и ключ группы
+/// не меняются, доставка всем участникам работает.
+#[test]
+fn не_владелец_кик_получает_error_и_никого_не_выкидывает() {
+    let dir = temp_dir("kick-denied");
+    let server = start_server(&dir, 0);
+    let (a, mut b, c, gid) = three_in_group(&server, false);
+    let (epoch, c_pub) = (a.epoch(gid), c.eng.my_pub);
+    b.eng.cmds.send(Cmd::Kick(gid, c_pub)).unwrap();
+    b.wait(
+        "B: отказ сервера",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("владелец")),
+    );
+    // Никого не выкинуло: C в группе, эпоха и состав прежние.
+    assert!(c.has_group(gid), "C выкинут отказом");
+    assert_eq!(a.epoch(gid), epoch, "отказ ротировал ключ");
+    assert_eq!(a.members(gid), 2, "отказ изменил состав");
+    deliver(&a, &c, gid, "after-denied-kick", T);
+    drop((a, b, c));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- issue #20: удалённые, отключённые и потерянные выходы ----------
+
+/// Вход по gid удалённой группы: «группа не существует», группы нет.
+#[test]
+fn e2e_вход_по_старому_gid_после_удаления_не_пускает() {
+    let dir = temp_dir("old-gid");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let gid = a.create("gone", false);
+    a.eng.cmds.send(Cmd::Delete(gid)).unwrap();
+    a.wait(
+        "группа удалена",
+        T,
+        |e| matches!(e, Event::GroupDeleted { gid: g, .. } if *g == gid),
+    );
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.eng.cmds.send(Cmd::Join(gid)).unwrap();
+    b.wait(
+        "B: «группа не существует»",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("не существует")),
+    );
+    assert!(!b.has_group(gid), "B вошёл по старому gid");
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Отключение от доставки не выходит из группы: участие, ключ и состав
+/// сохраняются, кадры не ходят; attach возвращает доставку.
+#[test]
+fn e2e_отключиться_и_подключиться_сохраняет_участие() {
+    let dir = temp_dir("detach-e2e");
+    let server = start_server(&dir, 0);
+    let (a, b, _c, gid) = three_in_group(&server, false);
+    let (epoch, members) = (a.epoch(gid), a.members(gid));
+    b.eng.cmds.send(Cmd::Detach(gid)).unwrap();
+    wait_until("B отключён локально", T, || {
+        b.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .is_some_and(|g| g.detached)
+    });
+    // Сервер подтвердил: своя запись в GROUP_STATE — офлайн.
+    wait_until(
+        "сервер подтвердил отключение",
+        T,
+        || {
+            b.eng
+                .groups
+                .lock()
+                .unwrap()
+                .get(&gid)
+                .is_some_and(|g| !g.server_online)
+        },
+    );
+    assert!(b.has_group(gid), "отключение вышло из группы");
+    assert_eq!(b.members(gid), 2, "отключение изменило состав");
+    assert_eq!(a.epoch(gid), epoch, "отключение ротировало ключ");
+    assert_eq!(a.members(gid), members);
+    // Пакет в отключённую группу не доставляется (и через сервер, и напрямую).
+    let pkt = ipv4(a.my_ip(gid), b.my_ip(gid), b"while-detached");
+    for _ in 0..10 {
+        a.eng.send_ip_packet(&pkt);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(b.got(&pkt), 0, "отключённому доставлен пакет");
+    // Возврат доставки.
+    b.eng.cmds.send(Cmd::Attach(gid)).unwrap();
+    wait_until("B подключён обратно", T, || {
+        b.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .is_some_and(|g| !g.detached && g.server_online)
+    });
+    deliver(&a, &b, gid, "after-attach", T);
+    assert_eq!(b.epoch(gid), epoch, "attach ротировал ключ");
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Клиент умер, не получив подтверждения выхода: `pending_leave` в конфиге
+/// переживает рестарт, LEAVE повторяется сам, сервер снимает участие.
+#[test]
+fn e2e_потерянный_leave_повторяется_после_рестарта() {
+    let dir = temp_dir("leave-restart");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    a.eng
+        .cmds
+        .send(Cmd::Create {
+            name: "secret".into(),
+            private: true,
+        })
+        .unwrap();
+    let gid = match a.wait("A создал группу", T, |e| {
+        matches!(e, Event::GroupJoined { .. })
+    }) {
+        Event::GroupJoined { gid, .. } => gid,
+        _ => unreachable!(),
+    };
+    a.eng.cmds.send(Cmd::Invite(gid, b_pub)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Первый запуск B: вход по приглашению, затем «падение» без LEAVE.
+    let mut b = Node::start_as("bravo", &server, b_id.clone());
+    b.wait(
+        "B: приглашение",
+        T,
+        |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid),
+    );
+    b.join(gid);
+    // A видит B участником: сервер принял вход.
+    wait_until("A видит B в группе", T, || a.members(gid) == 1);
+    drop(b); // процесс умер: LEAVE не ушёл
+
+    // Второй запуск: в конфиге остался неподтверждённый выход.
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let sink = saved.clone();
+    let cfg = Config {
+        name: "bravo".into(),
+        pending_leave: vec![gid],
+        ..Config::default()
+    };
+    let mut b = Node::start_cfg(
+        cfg,
+        local(server.addr),
+        server.pubkey,
+        b_id,
+        Arc::new(move |c: &Config| sink.lock().unwrap().push(c.clone())),
+    )
+    .unwrap();
+    b.wait("B подключён заново", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    // LEAVE из pending_leave ушёл сам: сервер снял участие и разослал
+    // дельту Removed — A больше B не видит.
+    wait_until("LEAVE повторился: A не видит B", T, || {
+        a.members(gid) == 0
+    });
+    wait_until("pending_leave очищен", T, || {
+        saved
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.pending_leave.is_empty())
+    });
+    assert!(!b.has_group(gid), "B вернулся в группу вместо выхода");
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- друзья (issue #24) ----------
+
+#[test]
+fn e2e_заявка_в_друзья_принятие_и_взаимность() {
+    let dir = temp_dir("friend-accept");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    // A просит дружбы: заявка уходит серверу, а не в свой конфиг.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    // B видит заявку с ником, а не с кодом.
+    b.wait("B получил заявку", T, |e| {
+        matches!(e, Event::FriendRequest { pubkey, name, expires_in }
+            if *pubkey == a_pub && name == "alpha" && *expires_in > 0)
+    });
+    // Инициатор — «ждёт ответа», цель — «пришла заявка».
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::PendingOut)
+    );
+    assert_eq!(
+        b.friend_state(&a_pub),
+        Some(crate::store::FriendState::PendingIn)
+    );
+
+    // Принятие: оба узнают, у обоих дружба. Принявший и так знает (он нажал
+    // «принять») — ему событие не нужно, состояние ставится сразу.
+    b.eng.cmds.send(Cmd::AcceptFriend(a_pub)).unwrap();
+    a.wait("A: заявку приняли", T, |e| {
+        matches!(e, Event::FriendAccepted { pubkey, name }
+            if *pubkey == b_pub && name == "bravo")
+    });
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::Accepted),
+        "у инициатора дружба"
+    );
+    assert_eq!(
+        b.friend_state(&a_pub),
+        Some(crate::store::FriendState::Accepted),
+        "у принявшего тоже — пара одна на двоих"
+    );
+    // Ник пришёл с сервера (кэш в client.json).
+    assert_eq!(a.friend_nick(&b_pub).as_deref(), Some("bravo"));
+    assert_eq!(b.friend_nick(&a_pub).as_deref(), Some("alpha"));
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_заявка_офлайн_цели_доставляется_после_hello() {
+    let dir = temp_dir("friend-offline");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let a_pub = a.eng.my_pub;
+
+    // B ещё не запущен: заявка ждёт на сервере (взаимность для офлайн-цели —
+    // ради этого сервер и хранит заявки).
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut b = Node::start_as("bravo", &server, b_id);
+    b.wait("B: заявка пришла после HELLO", T, |e| {
+        matches!(e, Event::FriendRequest { pubkey, name, .. }
+            if *pubkey == a_pub && name == "alpha")
+    });
+    // B видит её в списке как входящую, а A — как исходящую.
+    assert_eq!(
+        b.friend_state(&a_pub),
+        Some(crate::store::FriendState::PendingIn)
+    );
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::PendingOut)
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_отказ_в_друзья_уведомляет_инициатора() {
+    let dir = temp_dir("friend-decline");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    b.wait(
+        "B получил заявку",
+        T,
+        |e| matches!(e, Event::FriendRequest { pubkey, .. } if *pubkey == a_pub),
+    );
+    b.eng.cmds.send(Cmd::DeclineFriend(a_pub)).unwrap();
+    a.wait("A: заявку отклонили", T, |e| {
+        matches!(e, Event::FriendDeclined { pubkey, name }
+            if *pubkey == b_pub && name == "bravo")
+    });
+    // У обоих заявки больше нет, дружбы тоже.
+    assert_eq!(a.friend_state(&b_pub), None);
+    assert_eq!(b.friend_state(&a_pub), None);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_удаление_друга_снимает_запись_у_обоих() {
+    let dir = temp_dir("friend-remove");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    // Сначала дружба.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    b.wait(
+        "B получил заявку",
+        T,
+        |e| matches!(e, Event::FriendRequest { pubkey, .. } if *pubkey == a_pub),
+    );
+    b.eng.cmds.send(Cmd::AcceptFriend(a_pub)).unwrap();
+    a.wait("A: дружба", T, |e| {
+        matches!(e, Event::FriendAccepted { .. })
+    });
+
+    // Снимает инициатор — у второй стороны запись тоже уходит.
+    a.eng.cmds.send(Cmd::RemoveFriend(b_pub)).unwrap();
+    b.wait(
+        "B: дружбу сняли",
+        T,
+        |e| matches!(e, Event::FriendRemoved { pubkey } if *pubkey == a_pub),
+    );
+    assert_eq!(a.friend_state(&b_pub), None);
+    assert_eq!(b.friend_state(&a_pub), None);
+    assert_eq!(b.friends_len(), 0);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_заявка_себе_и_повтор_не_создают_дубликата() {
+    let dir = temp_dir("friend-self");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    // Себе — отказ, записи нет.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: a_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    a.wait(
+        "A: себя нельзя",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("себя")),
+    );
+    assert_eq!(a.friend_state(&a_pub), None);
+    assert_eq!(a.friends_len(), 0);
+
+    // Повтор заявки: заявка одна, продлевается срок. У цели второго окна
+    // нет — это тот же человек, ответ на прежнее окно уже был бы.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(a.friends_len(), 1, "повтор не плодит записей");
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::PendingOut)
+    );
+    assert_eq!(a.friend_state(&a_pub), None);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -8,6 +8,13 @@
 //! DNS клиента). Пул кончился — адрес забирается у identity, которая сейчас
 //! ни в одной группе (новые identity бесплатны, и без этого их поток занял
 //! бы весь пул навсегда).
+//!
+//! Аренда продлевается активностью identity (`touch`: HELLO3, вход в группу)
+//! и без неё истекает через `Limits::lease_ttl` (issue #21): удалённый
+//! профиль — это новый ключ, и без срока аренда (а с ней «призрачный»
+//! участник групп) осталась бы навсегда. Кто именно освобождает адрес и
+//! выселяет identity, решает сервер (`expire_leases`): `Leases` только
+//! помнит время и говорит, что истекло.
 
 use std::collections::HashMap;
 
@@ -48,6 +55,10 @@ fn pool() -> impl Iterator<Item = u32> {
 pub struct Leases {
     by_pub: HashMap<[u8; 32], u32>,
     by_ip: HashMap<u32, [u8; 32]>,
+    /// Когда аренда продлевалась в последний раз (unix мс, как в
+    /// `server.json` → `lease_seen`). Есть у каждой аренды: `assign` и
+    /// `get_or_alloc` кладут 0, время проставляет вызывающий (`touch`).
+    seen: HashMap<[u8; 32], u64>,
     /// Адреса, закреплённые общим пулом федерации за identity других
     /// серверов (`FED_ADDR_PUSH`): локальному пулу они не выдаются. Пока
     /// федерации нет, множество пусто и выдача не меняется.
@@ -90,7 +101,53 @@ impl Leases {
     pub fn revoke(&mut self, pk: &[u8; 32]) -> Option<u32> {
         let ip = self.by_pub.remove(pk)?;
         self.by_ip.remove(&ip);
+        // Время отозванной аренды забывается: перевыданный адрес получает
+        // новый отсчёт, а не чужой (issue #21).
+        self.seen.remove(pk);
         Some(ip)
+    }
+
+    /// Продлить аренду `pk` — активность identity (`now_ms`, unix мс).
+    /// Новую аренду не выдаёт: для identity без адреса — no-op.
+    pub fn touch(&mut self, pk: &[u8; 32], now_ms: u64) {
+        if self.by_pub.contains_key(pk) {
+            self.seen.insert(*pk, now_ms);
+        }
+    }
+
+    /// Когда аренда продлевалась в последний раз (unix мс). `None` — аренды
+    /// нет. Аренда без записи времени (не должно случаться: `assign` и
+    /// `get_or_alloc` её пишут) считается начатой с нуля.
+    pub fn seen_of(&self, pk: &[u8; 32]) -> Option<u64> {
+        self.by_pub
+            .get(pk)
+            .map(|_| self.seen.get(pk).copied().unwrap_or(0))
+    }
+
+    /// Выставить время аренды (загрузка `server.json`: у старого файла
+    /// записи нет — сервер ставит `now`, чтобы никого не выселить на старте).
+    pub fn set_seen(&mut self, pk: &[u8; 32], seen_ms: u64) {
+        if self.by_pub.contains_key(pk) {
+            self.seen.insert(*pk, seen_ms);
+        }
+    }
+
+    /// Истёкшие аренды `(identity, адрес)`: без активности дольше `ttl_ms`.
+    /// `ttl_ms == 0` — аренда не истекает никогда (освобождение выключено).
+    /// Сама ничего не меняет: освобождает адрес и выселяет из групп сервер.
+    pub fn expired(&self, now_ms: u64, ttl_ms: u64) -> Vec<([u8; 32], u32)> {
+        if ttl_ms == 0 {
+            return Vec::new();
+        }
+        self.by_pub
+            .iter()
+            .filter(|(pk, _)| {
+                self.seen
+                    .get(*pk)
+                    .is_some_and(|seen| now_ms.saturating_sub(*seen) > ttl_ms)
+            })
+            .map(|(pk, ip)| (*pk, *ip))
+            .collect()
     }
 
     #[cfg(test)]
@@ -114,6 +171,9 @@ impl Leases {
         }
         self.by_pub.insert(pk, ip);
         self.by_ip.insert(ip, pk);
+        // Время проставит вызывающий (`touch`): у загрузки файла — своё
+        // (`set_seen`), у выдачи по активности — `now`.
+        self.seen.insert(pk, 0);
         true
     }
 
@@ -147,11 +207,13 @@ impl Leases {
                     .map(|(k, ip)| (*k, *ip))?;
                 self.by_pub.remove(&old);
                 self.by_ip.remove(&ip);
+                self.seen.remove(&old);
                 ip
             }
         };
         self.by_pub.insert(pk, ip);
         self.by_ip.insert(ip, pk);
+        self.seen.insert(pk, 0);
         Some(ip)
     }
 }
@@ -275,5 +337,63 @@ mod tests {
         l.revoke(&pk(0));
         l.reserve(held);
         assert_eq!(l.get_or_alloc(pk(n), |_| true), None);
+    }
+
+    // ---------- аренда с TTL (issue #21) ----------
+
+    #[test]
+    fn touch_продлевает_аренду() {
+        let mut l = Leases::default();
+        let a = l.get_or_alloc(pk(1), |_| true).unwrap();
+        // Новая аренда: время ставит вызывающий.
+        assert_eq!(l.seen_of(&pk(1)), Some(0));
+        l.touch(&pk(1), 1_000);
+        assert_eq!(l.seen_of(&pk(1)), Some(1_000));
+        assert!(l.expired(1_050, 100).is_empty(), "продлена только что");
+        l.touch(&pk(1), 2_000);
+        assert_eq!(l.seen_of(&pk(1)), Some(2_000), "продление сдвигает срок");
+        // touch чужой identity новой аренды не выдаёт.
+        l.touch(&pk(9), 2_000);
+        assert!(l.get(&pk(9)).is_none());
+        assert_eq!(l.seen_of(&pk(9)), None);
+        assert_eq!(l.get(&pk(1)), Some(a), "адрес не изменился");
+    }
+
+    #[test]
+    fn аренда_истекает_без_активности() {
+        let mut l = Leases::default();
+        let a = l.get_or_alloc(pk(1), |_| true).unwrap();
+        let b = l.get_or_alloc(pk(2), |_| true).unwrap();
+        l.touch(&pk(1), 1_000);
+        l.touch(&pk(2), 1_000);
+        assert!(l.expired(1_000, 100).is_empty(), "срок ещё не вышел");
+        assert!(l.expired(1_100, 100).is_empty(), "ровно TTL — ещё жива");
+        let mut gone = l.expired(1_101, 100);
+        gone.sort_unstable();
+        assert_eq!(gone, vec![(pk(1), a), (pk(2), b)], "обе истекли");
+        // Продление одной — истекает только вторая.
+        l.touch(&pk(1), 2_000);
+        assert_eq!(l.expired(2_050, 100), vec![(pk(2), b)]);
+        // `ttl_ms == 0` — освобождение выключено, не истекает никто.
+        assert!(l.expired(u64::MAX, 0).is_empty());
+        // Часы назад (`now` раньше `seen`) — не истечение.
+        assert!(l.expired(1_000, 100).is_empty());
+    }
+
+    #[test]
+    fn revoke_забывает_время_аренды() {
+        let mut l = Leases::default();
+        let a = l.get_or_alloc(pk(1), |_| true).unwrap();
+        l.touch(&pk(1), 777);
+        assert_eq!(l.seen_of(&pk(1)), Some(777));
+        assert_eq!(l.revoke(&pk(1)), Some(a));
+        assert_eq!(l.seen_of(&pk(1)), None, "время отозванной аренды забыто");
+        assert!(l.expired(999_999, 1).is_empty(), "истёкших не осталось");
+        // Перевыдача тому же адресу — новый отсчёт, а не старое время.
+        assert!(l.assign(pk(2), a));
+        assert_eq!(l.seen_of(&pk(2)), Some(0));
+        l.set_seen(&pk(2), 5_000);
+        assert_eq!(l.seen_of(&pk(2)), Some(5_000), "время из server.json");
+        assert!(l.expired(5_050, 100).is_empty());
     }
 }

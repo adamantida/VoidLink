@@ -23,7 +23,7 @@ test`, CI), лаборатория NAT на сетевых пространст�
 
 ```bash
 # весь workspace (как в CI); счёт тестов для бейджа README:
-cargo test --workspace -- --list     # 580 на Windows (+26 unix-only на Linux/macOS)
+cargo test --workspace -- --list     # 695 на Windows (+26 unix-only на Linux/macOS)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
@@ -43,7 +43,7 @@ done
 нет `cargo test --list`; нужен `--` перед аргументами тест-раннера). Счёт
 зависит от ОС: файлы с `#![cfg(unix)]` (демон на Unix-сокете) на Windows не
 компилируются, зато часть платформенных тестов Windows не собирается на
-Unix. Бейдж — 580: значение на Windows, где шла проверка этапа 9 и фикс пайпа; точные
+Unix. Бейдж — 695: значение на Windows, где шла проверка этапа 9 и фикс пайпа; точные
 числа по ОС даёт CI.
 
 Каждый `run`/`up` начинает с чистого состояния: каталоги `c1`, `c2`, `srv` и

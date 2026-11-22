@@ -9,6 +9,7 @@ pub mod engine;
 #[cfg(test)]
 mod engine_e2e;
 pub mod federation;
+pub mod friends;
 pub mod invites;
 pub mod ipv6;
 /// Mesh-подсистема (L2) — каркас T3.

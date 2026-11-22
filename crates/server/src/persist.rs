@@ -28,6 +28,80 @@ pub struct Persisted {
     /// v4 поля нет — федерация просто не настроена.
     #[serde(default)]
     pub federation: PFederation,
+    /// hex pubkey → unix мс последней активности аренды адреса (issue #21).
+    /// Нет поля (файл v4 и раньше) — все аренды получают отсчёт от момента
+    /// загрузки, поэтому обновление сервера никого не выселяет сразу.
+    #[serde(default)]
+    pub lease_seen: BTreeMap<String, u64>,
+    /// Надгробия удалённых групп (issue #20): gid удалённой группы не
+    /// переиспользуется, пока надгробие живо, а вход по нему даёт
+    /// «группа не существует», а не вход в чужую группу с тем же номером.
+    #[serde(default)]
+    pub deleted: Vec<PTomb>,
+    /// Недавние выходы из групп (issue #20): приватная группа после выхода
+    /// пускает только по новому приглашению, в том числе после рестарта.
+    #[serde(default)]
+    pub left: Vec<PLeft>,
+    /// Дружбы и заявки (issue #24).
+    #[serde(default)]
+    pub friends: PFriends,
+}
+
+/// Надгробие удалённой группы (`server.json` → `deleted`).
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PTomb {
+    pub gid: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub owner: [u8; 32],
+    #[serde(default)]
+    pub rev: u64,
+    /// unix мс удаления: надгробие живёт `Limits::tomb_ttl`.
+    #[serde(default)]
+    pub at_ms: u64,
+}
+
+/// Недавний выход из группы (`server.json` → `left`).
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PLeft {
+    /// hex ed25519 вышедшего.
+    #[serde(default)]
+    pub pk: String,
+    pub gid: u32,
+    #[serde(default)]
+    pub at_ms: u64,
+}
+
+/// Дружбы и заявки (`server.json` → `friends`, issue #24).
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PFriends {
+    /// Неотвеченные заявки: живут `Limits::friend_req_ttl`.
+    #[serde(default)]
+    pub requests: Vec<PFriendReq>,
+    /// Принятые пары `(min, max)`: взаимность гарантирует сервер.
+    #[serde(default)]
+    pub edges: Vec<PFriendEdge>,
+}
+
+/// Заявка в друзья.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PFriendReq {
+    pub from: [u8; 32],
+    pub to: [u8; 32],
+    #[serde(default)]
+    pub created_ms: u64,
+    #[serde(default)]
+    pub from_name: String,
+}
+
+/// Принятая дружба: `a < b` по лексикографическому порядку ключей.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PFriendEdge {
+    pub a: [u8; 32],
+    pub b: [u8; 32],
+    #[serde(default)]
+    pub since_ms: u64,
 }
 
 /// Секция `federation` в `server.json`.

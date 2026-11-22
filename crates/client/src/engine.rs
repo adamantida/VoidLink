@@ -36,9 +36,9 @@ use proto::payloads;
 use tunnel_protocol as proto;
 
 use crate::path::{self, PathKind, PathTable};
-use crate::store::{Config, TransportMode};
+use crate::store::{self, Config, TransportMode};
 use crate::tcp_link::{self, TcpLink};
-use crate::{dht, federation, mesh, probe};
+use crate::{dht, federation, friends, mesh, probe};
 
 #[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
@@ -53,10 +53,10 @@ pub const DEFAULT_ADAPTER: &str = "voidlink0";
 pub const DEFAULT_ADAPTER: &str = "utun";
 /// Шаг цикла движка (верхняя граница задержки таймеров).
 const TICK: Duration = Duration::from_millis(100);
-/// RTT-зонд онлайн-пирам. Для прямых каналов он же держит NAT-маппинг.
-const RTT_EVERY: Duration = Duration::from_secs(2);
-/// PUNCH онлайн-пирам без прямого канала.
+/// PUNCH онлайн-пирам без прямого канала: базовый шаг (issue #16).
 const PUNCH_EVERY: Duration = Duration::from_secs(5);
+/// Потолок интервала PUNCH с бэкоффом (issue #16).
+const PUNCH_MAX: Duration = Duration::from_secs(60);
 /// CTRL_PING серверу (сервер держит сессию 30 с без пакетов).
 const PING_EVERY: Duration = Duration::from_secs(5);
 const LIST_EVERY: Duration = Duration::from_secs(15);
@@ -69,11 +69,15 @@ const MESH_INFO_EVERY: Duration = Duration::from_secs(5 * 60);
 /// `SERVER_HINT` серверу (T4): сразу после WELCOME и далее не чаще раза в
 /// 5 минут. Старый сервер тип не знает и молча роняет — шлём всем.
 const SERVER_HINT_EVERY: Duration = Duration::from_secs(5 * 60);
-/// Обслуживание DHT (устаревание, сохранение контактов) раз в 10 секунд:
-/// контакты должны пережить рестарт и мёртвый сервер, но запись файла —
-/// только когда таблица реально изменилась.
+/// Обслуживание DHT (устаревание, сохранение контактов) раз в 10 секунд.
+/// Кэш `mesh.contacts` переживает рестарт процесса и мёртвый сервер в уже
+/// запущенном клиенте, но сам по себе входа в сеть не даёт: ключи групп,
+/// состав и `my_ip` выдаёт сервер. Запись файла — только когда таблица
+/// реально изменилась (issue #27).
 const DHT_EVERY: Duration = Duration::from_secs(10);
-/// Поиск `find_node` для меш-пира не чаще раза в 5 минут.
+/// Поиск `find_node` для меш-пира не чаще раза в 5 минут. Спрашивать есть кого
+/// только при непустой таблице: первый источник контактов — `MESH_SEED` и
+/// состав групп от сервера, кэш `mesh.contacts` — лишь подсказка.
 const LOOKUP_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Сколько кандидатов-реле пробуем на один кадр (L2).
 const RELAY_TRIES: usize = 3;
@@ -93,9 +97,30 @@ const COOKIE_GAP: Duration = Duration::from_millis(250);
 /// Нет прямых фреймов от пира столько — прямой канал считается потерянным,
 /// трафик идёт через релей (пир сменил порт, NAT закрыл маппинг…).
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Сколько прямой канал живёт без единого прямого фрейма (issue #16): не
+/// меньше [`DIRECT_TIMEOUT`] и не меньше трёх интервалов проб. При интервале
+/// 5 с это 15 с, при 20 с — 60 с: одна-две пропущенные пробы канал не убивают.
+fn direct_timeout(interval: Duration) -> Duration {
+    DIRECT_TIMEOUT.max(interval * 3)
+}
+
+/// Интервал PUNCH с бэкоффом после `fails` неудач подряд (issue #16):
+/// 5 → 10 → 20 → 40 → 60 с, дальше — потолок.
+fn punch_interval(fails: u32) -> Duration {
+    let mut d = PUNCH_EVERY;
+    for _ in 0..fails.min(8) {
+        d *= 2;
+    }
+    d.min(PUNCH_MAX)
+}
+
 /// LEAVE повторяется, пока сервер не подтвердит выход списком групп.
 const LEAVE_RETRY: Duration = Duration::from_secs(1);
 const LEAVE_GIVE_UP: Duration = Duration::from_secs(20);
+/// GROUP_ATTACH без подтверждения столько — сообщаем, что отключение
+/// (подключение) осталось локальным: старый сервер тип не знает (issue #20).
+const ATTACH_CONFIRM: Duration = Duration::from_secs(5);
 /// Окно INVITE_LIST, которого ждём (после HELLO3 или запрошенное
 /// LIST_INVITES), запрашивается снова, пока не придёт: потерянное окно
 /// иначе прятало бы приглашения до переподключения.
@@ -175,6 +200,11 @@ pub struct PeerSess {
     pub mesh_x: Option<[u8; 32]>,
     /// Возможности mesh (`mesh::caps::*`) из mesh-секции.
     pub mesh_caps: u8,
+    /// Неудачных PUNCH подряд (issue #16): интервал растёт до `PUNCH_MAX`,
+    /// сбрасывается появлением прямого канала.
+    pub punch_fails: u32,
+    /// Когда снова можно слать PUNCH этому пиру (issue #16); `None` — сразу.
+    pub punch_at: Option<Instant>,
 }
 
 impl PeerSess {
@@ -218,12 +248,74 @@ impl PeerSess {
 /// сервера) окна прежнего ключа не наследует.
 type RxWindows = HashMap<u32, proto::ReplayWindow>;
 
-/// Что клиент накопил под ключом группы: следующий счётчик отправки и окна
-/// приёма.
+/// Сколько последних seq потока помнит кольцо дедупа (issue #25).
+pub const DEDUP_WINDOW: usize = 64;
+/// Сколько seq считается повтором, мс: дольше — это уже не дублирование
+/// путей, а запоздавший/подделанный кадр (его отсечёт окно повторов).
+pub const DEDUP_TTL_MS: u32 = 2_000;
+/// Предел числа потоков в кольце (LRU по времени последнего кадра).
+pub const DEDUP_FLOWS_MAX: usize = 64;
+/// Поток без кадров дольше — выбрасывается из кольца, мс.
+pub const DEDUP_FLOW_IDLE_MS: u32 = 10_000;
+
+/// Запись кольца дедупа: сквозной seq кадра (счётчик AEAD группы) и время.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DedupEntry {
+    seq: u64,
+    at_ms: u32,
+}
+
+/// Кольцо дедупа одного потока (`src_ip`) на выходе (issue #25): последние
+/// [`DEDUP_WINDOW`] seq, принятых не дольше [`DEDUP_TTL_MS`] назад.
+///
+/// Живёт в [`KeyState`], поэтому принадлежит ключу: при смене ключа кольцо
+/// пустое и счётчики начинаются с нуля — как у окон повторов.
+#[derive(Debug)]
+struct DedupRing {
+    entries: [Option<DedupEntry>; DEDUP_WINDOW],
+    /// Куда пишется следующая запись (кольцевой буфер).
+    next: usize,
+    /// Время последнего принятого кадра потока (для LRU по потокам).
+    last_ms: u32,
+}
+
+impl Default for DedupRing {
+    fn default() -> Self {
+        Self {
+            entries: [None; DEDUP_WINDOW],
+            next: 0,
+            last_ms: 0,
+        }
+    }
+}
+
+impl DedupRing {
+    /// `seq` уже доставлен этим потоком не дольше [`DEDUP_TTL_MS`] назад.
+    fn seen(&self, seq: u64, now_ms: u32) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|e| e.seq == seq && now_ms.wrapping_sub(e.at_ms) < DEDUP_TTL_MS)
+    }
+
+    /// Запомнить доставленный `seq`.
+    fn record(&mut self, seq: u64, now_ms: u32) {
+        self.entries[self.next] = Some(DedupEntry { seq, at_ms: now_ms });
+        self.next = (self.next + 1) % DEDUP_WINDOW;
+        self.last_ms = now_ms;
+    }
+}
+
+/// Кольца дедупа под ключом группы: src_ip → кольцо.
+type RxDedup = HashMap<u32, DedupRing>;
+
+/// Что клиент накопил под ключом группы: следующий счётчик отправки, окна
+/// приёма и кольца дедупа на выходе.
 #[derive(Default)]
 struct KeyState {
     tx: u64,
     rx: RxWindows,
+    dedup: RxDedup,
 }
 
 /// Отслуженные ключи групп и их [`KeyState`]. Общий для всех групп и их
@@ -245,7 +337,7 @@ impl KeyLog {
     }
 
     fn put(&self, key: proto::SymKey, st: KeyState) {
-        if st.tx == 0 && st.rx.is_empty() {
+        if st.tx == 0 && st.rx.is_empty() && st.dedup.is_empty() {
             return;
         }
         let mut log = self.0.lock().unwrap();
@@ -300,6 +392,15 @@ pub struct GroupSess {
     /// другого сервера, в UI у неё метка «федерация». `None` — своя группа
     /// (сервер uuid не сообщает) или сервер без федерации.
     pub fed_uuid: Option<[u8; 16]>,
+    /// Отключён от доставки (issue #20): кадры группы не отправляются и не
+    /// принимаются, но участие и ключ сохраняются (в отличие от выхода).
+    pub detached: bool,
+    /// Сервер видит нас онлайн в этой группе (свой `MemberInfo.online`) —
+    /// подтверждение `GROUP_ATTACH`. Старый сервер тип игнорирует, значение
+    /// остаётся `true`, и клиент сообщает о локальном отключении.
+    pub server_online: bool,
+    /// Когда отправлен последний `GROUP_ATTACH` (таймаут подтверждения).
+    attach_sent: Option<Instant>,
 }
 
 impl Drop for GroupSess {
@@ -332,6 +433,9 @@ impl GroupSess {
             hint_log: VecDeque::new(),
             state_sess: 0,
             fed_uuid: None,
+            detached: false,
+            server_online: true,
+            attach_sent: None,
         }
     }
 
@@ -357,6 +461,29 @@ impl GroupSess {
             .as_mut()
             .filter(|p| p.key == *key)
             .map(|p| p.st.rx.entry(src).or_default())
+    }
+
+    /// Кольцо дедупа потока `src` под ключом `key` (текущим или прошлым).
+    /// Память ограничена: простаивающие дольше [`DEDUP_FLOW_IDLE_MS`] потоки
+    /// выбрасываются, при переполнении — самый старый по последнему кадру
+    /// (LRU), так что число потоков не больше [`DEDUP_FLOWS_MAX`].
+    fn rx_dedup(&mut self, key: &proto::SymKey, src: u32, now_ms: u32) -> Option<&mut DedupRing> {
+        let map = if *key == self.key {
+            &mut self.cur.dedup
+        } else {
+            &mut self.prev.as_mut().filter(|p| p.key == *key)?.st.dedup
+        };
+        if !map.contains_key(&src) {
+            map.retain(|_, r| now_ms.wrapping_sub(r.last_ms) < DEDUP_FLOW_IDLE_MS);
+            while map.len() >= DEDUP_FLOWS_MAX {
+                let Some(oldest) = map.iter().min_by_key(|(_, r)| r.last_ms).map(|(ip, _)| *ip)
+                else {
+                    break;
+                };
+                map.remove(&oldest);
+            }
+        }
+        Some(map.entry(src).or_default())
     }
 
     /// Ключ из GROUP_STATE / GROUP_UPDATE. Новый ключ — свои счётчик и окна
@@ -504,6 +631,10 @@ impl GroupSess {
             // до него сохраняем прежние (адрес/ключ пира не менялся).
             mesh_x: prev.and_then(|p| p.mesh_x),
             mesh_caps: prev.map(|p| p.mesh_caps).unwrap_or(0),
+            // Бэкофф PUNCH переживает обновление списка: иначе каждый
+            // GROUP_UPDATE обнулял бы его и снова спамил (issue #16).
+            punch_fails: prev.map(|p| p.punch_fails).unwrap_or(0),
+            punch_at: prev.and_then(|p| p.punch_at),
         };
         if m.online {
             peer.rtt_ms = prev.and_then(|p| p.rtt_ms);
@@ -593,6 +724,11 @@ pub struct Stats {
     pub tx_bytes: AtomicU64,
     pub rx_pkts: AtomicU64,
     pub tx_pkts: AtomicU64,
+    /// Отправлено дублированных копий сверх первой (issue #25).
+    pub dup_sent: AtomicU64,
+    /// Отброшено дубликатов на выходе (issue #25): пришёл второй экземпляр
+    /// кадра, который уже доставлен.
+    pub dup_dropped: AtomicU64,
 }
 
 impl Stats {
@@ -602,6 +738,8 @@ impl Stats {
             tx_bytes: AtomicU64::new(0),
             rx_pkts: AtomicU64::new(0),
             tx_pkts: AtomicU64::new(0),
+            dup_sent: AtomicU64::new(0),
+            dup_dropped: AtomicU64::new(0),
         }
     }
 }
@@ -769,6 +907,36 @@ pub enum Event {
         pubkey: [u8; 32],
         items: Vec<payloads::FriendGroup>,
     },
+    /// Входящая заявка в друзья (`FRIEND_REQ_RCVD`, issue #24). Повторная
+    /// доставка (после HELLO, продление срока) — тоже это событие: UI убирает
+    /// дубликаты по `pubkey`, `expires_in` — секунд до истечения.
+    FriendRequest {
+        pubkey: [u8; 32],
+        name: String,
+        expires_in: u32,
+    },
+    /// Заявку приняли: `pubkey` теперь друг (сервер подтвердил пару).
+    FriendAccepted {
+        pubkey: [u8; 32],
+        name: String,
+    },
+    /// Нашу заявку отклонили.
+    FriendDeclined {
+        pubkey: [u8; 32],
+        name: String,
+    },
+    /// Дружбу сняла вторая сторона — запись у нас тоже уходит.
+    FriendRemoved {
+        pubkey: [u8; 32],
+    },
+    /// Сервер прислал окно списка друзей: состояния сняты/обновлены по нему.
+    /// `count` — сколько записей было в окне (для лога), `complete` —
+    /// покрывает ли окно список целиком (иначе движок дочитывает сам).
+    FriendsSynced {
+        from: [u8; 32],
+        complete: bool,
+        count: usize,
+    },
     /// Доступные федерированные группы сервера (`FED_GROUPS`, T4) — снимок
     /// списка целиком; пустой список — реплик больше нет. `Cmd::JoinFed`
     /// входит в группу по `uuid`.
@@ -806,11 +974,24 @@ pub enum Event {
         name: String,
         path: PathKind,
         rtt_ms: Option<u32>,
+        /// `true` — путь изменён ручным закреплением (`Cmd::PinPath`/
+        /// `Cmd::UnpinPath`), `false` — автоматикой (issue #26). UI по этому
+        /// флагу решает, показывать ли уведомление.
+        #[serde(default)]
+        manual: bool,
     },
     /// Доступных путей до участника не осталось: трафик не доставляется.
     PathLost {
         ip: u32,
         name: String,
+    },
+    /// Автоматика откатила путь назад: новый путь оказался хуже старого и
+    /// ушёл в карантин на [`path::QUARANTINE_MS`] (issue #26).
+    PathReverted {
+        ip: u32,
+        name: String,
+        from: PathKind,
+        to: PathKind,
     },
     /// Результат пробы сервера (`Cmd::ProbeServer`, §3.7). Для недоступного
     /// сервера — `success: false`; `key_match` — сверка с закреплённым ключом.
@@ -844,6 +1025,10 @@ pub enum Cmd {
         uuid: [u8; 16],
     },
     Leave(u32),
+    /// Отключиться от доставки группы, оставаясь участником (issue #20).
+    Detach(u32),
+    /// Снова принимать кадры группы.
+    Attach(u32),
     Delete(u32),
     Rename(u32, String),
     Invite(u32, [u8; 32]),
@@ -870,12 +1055,24 @@ pub enum Cmd {
     /// Переключить автовход в группу (локальная настройка).
     ToggleAutojoin(u32),
     FriendGroups([u8; 32]),
-    /// Друг в конфиг (PLAN.md 7.1): тот же pubkey — обновить alias.
+    /// Заявка в друзья (issue #24): сетевой кадр `FRIEND_REQ`, вторая сторона
+    /// узнаёт о ней от сервера (в т.ч. когда её нет в сети). `alias` — ручное
+    /// имя, пусто — не задавать. Требует связи: без сервера заявку доставить
+    /// некому, поэтому локальная запись тут больше не делается.
     AddFriend {
         pubkey: [u8; 32],
         alias: String,
     },
-    /// Удалить друга из конфига.
+    /// Принять входящую заявку (`FRIEND_ACCEPT`).
+    AcceptFriend([u8; 32]),
+    /// Отклонить входящую заявку (`FRIEND_DECLINE`).
+    DeclineFriend([u8; 32]),
+    /// Снять дружбу (`FRIEND_REMOVE`); вторая сторона получает
+    /// `FRIEND_REMOVED` и тоже убирает запись.
+    RemoveFriend([u8; 32]),
+    /// Убрать друга из списка: локальная запись (`Legacy`) снимается сразу, а
+    /// подтверждённая сервером дружба — через `FRIEND_REMOVE`, иначе следующий
+    /// список вернёт её обратно.
     DelFriend([u8; 32]),
     /// Alias друга (переименование; друга нет — `Event::Error`).
     SetAlias {
@@ -985,6 +1182,12 @@ impl Engine {
     pub fn group_key(&self, gid: u32) -> Option<(u32, proto::SymKey, u32)> {
         let g = self.env.groups.lock().unwrap();
         g.get(&gid).map(|gs| (gs.epoch, gs.key, gs.my_ip))
+    }
+
+    /// Сколько контактов в таблице DHT (тесты: кэш `mesh.contacts` загружен).
+    #[cfg(test)]
+    pub fn dht_contacts(&self) -> usize {
+        self.env.dht.lock().unwrap().len()
     }
 
     /// Фрейм группы текущим ключом и следующим счётчиком движка, но с
@@ -1190,6 +1393,59 @@ impl TunDev for crate::tun_macos::Utun {
 
 // ---------- общий контекст потоков ----------
 
+/// Предел одновременно дублируемых целей (issue #25): больше — это уже
+/// дублирование всего трафика, а не «маленького latency-sensitive».
+pub const DUP_TARGETS_MAX: usize = 8;
+/// Сколько цель считается активной после дублирования, мс.
+pub const DUP_TARGET_TTL_MS: u64 = 10_000;
+/// Допуск правила «второй путь не хуже 1.5× лучшего», мс: на быстрых путях
+/// (localhost, LAN) RTT — доли миллисекунды, и без допуска отношение скачет
+/// от шума измерений.
+pub const DUP_COST_SLACK_MS: f64 = 5.0;
+/// Во сколько раз второй путь может быть дороже лучшего.
+pub const DUP_COST_RATIO: f64 = 1.5;
+/// Свежесть замера RTT релея для правила выбора, мс (как `PEER_FRESH_MS`).
+pub const DUP_RELAY_FRESH_MS: u64 = 30_000;
+/// Вес нового замера в EWMA скорости цели.
+const DUP_RATE_ALPHA: f64 = 0.2;
+
+/// EWMA скорости цели, кбит/с: по ней решается, дублировать ли поток.
+#[derive(Clone, Copy, Default)]
+struct RateEwma {
+    kbps: f64,
+    at_ms: u64,
+}
+
+impl RateEwma {
+    /// Учесть отправленный пакет и вернуть текущую оценку скорости.
+    fn observe(&mut self, bytes: usize, now_ms: u64) -> f64 {
+        if self.at_ms != 0 {
+            let dt = now_ms.saturating_sub(self.at_ms).max(1) as f64 / 1000.0;
+            let inst = bytes as f64 * 8.0 / 1000.0 / dt;
+            self.kbps = if self.kbps == 0.0 {
+                inst
+            } else {
+                self.kbps * (1.0 - DUP_RATE_ALPHA) + inst * DUP_RATE_ALPHA
+            };
+        }
+        self.at_ms = now_ms;
+        self.kbps
+    }
+}
+
+/// Состояние дублирования путей (issue #25), которое движок ведёт сам:
+/// в `path.rs` только измерения и выбор одного пути, а EWMA скорости цели и
+/// замеры релея для правила «второй путь не хуже» нужны здесь.
+#[derive(Default)]
+struct DupState {
+    /// EWMA скорости цели, кбит/с.
+    rate: HashMap<u32, RateEwma>,
+    /// Когда цель последний раз дублировалась (предел одновременных целей).
+    active: HashMap<u32, u64>,
+    /// RTT маршрута через пира из `MESH_ROUTE_OK`: (получатель, релей) → (мс, когда).
+    relay: HashMap<(u32, [u8; 32]), (f64, u64)>,
+}
+
 struct Env {
     groups: Groups,
     meta: Arc<Mutex<Meta>>,
@@ -1217,6 +1473,9 @@ struct Env {
     paths: Arc<PathTable>,
     /// Пробы серверов (T2).
     probes: Arc<probe::ProbeState>,
+    /// Дублирование путей (issue #25): EWMA скорости цели, активные цели и
+    /// замеры RTT релея.
+    dup: Mutex<DupState>,
 }
 
 impl Env {
@@ -2052,7 +2311,7 @@ pub fn start_with_tun(
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (in_tx, in_rx) = mpsc::channel::<Input>();
 
-    let (server_label, pinned, mesh_enabled) = {
+    let (server_label, pinned, mesh_enabled, saved_contacts) = {
         let mut c = cfg.lock().unwrap();
         // Автовход — этого сервера (gid у каждого сервера свои).
         if c.activate_server(server) {
@@ -2062,6 +2321,9 @@ pub fn start_with_tun(
             server_label(&c, server),
             c.pinned_paths.clone(),
             c.mesh.enabled,
+            // Кэш DHT: грузим до первого `MESH_SEED`, чтобы серверные данные
+            // перебили сохранённые (issue #27).
+            c.mesh.contacts.clone(),
         )
     };
     let meta = Arc::new(Mutex::new(Meta {
@@ -2087,6 +2349,12 @@ pub fn start_with_tun(
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
     let paths = Arc::new(PathTable::new(&pinned));
     let my_ed = identity.ed_pub();
+    // Таблица DHT стартует с кэша `mesh.contacts` (issue #27): кэш — подсказка,
+    // а не замена серверу. Ключи групп, состав и свой `my_ip` по-прежнему
+    // приходят только в `WELCOME`/`GROUP_STATE`, поэтому без сервера вход в сеть
+    // не поднимется; зато известные адреса пиров не теряются между запусками.
+    let mut dht_table = dht::Dht::new(my_ed);
+    dht_table.load_at(&saved_contacts, epoch_ms());
     let env = Arc::new(Env {
         groups: groups.clone(),
         meta: meta.clone(),
@@ -2102,10 +2370,11 @@ pub fn start_with_tun(
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
         mesh: Arc::new(Mutex::new(mesh::MeshState::new(mesh_enabled))),
-        dht: Arc::new(Mutex::new(dht::Dht::new(my_ed))),
+        dht: Arc::new(Mutex::new(dht_table)),
         mesh_finds: Arc::new(Mutex::new(Vec::new())),
         paths: paths.clone(),
         probes: Arc::new(probe::ProbeState::new()),
+        dup: Mutex::new(DupState::default()),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
@@ -2135,6 +2404,16 @@ pub fn start_with_tun(
     }
     // Первое подключение — синхронно, чтобы ошибка была видна сразу.
     let mut st = State::new(server_pub);
+    // Неподтверждённые выходы прошлого запуска (issue #20): LEAVE повторится
+    // после первого подключения (restore) и при каждом переподключении, пока
+    // сервер не пришлёт список без этой группы.
+    for gid in env.cfg.lock().unwrap().pending_leave.clone() {
+        st.leaving.insert(gid, Instant::now());
+    }
+    // Друзья (issue #24): до первого FRIEND_LIST источник — `client.json`.
+    // Записи `Legacy` (добавленные до заявок) живут локально, пока сервер не
+    // пришлёт пару; подтверждённые сервером сверка снимет, если пары нет.
+    st.friends = crate::friends::Friends::from_cfg(&cfg.lock().unwrap(), Instant::now());
     st.rx_ctx = Some((env.clone(), in_tx));
     if let Err(e) = first_connect(&env, &in_rx, &mut st) {
         env.quit.store(true, Ordering::Relaxed);
@@ -2248,7 +2527,8 @@ fn dispatch(
     if proto::grp::is_group(typ) {
         match handle_group_frame(env, src, datagram, false) {
             FrameVerdict::NeedGroup(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
-            FrameVerdict::Accepted | FrameVerdict::Drop => true,
+            // Повтор уже доставленного кадра — не повод тянуть GROUP_STATE.
+            FrameVerdict::Accepted | FrameVerdict::Duplicate | FrameVerdict::Drop => true,
         }
     } else if src == env.server() {
         in_tx
@@ -2372,6 +2652,19 @@ struct State {
     /// Последний отправленный `SERVER_HINT` (T4): `None` — ещё не слали
     /// этому серверу (сразу после WELCOME, не чаще `SERVER_HINT_EVERY`).
     last_hint: Option<Instant>,
+    /// Последняя применённая политика путей (гистерезис, dwell, интервал
+    /// проб) — чтобы не дёргать таблицу путей каждый тик (issue #16/#17).
+    path_policy: (u32, u64, u64),
+    /// Друзья и заявки (issue #24): состояния ведёт модель, `client.json` —
+    /// её кэш (см. `crate::friends`).
+    friends: crate::friends::Friends,
+    /// Ожидаемое окно списка друзей: (`from`, с какого момента ждём) — сервер
+    /// шлёт не больше [`tunnel_protocol::payloads::FriendList`]-окна за раз.
+    friend_sync: Option<([u8; 32], Instant)>,
+    last_friend_req: Instant,
+    /// Отклонённые заявки в друзья, отказ ещё не подтверждён окном.
+    declining_friends: HashMap<[u8; 32], Instant>,
+    last_friend_decline: Instant,
 }
 
 impl State {
@@ -2418,11 +2711,38 @@ impl State {
             last_route_probe: now,
             lookup_seq: 1,
             last_hint: None,
+            path_policy: (u32::MAX, u64::MAX, u64::MAX),
+            friends: crate::friends::Friends::new(),
+            friend_sync: None,
+            last_friend_req: now,
+            declining_friends: HashMap::new(),
+            last_friend_decline: now,
         }
     }
 
     fn connected(&self) -> bool {
         self.sess.is_some()
+    }
+
+    /// Перенести состояния друзей из модели в `client.json` (алиасы модель не
+    /// трогает — это локальные имена, см. [`crate::friends::Friends::apply`]).
+    /// Файл не переписывается, если ничего не изменилось: `save` — запись на
+    /// диск, а список друзей обновляется на каждый `FRIEND_LIST`.
+    fn sync_friends_cfg(&self, env: &Env) {
+        let mut cfg = env.cfg.lock().unwrap();
+        let mut next = cfg.clone();
+        self.friends.apply(&mut next);
+        let changed = next.friends.len() != cfg.friends.len()
+            || next
+                .friends
+                .iter()
+                .zip(&cfg.friends)
+                .any(|(a, b)| a.pubkey != b.pubkey || a.state != b.state || a.nick != b.nick);
+        if !changed {
+            return;
+        }
+        cfg.friends = next.friends;
+        (env.save)(&cfg);
     }
 
     /// Новая попытка рукопожатия (новый эфемерный ключ), HELLO3 — сразу.
@@ -2652,6 +2972,22 @@ fn restore(env: &Env, st: &mut State) {
     for gid in leaving {
         st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
     }
+    // Отключённые от доставки — GROUP_ATTACH заново в новую сессию: сервер
+    // после своего рестарта считает доставку включённой (issue #20).
+    let detached: Vec<u32> = {
+        let g = env.groups.lock().unwrap();
+        g.iter()
+            .filter(|(_, gs)| gs.detached)
+            .map(|(gid, _)| *gid)
+            .collect()
+    };
+    for gid in detached {
+        st.send_ctrl(
+            env,
+            ctrl::GROUP_ATTACH,
+            &payloads::enc_gid_attach(gid, false),
+        );
+    }
     let declining: Vec<u32> = st.declining.keys().copied().collect();
     for gid in declining {
         st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
@@ -2865,6 +3201,33 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
                 st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
             }
         }
+        // GROUP_ATTACH без подтверждения: старый сервер неизвестный тип
+        // молча роняет, и отключение остаётся локальным (issue #20). Сообщаем
+        // один раз — повтор каждые 5 с был бы спамом.
+        let unconfirmed: Vec<(u32, String, bool)> = {
+            let g = env.groups.lock().unwrap();
+            g.iter()
+                .filter(|(_, gs)| {
+                    gs.attach_sent
+                        .is_some_and(|t| now.duration_since(t) >= ATTACH_CONFIRM)
+                })
+                // Подтверждено — состояние доставки совпало с желаемым:
+                // остались только те, где желаемое (`detached`) ещё не равно
+                // серверному (`server_online`).
+                .filter(|(_, gs)| gs.detached == gs.server_online)
+                .map(|(gid, gs)| (*gid, gs.name.clone(), gs.detached))
+                .collect()
+        };
+        for (gid, name, detached) in unconfirmed {
+            if let Some(gs) = env.groups.lock().unwrap().get_mut(&gid) {
+                gs.attach_sent = None;
+            }
+            env.emit(Event::Notice(if detached {
+                format!("сервер не подтвердил отключение от {gid} «{name}» — оно локальное")
+            } else {
+                format!("сервер не подтвердил возврат доставки в {gid} «{name}»")
+            }));
+        }
         if let Some((from, since)) = st.invite_sync
             && now.duration_since(st.last_invite_req) >= INVITE_SYNC_RETRY
         {
@@ -2882,6 +3245,29 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
             let gids: Vec<u32> = st.declining.keys().copied().collect();
             for gid in gids {
                 st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
+            }
+        }
+        // Друзья (issue #24): отказ повторяется, пока окно списка не
+        // подтвердит, а неполное окно — дочитывается (сервер шлёт по 16).
+        if !st.declining_friends.is_empty()
+            && now.duration_since(st.last_friend_decline) >= DECLINE_RETRY
+        {
+            st.last_friend_decline = now;
+            st.declining_friends
+                .retain(|_, started| now.duration_since(*started) < DECLINE_GIVE_UP);
+            let pks: Vec<[u8; 32]> = st.declining_friends.keys().copied().collect();
+            for pk in pks {
+                st.send_ctrl(env, ctrl::FRIEND_DECLINE, &payloads::enc_pubkey(&pk));
+            }
+        }
+        if let Some((from, since)) = st.friend_sync
+            && now.duration_since(st.last_friend_req) >= INVITE_SYNC_RETRY
+        {
+            st.last_friend_req = now;
+            if now.duration_since(since) < INVITE_SYNC_GIVE_UP {
+                st.send_ctrl(env, ctrl::LIST_FRIENDS, &payloads::enc_pubkey(&from));
+            } else {
+                st.friend_sync = None;
             }
         }
         if !st.want_group.is_empty() {
@@ -2926,13 +3312,25 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
         }
     }
     // P2P-таймеры работают и без сервера: прямые каналы живут сами.
-    if now.duration_since(st.last_rtt) >= RTT_EVERY {
+    // Каденция проб — из конфига (issue #16): 2–20 с, по умолчанию 5 с.
+    let (rtt_every, hysteresis_ms, dwell_ms) = {
+        let c = env.cfg.lock().unwrap();
+        (c.rtt_interval(), c.path_hysteresis(), c.path_dwell())
+    };
+    let policy = (hysteresis_ms, dwell_ms, rtt_every.as_millis() as u64);
+    if st.path_policy != policy {
+        st.path_policy = policy;
+        // Пороги гистерезиса/dwell и интервал проб — в таблицу путей: от них
+        // зависит свежесть замеров и правило переключения (issue #16/#17).
+        env.paths.set_limits(hysteresis_ms, dwell_ms, rtt_every);
+    }
+    if now.duration_since(st.last_rtt) >= rtt_every {
         st.last_rtt = now;
-        rtt_round(env, st.connected(), now);
+        rtt_round(env, st.connected(), now, rtt_every);
     }
     if now.duration_since(st.last_punch) >= PUNCH_EVERY {
         st.last_punch = now;
-        punch_round(env);
+        punch_round(env, now);
     }
     // Пути доставки: пересчёт раз в 10 с и сразу при падении пути (§3.6).
     if now.duration_since(st.last_paths) >= PATHS_EVERY {
@@ -2946,15 +3344,31 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
     }
 }
 
+/// Снять путь с участников, ушедших в офлайн (issue #14): у офлайн-участника
+/// пути нет вовсе — иначе таблица держала бы «server» и плечо сервера как
+/// RTT, а UI показывал бы 1 мс до человека, которого нет в сети.
+fn drop_offline_paths(env: &Env, events: &[Event]) {
+    for e in events {
+        if let Event::PeerOffline { ip, .. } = e {
+            env.paths.clear_target(*ip);
+        }
+    }
+}
+
 /// Пересчёт путей всех участников: события `PathChanged`/`PathLost` (§3.6).
 fn paths_round(env: &Env, connected: bool, _now: Instant) {
-    // Каждому участнику — запись в таблице: у кого нет ни прямого канала, ни
-    // mesh-маршрута, путь по умолчанию — сервер.
+    // Каждому онлайн-участнику — запись в таблице: у кого нет ни прямого
+    // канала, ни mesh-маршрута, путь по умолчанию — сервер. Офлайн-участник
+    // пути не имеет (issue #14): его цель снимается.
     {
         let g = env.groups.lock().unwrap();
         for gs in g.values() {
             for p in gs.members.values() {
-                env.paths.ensure_target(p.ip);
+                if p.online {
+                    env.paths.ensure_target(p.ip);
+                } else {
+                    env.paths.clear_target(p.ip);
+                }
             }
         }
     }
@@ -2974,6 +3388,7 @@ fn paths_round(env: &Env, connected: bool, _now: Instant) {
                     name: peer_name(env, ip),
                     path: to,
                     rtt_ms,
+                    manual: false,
                 });
             }
             path::PathChange::Lost { ip, from } => {
@@ -2983,6 +3398,17 @@ fn paths_round(env: &Env, connected: bool, _now: Instant) {
                 env.emit(Event::PathLost {
                     ip,
                     name: peer_name(env, ip),
+                });
+            }
+            path::PathChange::Reverted { ip, from, to } => {
+                if debug() {
+                    eprintln!("[engine] путь {ip} откатан: {from:?} -> {to:?}");
+                }
+                env.emit(Event::PathReverted {
+                    ip,
+                    name: peer_name(env, ip),
+                    from,
+                    to,
                 });
             }
         }
@@ -3086,7 +3512,9 @@ fn mesh_round(env: &Env, st: &mut State, now: Instant, connected: bool) {
                 d.insert(c);
             }
             d.expire(now_ms);
-            d.to_stored()
+            // Прунинг на записи: кэш не больше BUCKETS × K записей и не старше
+            // CACHE_MAX_AGE (7 суток) — файл не должен расти и хранить мусор.
+            d.to_stored_pruned(now_ms)
         };
         if env.cfg.lock().unwrap().mesh.contacts != saved {
             env.update_cfg(|c| c.mesh.contacts = saved);
@@ -3306,6 +3734,10 @@ fn my_mesh_caps(env: &Env) -> u8 {
     if cfg.mesh.relay_enabled {
         c |= proto::mesh::caps::RELAY | proto::mesh::caps::ACCEPT_RELAY;
     }
+    // Дедупликация на выходе работает всегда (issue #25): кольцо в KeyState
+    // не зависит от того, дублируем ли мы сами. Бит сообщает отправителю,
+    // что копии этому пиру можно слать.
+    c |= proto::mesh::caps::DUP;
     c
 }
 
@@ -3429,6 +3861,19 @@ fn handle_mesh_frame(env: &Env, src: SocketAddr, typ: u8, body: &[u8]) {
     apply_mesh_out(env, out);
 }
 
+/// Итог доставки реле-кадра для ACK/NACK (`MeshState::delivery_result`).
+///
+/// Повтор уже доставленного кадра — **успех** (issue #25): ACK, а не NACK.
+/// Иначе потерянный ACK и дубликат снимали бы здоровый путь через
+/// `record_failure` по `ForwardFailed`, а с дублированием это стало бы
+/// систематическим.
+fn delivery_result_of(v: FrameVerdict) -> (bool, u8) {
+    match v {
+        FrameVerdict::Accepted | FrameVerdict::Duplicate => (true, proto::mesh::code::REJECTED),
+        FrameVerdict::NeedGroup(_) | FrameVerdict::Drop => (false, proto::mesh::code::DROP),
+    }
+}
+
 /// Проверка открытого заголовка inner (реле не расшифровывает кадр).
 struct GroupCheck<'a> {
     groups: &'a [GroupMini],
@@ -3467,11 +3912,7 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
     }
     let now_ms = epoch_ms();
     for r in out.deliver {
-        let (ok, why) = match handle_group_frame(env, env.server(), &r.inner, true) {
-            FrameVerdict::Accepted => (true, proto::mesh::code::REJECTED),
-            FrameVerdict::NeedGroup(_) => (false, proto::mesh::code::DROP),
-            FrameVerdict::Drop => (false, proto::mesh::code::DROP),
-        };
+        let (ok, why) = delivery_result_of(handle_group_frame(env, env.server(), &r.inner, true));
         let reply = {
             let mut st = env.mesh.lock().unwrap();
             st.delivery_result(now_ms, &r, ok, why)
@@ -3504,8 +3945,18 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
                 load,
             } => {
                 if let Some(ip) = ip_of_ed(env, &dst_ed) {
-                    env.paths
-                        .record_peer_rtt(ip, via, up_ms, down_ms, load, uptime_ms(env));
+                    // Одно и то же время (uptime) и в таблицу путей, и в кеш
+                    // дублирования: у них общий масштаб свежести.
+                    let up = uptime_ms(env);
+                    env.paths.record_peer_rtt(ip, via, up_ms, down_ms, load, up);
+                    // RTT релея — для правила выбора копий (issue #25):
+                    // в path.rs стоимость не отдаётся, а для «второй путь не
+                    // хуже 1.5× лучшего» нужен замер end-to-end.
+                    let mut d = env.dup.lock().unwrap();
+                    d.relay
+                        .retain(|_, (_, at)| up.saturating_sub(*at) <= DUP_RELAY_FRESH_MS);
+                    d.relay
+                        .insert((ip, via), (f64::from(up_ms) + f64::from(down_ms), up));
                 }
             }
             mesh::MeshEvent::RouteFailed { .. } => {}
@@ -3518,7 +3969,7 @@ fn apply_mesh_out(env: &Env, out: mesh::MeshOut) {
                     });
                     let connected = env.meta.lock().unwrap().connected;
                     for change in env.paths.recalc_one(ip, uptime_ms(env), connected) {
-                        emit_path_change(env, change);
+                        emit_path_change(env, change, false);
                     }
                 }
                 if debug() {
@@ -3567,12 +4018,15 @@ fn ip_of_ed(env: &Env, ed: &[u8; 32]) -> Option<u32> {
 fn recalc_path_now(env: &Env, ip: u32) {
     let connected = env.meta.lock().unwrap().connected;
     for change in env.paths.recalc_one(ip, uptime_ms(env), connected) {
-        emit_path_change(env, change);
+        // Закрепление/открепление — ручное изменение (issue #26): UI решает по
+        // флагу, показывать ли уведомление.
+        emit_path_change(env, change, true);
     }
 }
 
-/// Событие смены пути — из [`path::PathChange`].
-fn emit_path_change(env: &Env, change: path::PathChange) {
+/// Событие смены пути — из [`path::PathChange`]. `manual` — изменение пришло
+/// от `Cmd::PinPath`/`Cmd::UnpinPath` (issue #26).
+fn emit_path_change(env: &Env, change: path::PathChange, manual: bool) {
     match change {
         path::PathChange::Changed {
             ip,
@@ -3588,6 +4042,7 @@ fn emit_path_change(env: &Env, change: path::PathChange) {
                 name: peer_name(env, ip),
                 path: to,
                 rtt_ms,
+                manual,
             });
         }
         path::PathChange::Lost { ip, from } => {
@@ -3597,6 +4052,17 @@ fn emit_path_change(env: &Env, change: path::PathChange) {
             env.emit(Event::PathLost {
                 ip,
                 name: peer_name(env, ip),
+            });
+        }
+        path::PathChange::Reverted { ip, from, to } => {
+            if debug() {
+                eprintln!("[engine] путь {ip} откатан: {from:?} -> {to:?}");
+            }
+            env.emit(Event::PathReverted {
+                ip,
+                name: peer_name(env, ip),
+                from,
+                to,
             });
         }
     }
@@ -3653,6 +4119,70 @@ fn try_relay(env: &Env, dst: u32, dst_ed: [u8; 32], inner: &[u8]) -> bool {
     false
 }
 
+/// Отправить копию кадра через конкретного релея (issue #25, второй путь).
+/// Кандидаты не перебираются: путь выбран таблицей, и если релея нет —
+/// копия просто не уходит (`false`), без снятия пути.
+fn try_relay_via(env: &Env, dst_ed: [u8; 32], via: [u8; 32], inner: &[u8]) -> bool {
+    let w = mesh_world(env);
+    let Some(c) = w.contacts.iter().find(|c| c.ed == via).cloned() else {
+        return false;
+    };
+    let check = GroupCheck { groups: &w.groups };
+    let ctx = mesh::MeshCtx {
+        me: &env.identity,
+        my_caps: my_mesh_caps(env),
+        now_ms: epoch_ms(),
+        my_addr: w.my_addr,
+        contacts: &w.contacts,
+        members: &w.members,
+        relay_enabled: relay_enabled(env),
+        relay_budget: relay_budget(env),
+        check_group: &|gid, src, dst, epoch| check.accepts(gid, src, dst, epoch),
+    };
+    let mut st = env.mesh.lock().unwrap();
+    match st.start_forward(&ctx, dst_ed, &c, inner) {
+        Ok((to, frame)) => {
+            drop(st);
+            env.send(&frame, to);
+            true
+        }
+        Err(code) => {
+            if debug() {
+                eprintln!(
+                    "[mesh] копия через реле {} не ушла: код {code}",
+                    proto::hex_of(&via)
+                );
+            }
+            false
+        }
+    }
+}
+
+/// Отправить копию кадра по пути `kind` (issue #25). `false` — путь сейчас
+/// не отправить (нет прямого адреса, релея, сессии): тихо пропускаем.
+fn send_extra(
+    env: &Env,
+    dst_ed: [u8; 32],
+    direct: Option<SocketAddr>,
+    frame: &[u8],
+    kind: PathKind,
+) -> bool {
+    match kind {
+        PathKind::Direct => match direct {
+            Some(a) => {
+                env.send(frame, a);
+                true
+            }
+            None => false,
+        },
+        PathKind::Server => {
+            env.send(frame, env.server());
+            true
+        }
+        PathKind::PeerRelay { via } => try_relay_via(env, dst_ed, via, frame),
+    }
+}
+
 fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
     // Локальные команды — всегда, независимо от связи с сервером.
     match cmd {
@@ -3700,10 +4230,46 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             env.autojoin_remove(gid);
             st.want_group.remove(&gid);
             st.leaving.insert(gid, Instant::now());
+            // Неподтверждённый выход переживает рестарт клиента (issue #20):
+            // иначе приватная группа пустила бы обратно без приглашения.
+            env.update_cfg(|c| {
+                if !c.pending_leave.contains(&gid) {
+                    c.pending_leave.push(gid);
+                }
+            });
             st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
             if let Some(name) = name {
                 env.emit(Event::GroupLeft { gid, name });
             }
+            return;
+        }
+        Cmd::Detach(gid) | Cmd::Attach(gid) => {
+            // Локальное состояние меняется сразу (гейт в route_packet и
+            // handle_group_frame), серверу уходит GROUP_ATTACH. Старый сервер
+            // тип игнорирует — отключение остаётся локальным, о чём клиент
+            // сообщает по таймауту подтверждения (tick).
+            let on = matches!(cmd, Cmd::Attach(_));
+            let mut name = None;
+            {
+                let mut g = env.groups.lock().unwrap();
+                if let Some(gs) = g.get_mut(&gid) {
+                    gs.detached = !on;
+                    gs.attach_sent = Some(Instant::now());
+                    name = Some(gs.name.clone());
+                }
+            }
+            if st.connected() {
+                st.send_ctrl(env, ctrl::GROUP_ATTACH, &payloads::enc_gid_attach(gid, on));
+            }
+            env.emit(match name {
+                Some(name) if on => Event::Notice(format!(
+                    "подключаемся к группе {gid} «{name}» — доставка возвращается"
+                )),
+                Some(name) => Event::Notice(format!(
+                    "отключение от группы {gid} «{name}»: участие сохраняется"
+                )),
+                None => Event::Error(format!("группа {gid} не найдена")),
+            });
             return;
         }
         Cmd::SwitchServer {
@@ -3764,9 +4330,64 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             }
             return;
         }
-        Cmd::AddFriend { .. }
-        | Cmd::DelFriend(_)
-        | Cmd::SetAlias { .. }
+        Cmd::DelFriend(pk) => {
+            // Что снимаем: локальную запись — сразу, подтверждённую сервером
+            // — только через FRIEND_REMOVE (иначе следующий список вернёт её
+            // обратно). Отменить отправленную заявку протокол не умеет:
+            // честнее сказать это, чем показать «удалено» и вернуть запись.
+            match st.friends.state_of(&pk) {
+                Some(store::FriendState::Accepted) => {
+                    if !st.connected() {
+                        env.emit(Event::Error(
+                            "нет связи с сервером — дружбу снять нельзя: сервер о ней знает".into(),
+                        ));
+                        return;
+                    }
+                    remove_friend(env, st, pk);
+                }
+                Some(store::FriendState::PendingIn) => {
+                    if !st.connected() {
+                        env.emit(Event::Error(
+                            "нет связи с сервером — заявку не отклонить".into(),
+                        ));
+                        return;
+                    }
+                    decline_friend(env, st, pk);
+                }
+                Some(store::FriendState::PendingOut) => {
+                    // Сервер не умеет отменять заявку (кадра нет), но старая
+                    // локальная запись не должна залипать навсегда: снимаем
+                    // её у себя, серверная заявка истечёт по TTL (issue #24).
+                    st.friends.on_removed(&pk);
+                    env.update_cfg(|c| {
+                        c.friends
+                            .retain(|f| proto::hex_to_bytes(&f.pubkey).ok() != Some(pk.to_vec()));
+                    });
+                    env.emit(Event::Notice(
+                        "заявка снята локально; на сервере она истечёт сама".into(),
+                    ));
+                }
+                // Локальная запись (или её уже нет) — снимаем у себя.
+                _ => {
+                    if st.friends.on_removed(&pk).is_none()
+                        && !env
+                            .cfg
+                            .lock()
+                            .unwrap()
+                            .friends
+                            .iter()
+                            .any(|f| proto::hex_to_bytes(&f.pubkey).ok() == Some(pk.to_vec()))
+                    {
+                        env.emit(Event::Error("такого друга нет".into()));
+                        return;
+                    }
+                    st.sync_friends_cfg(env);
+                    env.emit(Event::Notice("друг удалён".into()));
+                }
+            }
+            return;
+        }
+        Cmd::SetAlias { .. }
         | Cmd::AddServer { .. }
         | Cmd::DelServer { .. }
         | Cmd::SetPrimaryServer { .. }
@@ -3774,6 +4395,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::UnpinPath { .. }
         | Cmd::SetRelayEnabled(_)
         | Cmd::SetMeshEnabled(_) => {
+            // Правки конфига, которым сервер не нужен. Друзья-заявки — не
+            // здесь: они сетевые (см. ниже), иначе вторая сторона о них не
+            // узнала бы.
             cfg_cmd(env, st, cmd);
             return;
         }
@@ -3795,6 +4419,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         Cmd::Join(gid) => {
             st.leaving.remove(&gid);
             st.declining.remove(&gid);
+            // Осознанный повторный вход: неподтверждённый выход больше не
+            // повторяем (issue #20).
+            env.update_cfg(|c| c.pending_leave.retain(|g| *g != gid));
             st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(gid))
         }
         // T4: вход в федерированную группу по uuid. Ответ — обычный
@@ -3845,6 +4472,42 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         Cmd::FriendGroups(pk) => {
             st.send_ctrl(env, ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&pk));
         }
+        // ---------- друзья (issue #24) ----------
+        //
+        // Заявка — сетевой кадр: вторая сторона узнаёт о ней от сервера, в том
+        // числе когда её нет в сети. Локально сразу помечаем «ждёт ответа»,
+        // чтобы панель не ждала списка.
+        Cmd::AddFriend { pubkey, alias } => {
+            // Себя в друзья не добавить: сервер ответил бы ошибкой, но
+            // оптимистичная запись уже легла бы в конфиг.
+            if pubkey == env.identity.ed_pub() {
+                env.emit(Event::Error("нельзя добавить себя в друзья".into()));
+                return;
+            }
+            if !alias.trim().is_empty() {
+                let hex = proto::hex_of(&pubkey);
+                let a = alias.clone();
+                env.update_cfg(|c| match c.friends.iter_mut().find(|f| f.pubkey == hex) {
+                    Some(f) => f.alias = a,
+                    None => c.friends.push(store::StoredFriend {
+                        pubkey: hex,
+                        alias: a,
+                        ..Default::default()
+                    }),
+                });
+            }
+            st.friends.request_sent(pubkey, Instant::now());
+            st.sync_friends_cfg(env);
+            st.send_ctrl(env, ctrl::FRIEND_REQ, &payloads::enc_pubkey(&pubkey));
+        }
+        Cmd::AcceptFriend(pk) => {
+            // Оптимистично: дружба появится в панели сразу, список подтвердит.
+            st.friends.on_accepted(pk, String::new(), Instant::now());
+            st.sync_friends_cfg(env);
+            st.send_ctrl(env, ctrl::FRIEND_ACCEPT, &payloads::enc_pubkey(&pk));
+        }
+        Cmd::DeclineFriend(pk) => decline_friend(env, st, pk),
+        Cmd::RemoveFriend(pk) => remove_friend(env, st, pk),
         Cmd::Quit
         | Cmd::ToggleAutojoin(_)
         | Cmd::SetName(_)
@@ -3852,13 +4515,14 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::SetInvisible(_)
         | Cmd::SwitchServer { .. }
         | Cmd::Reconnect
-        | Cmd::AddFriend { .. }
         | Cmd::DelFriend(_)
         | Cmd::SetAlias { .. }
         | Cmd::AddServer { .. }
         | Cmd::DelServer { .. }
         | Cmd::SetPrimaryServer { .. }
         | Cmd::Leave(_)
+        | Cmd::Detach(_)
+        | Cmd::Attach(_)
         | Cmd::PingServer { .. }
         | Cmd::PinPath { .. }
         | Cmd::UnpinPath { .. }
@@ -3866,6 +4530,30 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::SetMeshEnabled(_)
         | Cmd::ProbeServer { .. } => {}
     }
+}
+
+/// Отказ от заявки в друзья: убрать у себя сразу и повторять `FRIEND_DECLINE`,
+/// пока окно списка не подтвердит (потерянный кадр оставил бы заявку на
+/// сервере, а инициатор не узнал бы об отказе).
+fn decline_friend(env: &Env, st: &mut State, pk: [u8; 32]) {
+    let now = Instant::now();
+    st.friends.on_decline_sent(pk, now);
+    st.declining_friends.insert(pk, now);
+    st.last_friend_decline = now;
+    st.sync_friends_cfg(env);
+    st.send_ctrl(env, ctrl::FRIEND_DECLINE, &payloads::enc_pubkey(&pk));
+    env.emit(Event::Notice("заявка отклонена".into()));
+}
+
+/// Снятие дружбы: запись уходит у обоих (сервер уведомит вторую сторону).
+fn remove_friend(env: &Env, st: &mut State, pk: [u8; 32]) {
+    if st.friends.on_removed(&pk).is_none() {
+        env.emit(Event::Error("такого друга нет".into()));
+        return;
+    }
+    st.sync_friends_cfg(env);
+    st.send_ctrl(env, ctrl::FRIEND_REMOVE, &payloads::enc_pubkey(&pk));
+    env.emit(Event::Notice("друг удалён".into()));
 }
 
 /// Проверка команды правки конфига до отправки движку (демон отвечает
@@ -3929,18 +4617,6 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         return;
     }
     match cmd {
-        Cmd::AddFriend { pubkey, alias } => {
-            let hex = proto::hex_of(&pubkey);
-            let a = alias.clone();
-            env.update_cfg(|c| match c.friends.iter_mut().find(|f| f.pubkey == hex) {
-                Some(f) => f.alias = a,
-                None => c.friends.push(crate::store::StoredFriend {
-                    pubkey: hex,
-                    alias: a,
-                }),
-            });
-            env.emit(Event::Notice(format!("друг добавлен: {alias}")));
-        }
         Cmd::DelFriend(pubkey) => {
             let hex = proto::hex_of(&pubkey);
             env.update_cfg(|c| c.friends.retain(|f| f.pubkey != hex));
@@ -4044,7 +4720,7 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             // Снятие/включение L2 меняет набор путей — пересчитать сразу.
             let connected = env.meta.lock().unwrap().connected;
             for change in env.paths.recalc(uptime_ms(env), connected) {
-                emit_path_change(env, change);
+                emit_path_change(env, change, false);
             }
             env.emit(Event::Notice(if on {
                 "релей через пиров включён".into()
@@ -4116,6 +4792,9 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
     *env.server.lock().unwrap() = addr;
     {
         let mut cfg = env.cfg.lock().unwrap();
+        // gid у каждого сервера свои: неподтверждённые выходы старого сервера
+        // на новом повторились бы в чужие группы (issue #20).
+        cfg.pending_leave.clear();
         if cfg.activate_server(addr) {
             (env.save)(&cfg);
         }
@@ -4142,6 +4821,7 @@ impl State {
 }
 
 fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
+    let now = Instant::now();
     match typ {
         ctrl::GROUP_STATE => {
             if let Ok(gs) = payloads::dec_group_state(payload) {
@@ -4157,8 +4837,12 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         ctrl::GROUP_LIST => {
             if let Ok(items) = payloads::dec_group_list(payload) {
                 let mine: HashSet<u32> = items.iter().filter(|g| g.mine).map(|g| g.gid).collect();
-                // Сервер подтвердил выход — больше не повторяем LEAVE.
+                // Сервер подтвердил выход — больше не повторяем LEAVE и
+                // забываем неподтверждённые выходы в конфиге (issue #20).
                 st.leaving.retain(|gid, _| mine.contains(gid));
+                if !env.cfg.lock().unwrap().pending_leave.is_empty() {
+                    env.update_cfg(|c| c.pending_leave.retain(|g| mine.contains(g)));
+                }
                 reconcile(env, &mine);
                 // Автовход — только в группы, где сервер нас участником не
                 // считает: свои он и так присылает после HELLO3, а повторный
@@ -4282,6 +4966,9 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 let local = local.map(|(name, _)| name);
                 env.autojoin_remove(k.gid);
                 st.want_group.remove(&k.gid);
+                // Исключённый из группы выход не подтверждает — из
+                // `pending_leave` запись тоже убираем (issue #20).
+                env.update_cfg(|c| c.pending_leave.retain(|g| *g != k.gid));
                 let name = if k.group_name.is_empty() {
                     local.unwrap_or_default()
                 } else {
@@ -4327,6 +5014,126 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                     pubkey: f.target,
                     items: f.groups,
                 });
+            }
+        }
+        // ---------- друзья (issue #24) ----------
+        //
+        // Состояния ведёт модель `st.friends`, `client.json` — её кэш; UI
+        // получает и события (окно заявки, тосты), и снимок конфига.
+        ctrl::FRIEND_REQ_RCVD => {
+            if let Ok(n) = payloads::dec_friend_req_rcvd(payload) {
+                match st
+                    .friends
+                    .on_request(n.from, n.from_name.clone(), Some(n.expires_in), now)
+                {
+                    friends::RequestOutcome::New => {
+                        st.sync_friends_cfg(env);
+                        env.emit(Event::FriendRequest {
+                            pubkey: n.from,
+                            name: n.from_name,
+                            expires_in: n.expires_in,
+                        });
+                    }
+                    friends::RequestOutcome::Accepted => {
+                        // Встречная заявка: сервер уже считает пару принятой.
+                        st.sync_friends_cfg(env);
+                        env.emit(Event::FriendAccepted {
+                            pubkey: n.from,
+                            name: n.from_name,
+                        });
+                    }
+                    // Повтор — только данные; запоздавший список после отказа
+                    // — игнор (память отказа).
+                    friends::RequestOutcome::Updated | friends::RequestOutcome::Declined => {
+                        st.sync_friends_cfg(env);
+                    }
+                }
+            }
+        }
+        ctrl::FRIEND_LIST => {
+            if let Ok(list) = payloads::dec_friend_list(payload) {
+                // Неполное окно — дочитать следующее: сервер шлёт не больше
+                // 16 за раз, а показать нужно все. Ключи растут, цепочка
+                // конечна (последний ключ окна повторяется первым).
+                let next = list.next_from();
+                let (from, complete, count) = (list.from, list.complete, list.items.len());
+                // Отказ подтверждён: окно покрывает ключ, а заявки в нём нет.
+                st.declining_friends
+                    .retain(|pk, _| !list.covers(pk) || list.items.iter().any(|i| i.pk == *pk));
+                // Состояния до сверки: по разнице узнаём, кто стал другом —
+                // вторая сторона приняла заявку, пока мы были офлайн, или
+                // принять успели на другом устройстве.
+                let before: Vec<([u8; 32], store::FriendState)> =
+                    st.friends.list().iter().map(|f| (f.pk, f.state)).collect();
+                let removed = st.friends.on_synced(&list.items, &from, complete, now);
+                for f in &removed {
+                    env.emit(Event::FriendRemoved { pubkey: f.pk });
+                }
+                for f in st.friends.list() {
+                    let was = before.iter().find(|(pk, _)| *pk == f.pk).map(|(_, s)| *s);
+                    let was_accepted = was == Some(store::FriendState::Accepted);
+                    if f.state == store::FriendState::Accepted && !was_accepted {
+                        env.emit(Event::FriendAccepted {
+                            pubkey: f.pk,
+                            name: f.nick.clone(),
+                        });
+                    }
+                    // Заявка, пришедшая в наше отсутствие: офлайн-цель узнаёт о
+                    // ней только из списка. `expires_in: 0` — «срок неизвестен»
+                    // (в FRIEND_LIST его нет).
+                    if f.state == store::FriendState::PendingIn
+                        && was != Some(store::FriendState::PendingIn)
+                    {
+                        env.emit(Event::FriendRequest {
+                            pubkey: f.pk,
+                            name: f.nick.clone(),
+                            expires_in: 0,
+                        });
+                    }
+                }
+                st.sync_friends_cfg(env);
+                if let Some(n) = next {
+                    st.send_ctrl(env, ctrl::LIST_FRIENDS, &payloads::enc_pubkey(&n));
+                    st.friend_sync = Some((n, now));
+                    st.last_friend_req = now;
+                } else {
+                    st.friend_sync = None;
+                }
+                env.emit(Event::FriendsSynced {
+                    from,
+                    complete,
+                    count,
+                });
+            }
+        }
+        ctrl::FRIEND_REQ_ACCEPTED => {
+            if let Ok(v) = payloads::dec_friend_accepted(payload) {
+                st.friends.on_accepted(v.by, v.by_name.clone(), now);
+                st.declining_friends.remove(&v.by);
+                st.sync_friends_cfg(env);
+                env.emit(Event::FriendAccepted {
+                    pubkey: v.by,
+                    name: v.by_name,
+                });
+            }
+        }
+        ctrl::FRIEND_REQ_DECLINED => {
+            if let Ok(v) = payloads::dec_friend_declined(payload) {
+                st.friends.on_declined(v.by, now);
+                st.sync_friends_cfg(env);
+                env.emit(Event::FriendDeclined {
+                    pubkey: v.by,
+                    name: v.by_name,
+                });
+            }
+        }
+        ctrl::FRIEND_REMOVED => {
+            if let Ok(by) = payloads::dec_friend_removed(payload) {
+                // Уже снят нами — не повод для второго тоста.
+                if st.friends.on_removed(&by).is_some() {
+                    st.sync_friends_cfg(env);
+                    env.emit(Event::FriendRemoved { pubkey: by });
+                }
             }
         }
         ctrl::CTRL_PONG => {
@@ -4536,6 +5343,12 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
         entry.owner = st.owner;
         entry.private = st.private;
         entry.my_ip = st.my_ip;
+        // Свой MemberInfo — единственный взгляд сервера на нас: `online =
+        // false` при отключённой доставке подтверждает GROUP_ATTACH
+        // (issue #20). Без своего участника (старый сервер?) — не трогаем.
+        if let Some(me) = st.members.iter().find(|m| m.pubkey == my_pub) {
+            entry.server_online = me.online;
+        }
         // Метка «федерация»: gid мог прийти в FED_GROUPS раньше состояния
         // (или это ответ на JOIN_FED — список тоже уже был). Нет в списке —
         // прежняя метка сохраняется до следующего FED_GROUPS.
@@ -4594,6 +5407,7 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
             crate::dns::DNS_ADDR
         )));
     }
+    drop_offline_paths(env, &events);
     for ev in events {
         env.emit(ev);
     }
@@ -4620,6 +5434,9 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
     let my_pub = env.identity.ed_pub();
     let now = Instant::now();
     let mut events: Vec<Event> = Vec::new();
+    // Адреса участников, удалённых из группы: их записи в таблице путей
+    // снимаются после отпускания блокировки (issue #20/утечка замеров).
+    let mut removed_ips: Vec<u32> = Vec::new();
     {
         let mut g = env.groups.lock().unwrap();
         let Some(gs) = g.get_mut(&u.gid) else { return };
@@ -4638,11 +5455,25 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
                     // Хвост дельты (§4.2): mesh-контакт изменившегося участника.
                     gs.apply_mesh_tail_for(&m.pubkey, &u.mesh);
                     sync_group_contacts(env, gs);
+                } else {
+                    // Своя дельта приходит и после GROUP_ATTACH: `online =
+                    // false` — сервер принял отключение (issue #20).
+                    gs.server_online = m.online;
                 }
             }
             payloads::GroupDelta::Removed(pk) => {
                 if *pk != my_pub {
+                    // Адрес нужен до удаления: после `remove_member` его уже
+                    // не найти по ключу.
+                    let ip = gs
+                        .members
+                        .iter()
+                        .find(|(_, p)| p.pubkey == *pk)
+                        .map(|(ip, _)| *ip);
                     gs.remove_member(pk);
+                    if let Some(ip) = ip {
+                        removed_ips.push(ip);
+                    }
                 }
             }
             payloads::GroupDelta::Meta {
@@ -4656,6 +5487,22 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
             }
         }
         gs.rev = u.rev;
+    }
+    drop_offline_paths(env, &events);
+    // Удалённые из группы участники: запись в таблице путей снимается, если
+    // их больше нет ни в одной общей группе (issue #20, утечка замеров).
+    if !removed_ips.is_empty() {
+        let alive: HashSet<u32> = {
+            let g = env.groups.lock().unwrap();
+            g.values()
+                .flat_map(|gs| gs.members.keys().copied())
+                .collect()
+        };
+        for ip in removed_ips {
+            if !alive.contains(&ip) {
+                env.paths.clear_target(ip);
+            }
+        }
     }
     for ev in events {
         env.emit(ev);
@@ -4671,6 +5518,10 @@ enum FrameVerdict {
     Accepted,
     /// Эпоха новее известной: нужен GET_GROUP (сигнал не чаще раза в секунду).
     NeedGroup(u32),
+    /// Повтор уже доставленного кадра (issue #25): не инжектится, окно
+    /// повторов не трогает, но это **не** отказ — отправителю уходит ACK.
+    /// Иначе дубликат (в т.ч. при дублировании путей) снимал бы здоровый путь.
+    Duplicate,
     /// Отброшен: не своя группа, не нам, не тот отправитель, повтор, мусор.
     Drop,
 }
@@ -4687,6 +5538,8 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         return FrameVerdict::Drop;
     };
     let now = Instant::now();
+    // Время для кольца дедупа — до захвата групп (uptime_ms берёт meta).
+    let now_ms = uptime_ms(env) as u32;
     let is_relay = relayed || src == env.server();
     // 1. Группа известна, эпоха — текущая или прошлая в пределах grace.
     let key = {
@@ -4694,6 +5547,11 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         let Some(gs) = g.get_mut(&h.gid) else {
             return FrameVerdict::Drop;
         };
+        // Группа отключена локально (issue #20): кадры не принимаем вовсе —
+        // окно повторов и статистика не тратятся, PING не отвечается.
+        if gs.detached {
+            return FrameVerdict::Drop;
+        }
         match gs.rx_key(h.epoch, now) {
             Some(k) => k,
             None => {
@@ -4715,6 +5573,9 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         return FrameVerdict::Drop;
     }
     let mut became_direct: Option<String> = None;
+    // Замер RTT из PONG: адрес получателя, мс и по какому пути он пришёл
+    // (прямой / через сервер) — для честного end-to-end RTT (issue #15).
+    let mut pong: Option<(u32, u32, bool, bool)> = None;
     let reply = {
         let mut g = env.groups.lock().unwrap();
         let Some(gs) = g.get_mut(&h.gid) else {
@@ -4733,12 +5594,31 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
             return FrameVerdict::Drop;
         }
         // 4. Окно повторов (того ключа, которым открыт фрейм) — последним:
-        //    отвергнутый фрейм счётчик не тратит.
+        //    отвергнутый фрейм счётчик не тратит. Перед ним — дедуп на выходе
+        //    (issue #25): повтор уже доставленного кадра отличается от
+        //    подделки/старика и получает ACK, а не NACK.
+        let Some(ring) = gs.rx_dedup(&key, h.src, now_ms) else {
+            return FrameVerdict::Drop;
+        };
+        if ring.seen(ctr, now_ms) {
+            // Не инжектим, окно не трогаем, прямой канал не поднимаем: кадр
+            // уже доставлен, но пир жив — ответ придёт ACK-ом.
+            env.stats.dup_dropped.fetch_add(1, Ordering::Relaxed);
+            if let Some(peer) = gs.members.get_mut(&h.src) {
+                peer.last_rx = now;
+            }
+            return FrameVerdict::Duplicate;
+        }
         let Some(win) = gs.rx_window(&key, h.src) else {
             return FrameVerdict::Drop;
         };
         if !win.commit(ctr) {
             return FrameVerdict::Drop;
+        }
+        // Кольцо заполняется только после успешного commit: подделанный кадр
+        // (AEAD не сошёлся) и повтор вне окна его не отравляют.
+        if let Some(ring) = gs.rx_dedup(&key, h.src, now_ms) {
+            ring.record(ctr, now_ms);
         }
         let peer = gs.members.get_mut(&h.src).expect("участник проверен");
         peer.last_rx = now;
@@ -4748,6 +5628,9 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
                 None => {
                     peer.direct_addr = Some(src);
                     peer.last_direct = Some(now);
+                    // Прямой канал есть — бэкофф PUNCH сброшен (issue #16).
+                    peer.punch_fails = 0;
+                    peer.punch_at = None;
                     became_direct = Some(peer.name.clone());
                 }
                 Some(a) if a == src => peer.last_direct = Some(now),
@@ -4757,7 +5640,16 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
         if typ == proto::grp::PONG
             && let Ok(sent_ms) = payloads::dec_ping(&payload)
         {
-            peer.rtt_ms = Some(epoch_ms().saturating_sub(sent_ms));
+            let rtt = epoch_ms().saturating_sub(sent_ms);
+            peer.rtt_ms = Some(rtt);
+            let direct = !is_relay && peer.direct_addr == Some(src);
+            let via_server = !direct && src == env.server();
+            pong = Some((
+                h.src,
+                u32::try_from(rtt).unwrap_or(u32::MAX),
+                direct,
+                via_server,
+            ));
         }
         // Через релея heartbeat не отвечаем: ответ ушёл бы не туда (dst —
         // исходный отправитель), а прямой канал его и так покрывает.
@@ -4782,6 +5674,17 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
             ip: h.src,
             name,
         });
+    }
+    // Замер из PONG — в таблицу путей: прямой — стоимость L0, серверный —
+    // честный end-to-end маршрута (issue #15), плечо сюда не попадает.
+    if let Some((ip, rtt, direct, via_server)) = pong {
+        let now_ms = uptime_ms(env);
+        if direct {
+            env.paths.record_direct_rtt(ip, rtt, now_ms);
+        } else if via_server {
+            env.paths.record_server_path_rtt(ip, rtt, now_ms);
+        }
+        env.paths.record_probe_answered(ip);
     }
     match (typ, reply) {
         (proto::grp::DATA, _) => {
@@ -4810,6 +5713,9 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8], relayed: bool
 fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
     groups
         .iter()
+        // Отключённая группа не доставляет: пакет ищет другую общую группу
+        // (issue #20). Нет такой — пакет отбрасывается.
+        .filter(|(_, gs)| !gs.detached)
         .filter(|(_, gs)| gs.my_ip != dst)
         .filter_map(|(gid, gs)| gs.members.get(&dst).map(|p| (*gid, p)))
         .min_by_key(|(gid, p)| (p.direct_addr.is_none(), !p.online, *gid))
@@ -4820,6 +5726,15 @@ fn pick_group(groups: &HashMap<u32, GroupSess>, dst: u32) -> Option<u32> {
 /// измеренной стоимости (§3.6): прямой → релей сервера → релей через пира.
 /// Отказ выбранного пути (`record_failure` + `PathLost`) — следующий кандидат:
 /// реле пробуются по очереди (до [`RELAY_TRIES`]), затем сервер.
+///
+/// Дублирование (issue #25): маленький пакет к цели, которая умеет дедуп
+/// (`caps::DUP`), уходит по нескольким путям — копии **одной и той же**
+/// датаграммы.
+///
+/// Инвариант: кадр запечатывается **один раз** и может быть отправлен по
+/// любому числу путей. Повторная запечатки того же payload под тем же
+/// счётчиком запрещена — это повтор nonce; per-flow seq здесь один на все
+/// пути, потому что кадр один.
 fn route_packet(env: &Env, bytes: &[u8]) {
     if bytes.len() > proto::MAX_GROUP_PAYLOAD {
         return;
@@ -4833,7 +5748,7 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
-    let (key, h, ctr, direct, dst_ed) = {
+    let (key, h, ctr, direct, dst_ed, peer_caps) = {
         let mut g = env.groups.lock().unwrap();
         let Some(gid) = pick_group(&g, dst) else {
             return;
@@ -4842,17 +5757,26 @@ fn route_packet(env: &Env, bytes: &[u8]) {
         let Some(peer) = gs.members.get(&dst) else {
             return;
         };
-        let (direct, dst_ed) = (peer.direct_addr, peer.pubkey);
+        let (direct, dst_ed, caps) = (peer.direct_addr, peer.pubkey, peer.mesh_caps);
         let (k, h, c) = gs.next_frame(gid, dst);
-        (k, h, c, direct, dst_ed)
+        (k, h, c, direct, dst_ed, caps)
     };
+    // Запечатали один раз — все копии ниже отправляют эти же байты.
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     let connected = env.meta.lock().unwrap().connected;
     let now_ms = uptime_ms(env);
     let (chosen, changes) = env.paths.choose(dst, now_ms, connected);
     for ch in changes {
-        emit_path_change(env, ch);
+        emit_path_change(env, ch, false);
     }
+    // Дополнительные пути (issue #25) — до отправки: решение не зависит от
+    // того, принял ли кадр выбранный путь. Прямой путь без адреса уже уйдёт
+    // сервером, и копия «сервером» была бы второй одинаковой датаграммой.
+    let extra = if chosen == Some(PathKind::Direct) && direct.is_none() {
+        Vec::new()
+    } else {
+        dup_extra_paths(env, dst, peer_caps, bytes.len(), chosen, now_ms, connected)
+    };
     match chosen {
         Some(PathKind::Direct) => match direct {
             Some(a) => env.send(&frame, a),
@@ -4885,6 +5809,161 @@ fn route_packet(env: &Env, bytes: &[u8]) {
         // ничего не даёт, но и вреда нет).
         Some(PathKind::Server) | None => env.send(&frame, env.server()),
     }
+    // Копии по дополнительным путям (issue #25): те же байты кадра, без
+    // перезапечатки. Отказ копии не трогает таблицу путей: её состояние
+    // поправят обычные измерения, а путь к цели уже выбран.
+    for kind in extra {
+        if send_extra(env, dst_ed, direct, &frame, kind) {
+            env.stats.dup_sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Входы правила дублирования (issue #25): так сигнатура не разрастается, а
+/// тест задаёт их по отдельности.
+struct DupQuery<'a> {
+    cfg: &'a crate::store::MeshConfig,
+    /// Сколько путей копировать (`Config::duplicate_paths`).
+    n_paths: u8,
+    peer_caps: u8,
+    pinned: bool,
+    pkt_len: usize,
+    /// EWMA скорости цели, кбит/с.
+    rate_kbps: f64,
+    chosen: Option<PathKind>,
+    /// Доступные пути по возрастанию стоимости (`PathTable::fallbacks`).
+    paths: &'a [PathKind],
+}
+
+/// Правило выбора путей для дублирования (issue #25) без движка — чистая
+/// функция, чтобы её можно было проверить юнит-тестом.
+///
+/// Копии шлются, только если: дублирование включено, пакет не больше
+/// `duplicate_max_pkt`, получатель умеет дедуп (`caps::DUP`), цель не
+/// закреплена вручную (pin сильнее автоматики), поток цели не быстрее
+/// `duplicate_max_kbps`, доступно ≥ 2 пути и каждый следующий не дороже
+/// [`DUP_COST_RATIO`]× лучшего (+ [`DUP_COST_SLACK_MS`]).
+///
+/// Возвращает пути **сверх** выбранного: не больше `n_paths - 1`.
+fn dup_plan(q: &DupQuery, cost_ms: impl Fn(PathKind) -> Option<f64>) -> Vec<PathKind> {
+    let cfg = q.cfg;
+    if !cfg.duplicate || q.pkt_len > usize::from(cfg.duplicate_max_pkt) {
+        return Vec::new();
+    }
+    // Пир не умеет дедуп — копии для него мусор (и трафик).
+    if !proto::mesh::caps::has(q.peer_caps, proto::mesh::caps::DUP) {
+        return Vec::new();
+    }
+    // Ручное закрепление сильнее автоматики: у пина ровно один путь.
+    if q.pinned || q.chosen.is_none() || q.paths.len() < 2 {
+        return Vec::new();
+    }
+    // Быстрый поток дублировать нельзя: полоса удвоится на потоке, которому
+    // это не нужно (дублирование — для редкого latency-sensitive трафика).
+    if q.rate_kbps > f64::from(cfg.duplicate_max_kbps) {
+        return Vec::new();
+    }
+    let best = q
+        .paths
+        .iter()
+        .filter_map(|k| cost_ms(*k))
+        .fold(f64::INFINITY, f64::min);
+    if !best.is_finite() {
+        return Vec::new();
+    }
+    let limit = usize::from(q.n_paths);
+    let mut out = Vec::new();
+    for kind in q.paths {
+        if Some(*kind) == q.chosen {
+            continue;
+        }
+        if out.len() + 1 >= limit {
+            break;
+        }
+        match cost_ms(*kind) {
+            // `fallbacks` отсортирован по стоимости: дальше только дороже.
+            Some(c) if c <= best * DUP_COST_RATIO + DUP_COST_SLACK_MS => out.push(*kind),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// RTT пути до получателя `ip`, мс (issue #25): оценка стоимости для правила
+/// «второй путь не хуже 1.5× лучшего». Прямой канал — из PONG, сервер — из
+/// CTRL_PONG, релей — из `MESH_ROUTE_OK` (запоминает движок).
+fn path_rtt_ms(env: &Env, ip: u32, kind: PathKind, now_ms: u64) -> Option<f64> {
+    match kind {
+        PathKind::Direct => {
+            let g = env.groups.lock().unwrap();
+            g.values()
+                .find_map(|gs| gs.members.get(&ip).and_then(|p| p.rtt_ms))
+                .map(|r| r as f64)
+        }
+        // Честный e2e-замер (issue #15): плечо до сервера сравнивать с прямым
+        // путём нельзя — оно всегда «лучше» и перекосило бы выбор копий.
+        PathKind::Server => env.paths.server_path_rtt(ip).map(f64::from),
+        PathKind::PeerRelay { via } => {
+            let d = env.dup.lock().unwrap();
+            d.relay
+                .get(&(ip, via))
+                .filter(|(_, at)| now_ms.saturating_sub(*at) <= DUP_RELAY_FRESH_MS)
+                .map(|(rtt, _)| *rtt)
+        }
+    }
+}
+
+/// Дополнительные пути для копий кадра (issue #25): правила, которым нужно
+/// состояние движка, — EWMA скорости цели, предел одновременных целей,
+/// закрепление, доступные пути и их RTT.
+fn dup_extra_paths(
+    env: &Env,
+    dst: u32,
+    peer_caps: u8,
+    pkt_len: usize,
+    chosen: Option<PathKind>,
+    now_ms: u64,
+    connected: bool,
+) -> Vec<PathKind> {
+    let cfg = env.cfg.lock().unwrap().mesh.clone();
+    if !cfg.duplicate {
+        return Vec::new();
+    }
+    // EWMA скорости цели (кбит/с) — с учётом этого пакета.
+    let rate_kbps = {
+        let mut d = env.dup.lock().unwrap();
+        d.rate
+            .retain(|_, r| now_ms.saturating_sub(r.at_ms) < DUP_TARGET_TTL_MS * 6);
+        d.rate.entry(dst).or_default().observe(pkt_len, now_ms)
+    };
+    // Предел одновременно дублируемых целей: больше DUP_TARGETS_MAX — это уже
+    // дублирование всего трафика, а не маленького latency-sensitive.
+    {
+        let mut d = env.dup.lock().unwrap();
+        d.active
+            .retain(|_, at| now_ms.saturating_sub(*at) < DUP_TARGET_TTL_MS);
+        if !d.active.contains_key(&dst) && d.active.len() >= DUP_TARGETS_MAX {
+            return Vec::new();
+        }
+    }
+    let pinned = env.paths.pin_of(dst).is_some();
+    let fb = env.paths.fallbacks(dst, now_ms, connected);
+    let n_paths = env.cfg.lock().unwrap().duplicate_paths();
+    let q = DupQuery {
+        cfg: &cfg,
+        n_paths,
+        peer_caps,
+        pinned,
+        pkt_len,
+        rate_kbps,
+        chosen,
+        paths: &fb,
+    };
+    let extra = dup_plan(&q, |k| path_rtt_ms(env, dst, k, now_ms));
+    if !extra.is_empty() {
+        env.dup.lock().unwrap().active.insert(dst, now_ms);
+    }
+    extra
 }
 
 /// Ответ встроенного DNS на запрос из адаптера: имена — нормализованные
@@ -4935,18 +6014,32 @@ fn answer_dns(env: &Env, bytes: &[u8]) {
 // ---------- раунды RTT и NAT ----------
 
 /// RTT-зонд онлайн-пирам: прямым — напрямую (это же держит NAT-маппинг),
-/// остальным — через релей. Заодно гасит протухшие прямые каналы.
-fn rtt_round(env: &Env, connected: bool, now: Instant) {
+/// остальным — через сервер (честный end-to-end замер маршрута, issue #15).
+/// Заодно гасит протухшие прямые каналы: порог — [`direct_timeout`] от
+/// интервала проб (issue #16), поэтому одна-две пропущенные пробы канал не
+/// убивают.
+fn rtt_round(env: &Env, connected: bool, now: Instant, interval: Duration) {
     let payload = payloads::enc_ping(epoch_ms());
     let mut frames: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     // Замеры прямого канала (RTT из PONG по прямому пути) и падения.
     let mut direct_rtts: Vec<(u32, u32)> = Vec::new();
+    // Получатели, которым реально ушла проба (для учёта потерь, issue #26).
+    let mut probes: Vec<u32> = Vec::new();
+    // Уникальные получатели раунда: у пира может быть несколько общих групп.
+    let mut seen_probes: HashSet<u32> = HashSet::new();
     let mut failures: Vec<u32> = Vec::new();
+    let timeout = direct_timeout(interval);
     {
         let server = env.server();
         let mut g = env.groups.lock().unwrap();
         for (gid, gs) in g.iter_mut() {
+            // Отключённая группа (issue #20): доставки нет, проб не шлём —
+            // иначе «отключённый» оставался бы для пиров живым, а его
+            // собственные потери были бы 100 %.
+            if gs.detached {
+                continue;
+            }
             let ips: Vec<u32> = gs.members.keys().copied().collect();
             for ip in ips {
                 let Some(peer) = gs.members.get_mut(&ip) else {
@@ -4958,7 +6051,7 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                 if peer.direct_addr.is_some()
                     && peer
                         .last_direct
-                        .is_none_or(|t| now.duration_since(t) > DIRECT_TIMEOUT)
+                        .is_none_or(|t| now.duration_since(t) > timeout)
                 {
                     peer.direct_addr = None;
                     peer.last_direct = None;
@@ -4987,6 +6080,7 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                     proto::seal_group(&k, proto::grp::PING, &h, c, &payload),
                     target,
                 ));
+                probes.push(ip);
             }
         }
     }
@@ -4994,6 +6088,15 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
     let now_ms = uptime_ms(env);
     for (ip, rtt) in direct_rtts {
         env.paths.record_direct_rtt(ip, rtt, now_ms);
+    }
+    for ip in probes {
+        // Один получатель может быть в нескольких общих группах: проб на него
+        // за раунд несколько, а окно потерь — одно. Иначе здоровая пара
+        // показывала бы 500 ‰ (issue #26).
+        if !seen_probes.insert(ip) {
+            continue;
+        }
+        env.paths.record_probe_sent(ip);
     }
     for ev in events {
         env.emit(ev);
@@ -5013,18 +6116,35 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
 
 /// PUNCH онлайн-пирам без прямого канала — на endpoint и все кандидаты.
 /// Пирам с прямым каналом не шлём ничего: их маппинг держат RTT-зонды.
-fn punch_round(env: &Env) {
+///
+/// Бэкофф (issue #16): каждая неудача удваивает паузу до пира —
+/// 5 → 10 → 20 → 40 → 60 с. Прямой канал сбрасывает счётчик (см.
+/// `handle_group_frame`), поэтому живая пара не платит за чужие неудачи.
+fn punch_round(env: &Env, now: Instant) {
     let mut frames: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
     {
         let mut g = env.groups.lock().unwrap();
         for (gid, gs) in g.iter_mut() {
+            // Отключённая группа (issue #20): PUNCH — тоже доставка, её нет.
+            if gs.detached {
+                continue;
+            }
             let targets: Vec<(u32, Vec<SocketAddr>)> = gs
                 .members
                 .iter()
                 .filter(|(_, p)| p.online && p.direct_addr.is_none())
+                .filter(|(_, p)| p.punch_at.is_none_or(|t| now >= t))
                 .map(|(ip, p)| (*ip, p.punch_addrs()))
                 .collect();
             for (ip, addrs) in targets {
+                let Some(peer) = gs.members.get_mut(&ip) else {
+                    continue;
+                };
+                // Прошлый PUNCH прямого канала не дал — следующая попытка
+                // позже; счётчик растёт только здесь, сбрасывается каналом.
+                let wait = punch_interval(peer.punch_fails);
+                peer.punch_fails = peer.punch_fails.saturating_add(1);
+                peer.punch_at = Some(now + wait);
                 for a in addrs {
                     let (k, h, c) = gs.next_frame(*gid, ip);
                     frames.push((proto::seal_group(&k, proto::grp::PUNCH, &h, c, &[]), a));
@@ -5206,6 +6326,36 @@ pub fn run(
             Event::InviteRevoked { gid } => {
                 eprintln!("[engine] приглашение в группу {gid} больше недействительно")
             }
+            // Друзья (issue #24): в `run` ответить на месте нельзя по той же
+            // причине, что и на приглашение, — командой после остановки run
+            // (`accept-friend` / `decline-friend`) или в TUI.
+            Event::FriendRequest {
+                pubkey,
+                name,
+                expires_in,
+            } => eprintln!(
+                "[engine] заявка в друзья от {name} ({}): истекает через {}; ответить — accept-friend / decline-friend после остановки run или в TUI",
+                friends::short_code(&pubkey),
+                fmt_secs(expires_in)
+            ),
+            Event::FriendAccepted { pubkey, name } => eprintln!(
+                "[engine] заявка принята: {name} ({}) теперь друг",
+                friends::short_code(&pubkey)
+            ),
+            Event::FriendDeclined { pubkey, name } => eprintln!(
+                "[engine] {name} ({}) отклонил заявку в друзья",
+                friends::short_code(&pubkey)
+            ),
+            Event::FriendRemoved { pubkey } => {
+                eprintln!("[engine] дружба с {} снята", friends::short_code(&pubkey))
+            }
+            Event::FriendsSynced {
+                count, complete, ..
+            } => {
+                if debug() {
+                    eprintln!("[engine] список друзей: {count} записей, полный: {complete}");
+                }
+            }
             Event::ServerKeyRotated { addr, new_code } => eprintln!(
                 "[engine] ключ сервера {addr} сменён по цепочке ротации, закреплён новый: {new_code}"
             ),
@@ -5224,7 +6374,7 @@ pub fn run(
             }
             Event::ServerPingResult { .. } => {}
             // Этап 9: путь доставки, пробы, релей. UI-часть — T2/T3/T5.
-            Event::PathChanged { .. } | Event::PathLost { .. } => {}
+            Event::PathChanged { .. } | Event::PathLost { .. } | Event::PathReverted { .. } => {}
             Event::ProbeResult { .. } => {}
             Event::RelayStats { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
@@ -5609,6 +6759,8 @@ mod tests {
             rtt_ms: None,
             mesh_x: None,
             mesh_caps: 0,
+            punch_fails: 0,
+            punch_at: None,
         };
         let mut groups: HashMap<u32, GroupSess> = HashMap::new();
         for gid in [3, 5, 9] {
@@ -5659,6 +6811,8 @@ mod tests {
                 rtt_ms: None,
                 mesh_x: None,
                 mesh_caps: 0,
+                punch_fails: 0,
+                punch_at: None,
             },
         );
         let h = |src, epoch| proto::GroupHeader {
@@ -5876,6 +7030,11 @@ mod tests {
 
     /// Минимальный `Env` без потоков: мета/группы/сокет/таблица путей.
     fn test_env(server: SocketAddr) -> (Arc<Env>, mpsc::Receiver<Event>) {
+        test_env_tun(server, Arc::new(NullTun))
+    }
+
+    /// То же, но со своей заглушкой адаптера (счётчик инъекций в тестах дедупа).
+    fn test_env_tun(server: SocketAddr, tun: Arc<dyn TunDev>) -> (Arc<Env>, mpsc::Receiver<Event>) {
         let (ev_tx, ev_rx) = mpsc::channel();
         let meta = Arc::new(Mutex::new(Meta {
             connected: true,
@@ -5905,7 +7064,7 @@ mod tests {
             server: Mutex::new(server),
             sock,
             tcp: Mutex::new(None),
-            tun: Arc::new(NullTun),
+            tun,
             quit: AtomicBool::new(false),
             key_log: KeyLog::default(),
             mesh: Arc::new(Mutex::new(mesh::MeshState::new(true))),
@@ -5913,6 +7072,7 @@ mod tests {
             mesh_finds: Arc::new(Mutex::new(Vec::new())),
             paths: paths.clone(),
             probes: Arc::new(probe::ProbeState::new()),
+            dup: Mutex::new(DupState::default()),
         });
         (env, ev_rx)
     }
@@ -5924,6 +7084,379 @@ mod tests {
             at: Instant::now() - Duration::from_millis(30),
             report,
         }
+    }
+
+    // ---------- issue #25: дедупликация на выходе и дублирование путей ----------
+
+    /// Заглушка адаптера со счётчиком инъекций.
+    #[derive(Default)]
+    struct CountTun {
+        injected: AtomicU64,
+    }
+
+    impl TunDev for CountTun {
+        fn inject(&self, _packet: &[u8]) -> Result<()> {
+            self.injected.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn ensure_address(&self, _ip: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Минимальный IPv4-пакет (заголовок 20 байт + данные).
+    fn ipv4(src: u32, dst: u32, data: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        let len = (20 + data.len()) as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src.to_be_bytes());
+        p[16..20].copy_from_slice(&dst.to_be_bytes());
+        p.extend_from_slice(data);
+        p
+    }
+
+    /// Группа с одним участником: свой ip, ключ `[2; 32]`, эпоха 1.
+    fn test_group(gid: u32, my_ip: u32, peer_ip: u32, peer_addr: SocketAddr) -> GroupSess {
+        let mut gs = GroupSess::new(
+            &payloads::GroupState {
+                gid,
+                rev: 1,
+                epoch: 1,
+                revoke_prev: false,
+                name: "g".into(),
+                owner: [1; 32],
+                private: false,
+                key: [2; 32],
+                deleted: false,
+                my_ip,
+                members: Vec::new(),
+                mesh: Vec::new(),
+            },
+            Instant::now(),
+            KeyLog::default(),
+        );
+        gs.members.insert(
+            peer_ip,
+            PeerSess {
+                pubkey: [3; 32],
+                name: "bravo".into(),
+                status: String::new(),
+                online: true,
+                ip: peer_ip,
+                endpoint: Some(peer_addr),
+                candidates: Vec::new(),
+                direct_addr: None,
+                last_rx: Instant::now(),
+                last_direct: None,
+                rtt_ms: Some(20),
+                mesh_x: None,
+                mesh_caps: proto::mesh::caps::MESH | proto::mesh::caps::DUP,
+                punch_fails: 0,
+                punch_at: None,
+            },
+        );
+        gs
+    }
+
+    /// Кадр группы под ключом `[2; 32]` (тот же, что у `test_group`).
+    fn test_frame(gid: u32, src: u32, dst: u32, ctr: u64, payload: &[u8]) -> Vec<u8> {
+        proto::seal_group(
+            &[2u8; 32],
+            proto::grp::DATA,
+            &proto::GroupHeader {
+                gid,
+                src,
+                dst,
+                epoch: 1,
+            },
+            ctr,
+            payload,
+        )
+    }
+
+    #[test]
+    fn дедуп_повтор_не_инжектится_дважды() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let tun = Arc::new(CountTun::default());
+        let (env, _ev) = test_env_tun(server, tun.clone());
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        env.groups
+            .lock()
+            .unwrap()
+            .insert(gid, test_group(gid, my_ip, peer_ip, peer));
+        let pkt = ipv4(peer_ip, my_ip, b"dedup");
+        let f = test_frame(gid, peer_ip, my_ip, 5, &pkt);
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Accepted
+        );
+        assert_eq!(tun.injected.load(Ordering::Relaxed), 1);
+        // Второй экземпляр того же кадра (копия по другому пути) — Duplicate.
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Duplicate
+        );
+        assert_eq!(
+            tun.injected.load(Ordering::Relaxed),
+            1,
+            "повтор не инжектится"
+        );
+        assert_eq!(env.stats.dup_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn дедуп_повтор_даёт_ack_а_не_nack() {
+        // Главный фикс issue #25: отброшенный повтор — успех для отправителя,
+        // иначе NACK снимал бы здоровый путь (record_failure по ForwardFailed).
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let tun = Arc::new(CountTun::default());
+        let (env, _ev) = test_env_tun(server, tun);
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        env.groups
+            .lock()
+            .unwrap()
+            .insert(gid, test_group(gid, my_ip, peer_ip, peer));
+        let pkt = ipv4(peer_ip, my_ip, b"ack");
+        let f = test_frame(gid, peer_ip, my_ip, 7, &pkt);
+        let first = handle_group_frame(&env, peer, &f, true);
+        let repeat = handle_group_frame(&env, peer, &f, true);
+        assert_eq!(first, FrameVerdict::Accepted);
+        assert_eq!(repeat, FrameVerdict::Duplicate);
+        assert!(delivery_result_of(first).0);
+        assert_eq!(
+            delivery_result_of(repeat),
+            (true, proto::mesh::code::REJECTED),
+            "дубликат подтверждается (ACK), а не отвергается (NACK)"
+        );
+    }
+
+    #[test]
+    fn дедуп_истекает_по_времени() {
+        let mut ring = DedupRing::default();
+        ring.record(7, 1_000);
+        assert!(ring.seen(7, 1_000), "сразу после приёма — повтор");
+        assert!(
+            ring.seen(7, 1_000 + DEDUP_TTL_MS - 1),
+            "в пределах TTL — ещё повтор"
+        );
+        assert!(
+            !ring.seen(7, 1_000 + DEDUP_TTL_MS),
+            "после TTL — уже не дубликат (решает окно повторов)"
+        );
+        // Кольцо ограничено: старые seq вытесняются новыми.
+        for i in 0..DEDUP_WINDOW as u64 {
+            ring.record(100 + i, 1_000);
+        }
+        assert!(!ring.seen(7, 1_000), "seq вытеснен кольцом");
+    }
+
+    #[test]
+    fn дедуп_не_видит_повтор_после_смены_ключа() {
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        let mut gs = test_group(gid, my_ip, peer_ip, peer);
+        let key1 = [2u8; 32];
+        gs.rx_dedup(&key1, peer_ip, 1_000).unwrap().record(5, 1_000);
+        assert!(gs.rx_dedup(&key1, peer_ip, 1_000).unwrap().seen(5, 1_000));
+        // Ротация ключа: кольцо принадлежит ключу и начинается с нуля.
+        gs.set_key(2, [9u8; 32], false, Instant::now());
+        assert!(
+            !gs.rx_dedup(&[9u8; 32], peer_ip, 1_000)
+                .unwrap()
+                .seen(5, 1_000),
+            "новый ключ не наследует кольцо прежнего"
+        );
+        // Прошлый ключ ещё принимается (grace) — и его кольцо цело.
+        assert!(gs.rx_dedup(&key1, peer_ip, 1_000).unwrap().seen(5, 1_000));
+    }
+
+    #[test]
+    fn дедуп_память_ограничена_числом_потоков() {
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        let mut gs = test_group(gid, my_ip, peer_ip, peer);
+        let key = [2u8; 32];
+        for i in 0..(DEDUP_FLOWS_MAX as u32 * 3) {
+            let src = 0x6442_1000 + i;
+            let now = 1_000 + i;
+            gs.rx_dedup(&key, src, now)
+                .unwrap()
+                .record(u64::from(i), now);
+        }
+        assert_eq!(
+            gs.cur.dedup.len(),
+            DEDUP_FLOWS_MAX,
+            "число потоков в кольце ограничено"
+        );
+        // Простаивающий поток выбрасывается, даже если место есть.
+        let stale = 0x6442_9000;
+        gs.rx_dedup(&key, stale, 1_000).unwrap();
+        let later = 1_000 + DEDUP_FLOW_IDLE_MS + 1;
+        gs.rx_dedup(&key, 0x6442_A000, later).unwrap();
+        assert!(
+            !gs.cur.dedup.contains_key(&stale),
+            "простаивающий поток выброшен"
+        );
+    }
+
+    #[test]
+    fn дедуп_не_трогает_окно_повторов() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let tun = Arc::new(CountTun::default());
+        let (env, _ev) = test_env_tun(server, tun);
+        let peer: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let (gid, my_ip, peer_ip) = (1, 0x6442_0001, 0x6442_0102);
+        env.groups
+            .lock()
+            .unwrap()
+            .insert(gid, test_group(gid, my_ip, peer_ip, peer));
+        let pkt = ipv4(peer_ip, my_ip, b"window");
+        let f = test_frame(gid, peer_ip, my_ip, 5, &pkt);
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Accepted
+        );
+        let (max_before, bits_before) = {
+            let g = env.groups.lock().unwrap();
+            let w = g[&gid].cur.rx[&peer_ip].clone();
+            (w.max(), w.check(4))
+        };
+        assert_eq!(max_before, Some(5));
+        assert_eq!(
+            handle_group_frame(&env, peer, &f, false),
+            FrameVerdict::Duplicate
+        );
+        let g = env.groups.lock().unwrap();
+        let w = &g[&gid].cur.rx[&peer_ip];
+        assert_eq!(w.max(), max_before, "окно не сдвинулось повтором");
+        assert_eq!(w.check(4), bits_before, "биты окна не изменились");
+    }
+
+    /// Правила дублирования без движка: пути Direct (10 мс) и Server (12 мс).
+    fn dup_cfg() -> crate::store::MeshConfig {
+        crate::store::MeshConfig {
+            duplicate: true,
+            ..Default::default()
+        }
+    }
+
+    fn dup_paths() -> Vec<PathKind> {
+        vec![PathKind::Direct, PathKind::Server]
+    }
+
+    fn dup_cost(kind: PathKind) -> Option<f64> {
+        Some(match kind {
+            PathKind::Direct => 10.0,
+            PathKind::Server => 12.0,
+            PathKind::PeerRelay { .. } => 20.0,
+        })
+    }
+
+    /// Запрос с выбранным Direct и путями `paths`.
+    fn dup_query<'a>(
+        cfg: &'a crate::store::MeshConfig,
+        caps: u8,
+        paths: &'a [PathKind],
+    ) -> DupQuery<'a> {
+        DupQuery {
+            cfg,
+            n_paths: 2,
+            peer_caps: caps,
+            pinned: false,
+            pkt_len: 64,
+            rate_kbps: 0.0,
+            chosen: Some(PathKind::Direct),
+            paths,
+        }
+    }
+
+    #[test]
+    fn дублирование_не_включается_без_caps() {
+        let cfg = dup_cfg();
+        let paths = dup_paths();
+        let no_dup = proto::mesh::caps::MESH | proto::mesh::caps::RELAY;
+        assert!(
+            dup_plan(&dup_query(&cfg, no_dup, &paths), dup_cost).is_empty(),
+            "без caps::DUP копии не шлём"
+        );
+        let with_dup = no_dup | proto::mesh::caps::DUP;
+        assert_eq!(
+            dup_plan(&dup_query(&cfg, with_dup, &paths), dup_cost),
+            vec![PathKind::Server]
+        );
+        // Выключенное дублирование — пусто даже с битом.
+        let off = crate::store::MeshConfig {
+            duplicate: false,
+            ..cfg.clone()
+        };
+        assert!(dup_plan(&dup_query(&off, with_dup, &paths), dup_cost).is_empty());
+        // Ручное закрепление сильнее автоматики: у пина один путь.
+        let pinned = DupQuery {
+            pinned: true,
+            ..dup_query(&cfg, with_dup, &paths)
+        };
+        assert!(dup_plan(&pinned, dup_cost).is_empty());
+    }
+
+    #[test]
+    fn дублирование_только_для_малого_трафика() {
+        let cfg = dup_cfg();
+        let caps = proto::mesh::caps::MESH | proto::mesh::caps::DUP;
+        let paths = dup_paths();
+        let q = dup_query(&cfg, caps, &paths);
+        // Размер: больше duplicate_max_pkt — не дублируем.
+        let big = DupQuery {
+            pkt_len: usize::from(cfg.duplicate_max_pkt) + 1,
+            ..dup_query(&cfg, caps, &paths)
+        };
+        assert!(
+            dup_plan(&big, dup_cost).is_empty(),
+            "большой пакет не дублируется"
+        );
+        assert_eq!(dup_plan(&q, dup_cost), vec![PathKind::Server]);
+        // Скорость: быстрый поток цели — не дублируем.
+        let fast = DupQuery {
+            rate_kbps: f64::from(cfg.duplicate_max_kbps) + 1.0,
+            ..dup_query(&cfg, caps, &paths)
+        };
+        assert!(
+            dup_plan(&fast, dup_cost).is_empty(),
+            "быстрый поток не дублируется"
+        );
+        // Стоимость: второй путь дороже 1.5× лучшего (+ допуск) — не дублируем.
+        let far = |kind: PathKind| match kind {
+            PathKind::Direct => Some(10.0),
+            _ => Some(100.0),
+        };
+        assert!(dup_plan(&q, far).is_empty(), "дорогой второй путь не берём");
+        // Три пути: duplicate_paths = 3 — обе копии, кроме выбранной.
+        let three = crate::store::MeshConfig {
+            duplicate_paths: 3,
+            ..cfg.clone()
+        };
+        let relay = PathKind::PeerRelay { via: [7u8; 32] };
+        let mut paths3 = dup_paths();
+        paths3.push(relay);
+        assert_eq!(
+            dup_plan(
+                &DupQuery {
+                    n_paths: 3,
+                    ..dup_query(&three, caps, &paths3)
+                },
+                dup_cost
+            ),
+            vec![PathKind::Server, relay]
+        );
+        // duplicate_paths = 2 — только один дополнительный путь.
+        assert_eq!(
+            dup_plan(&dup_query(&cfg, caps, &paths3), dup_cost),
+            vec![PathKind::Server]
+        );
     }
 
     #[test]
@@ -6031,6 +7564,8 @@ mod tests {
                 rtt_ms: Some(20),
                 mesh_x: None,
                 mesh_caps: 0,
+                punch_fails: 0,
+                punch_at: None,
             },
         );
         env.groups.lock().unwrap().insert(1, g);
@@ -6196,5 +7731,135 @@ mod tests {
             }
         }
         assert_eq!(hint_candidates(&env).len(), payloads::MAX_SERVER_HINT);
+    }
+
+    /// Участник для тестов таймеров P2P: онлайн, без прямого канала.
+    fn timer_peer(ip: u32, endpoint: Option<SocketAddr>) -> PeerSess {
+        PeerSess {
+            pubkey: [3; 32],
+            name: "bravo".into(),
+            status: String::new(),
+            online: true,
+            ip,
+            endpoint,
+            candidates: Vec::new(),
+            direct_addr: None,
+            last_rx: Instant::now(),
+            last_direct: None,
+            rtt_ms: None,
+            mesh_x: None,
+            mesh_caps: 0,
+            punch_fails: 0,
+            punch_at: None,
+        }
+    }
+
+    #[test]
+    fn пробы_идут_не_чаще_интервала() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, _ev) = test_env(server);
+        let mut st = State::new([1; 32]);
+        // Интервал из конфига — 20 с (issue #16), а не прежние жёсткие 2 с.
+        env.cfg.lock().unwrap().rtt_interval_ms = 20_000;
+        let t0 = Instant::now();
+        st.last_rtt = t0;
+        // Прошло 2 с — пробы нет: раунд не сдвинул отметку.
+        tick(&env, &mut st, t0 + Duration::from_secs(2));
+        assert_eq!(st.last_rtt, t0, "проба чаще интервала");
+        // Интервал прошёл — раунд случился.
+        tick(&env, &mut st, t0 + Duration::from_secs(20));
+        assert!(st.last_rtt > t0, "проба не ушла через интервал");
+        // Свежесть прямого канала масштабируется: 3 × 20 с = 60 с, поэтому
+        // замер 30-секундной давности ещё жив.
+        let ip = 0x6442_0102;
+        env.paths.ensure_target(ip);
+        env.paths.record_direct_rtt(ip, 10, 0);
+        env.paths.recalc(30_000, true);
+        assert_eq!(env.paths.current(ip), Some(PathKind::Direct));
+        env.paths.recalc(61_000, true);
+        assert_eq!(
+            env.paths.current(ip),
+            Some(PathKind::Server),
+            "протухший прямой путь не держится"
+        );
+    }
+
+    #[test]
+    fn прямой_канал_не_умирает_от_одной_пропущенной_пробы() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, ev) = test_env(server);
+        let t0 = Instant::now();
+        let peer_ip = 0x6442_0102;
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut g = GroupSess::new(&state(1, 1, 1), t0, KeyLog::default());
+        let mut peer = timer_peer(peer_ip, None);
+        peer.direct_addr = Some(addr);
+        peer.last_direct = Some(t0);
+        g.members.insert(peer_ip, peer);
+        env.groups.lock().unwrap().insert(1, g);
+        let interval = Duration::from_secs(5);
+        // Одна пропущенная проба (5 с без прямых фреймов) канал не убивает:
+        // порог — max(12 с, 3 × интервал) = 15 с (issue #16).
+        rtt_round(&env, true, t0 + Duration::from_secs(5), interval);
+        assert!(
+            env.groups.lock().unwrap()[&1].members[&peer_ip]
+                .direct_addr
+                .is_some(),
+            "одна пропущенная проба убила прямой канал"
+        );
+        // Три интервала без единого фрейма — канал потерян, событие есть.
+        rtt_round(&env, true, t0 + Duration::from_secs(16), interval);
+        assert!(
+            env.groups.lock().unwrap()[&1].members[&peer_ip]
+                .direct_addr
+                .is_none()
+        );
+        assert!(matches!(
+            ev.try_recv().expect("нет события"),
+            Event::DirectLost { ip, .. } if ip == peer_ip
+        ));
+    }
+
+    #[test]
+    fn punch_с_бэкоффом_не_спамит() {
+        let server: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let (env, _ev) = test_env(server);
+        let t0 = Instant::now();
+        let peer_ip = 0x6442_0102;
+        let mut g = GroupSess::new(&state(1, 1, 1), t0, KeyLog::default());
+        g.members.insert(
+            peer_ip,
+            timer_peer(peer_ip, Some("127.0.0.1:9".parse().unwrap())),
+        );
+        env.groups.lock().unwrap().insert(1, g);
+        punch_round(&env, t0);
+        {
+            let g = env.groups.lock().unwrap();
+            let p = &g[&1].members[&peer_ip];
+            assert_eq!(p.punch_fails, 1, "попытка не учтена");
+            assert_eq!(p.punch_at, Some(t0 + Duration::from_secs(5)));
+        }
+        // Раньше срока PUNCH не уходит — счётчик не растёт (issue #16).
+        punch_round(&env, t0 + Duration::from_secs(1));
+        assert_eq!(
+            env.groups.lock().unwrap()[&1].members[&peer_ip].punch_fails,
+            1
+        );
+        // Через 5 с — вторая попытка, пауза удвоилась.
+        punch_round(&env, t0 + Duration::from_secs(5));
+        {
+            let g = env.groups.lock().unwrap();
+            let p = &g[&1].members[&peer_ip];
+            assert_eq!(p.punch_fails, 2);
+            assert_eq!(p.punch_at, Some(t0 + Duration::from_secs(15)));
+        }
+        // Потолок 60 с: 5 → 10 → 20 → 40 → 60 → 60…
+        let secs = |n| Duration::from_secs(n);
+        assert_eq!(punch_interval(0), secs(5));
+        assert_eq!(punch_interval(1), secs(10));
+        assert_eq!(punch_interval(2), secs(20));
+        assert_eq!(punch_interval(3), secs(40));
+        assert_eq!(punch_interval(4), secs(60));
+        assert_eq!(punch_interval(100), secs(60));
     }
 }
