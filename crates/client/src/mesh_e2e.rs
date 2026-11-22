@@ -5,9 +5,7 @@
 //! 1. релей через третьего участника при **остановленном** сервере;
 //! 2. DHT переживает мёртвый сервер и смену адреса пира;
 //! 3. переключение пути закреплением (`Cmd::PinPath`/`UnpinPath`);
-//! 7. `Cmd::SwitchServer` не теряет DHT/mesh-контакты;
-//! 8. кэш DHT (`mesh.contacts`) грузится при старте движка, а без сервера
-//!    движок честно не стартует (issue #27).
+//! 7. `Cmd::SwitchServer` не теряет DHT/mesh-контакты.
 //!
 //! Модуль отдельный от `engine_e2e.rs`: T2 (probe/offline) правит тот файл
 //! параллельно, а эти тесты трогают mesh-таймеры (шаг 1 с, поиск маршрута
@@ -16,6 +14,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -744,6 +743,172 @@ fn e2e_switch_server_не_рвёт_mesh_и_связь() {
     let _ = std::fs::remove_dir_all(&dir2);
 }
 
+// ---------- issue #25: дублирование путей и дедупликация на выходе ----------
+
+/// Сколько копий ждать, прежде чем проверять, что в TUN попала одна.
+const DUP_SETTLE: Duration = Duration::from_millis(600);
+
+/// Доступные пути до `ip` по таблице (для теста: `now_ms = 0` — все свежие
+/// замеры считаются актуальными, важно лишь наличие пути).
+fn available_paths(n: &Node, ip: u32) -> usize {
+    n.eng.paths.fallbacks(ip, 0, true).len()
+}
+
+#[test]
+fn e2e_дублирование_по_двум_путям_доставляет_один_раз() {
+    let dir = temp_dir("dup2");
+    let server = start_server(&dir, 47620);
+    // Дублирование включается конфигом до старта движка (по умолчанию выкл).
+    let cfg = Config {
+        name: "alpha".into(),
+        mesh: crate::store::MeshConfig {
+            duplicate: true,
+            duplicate_paths: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let identity = proto::Identity::generate();
+    let mut a = Node::start_cfg(cfg, &server, identity).expect("A стартует");
+    let gid = a.create("dup-two-paths");
+    let mut b = Node::start("bravo", &server);
+    b.join(gid);
+    let (a_ip, b_ip) = (a.my_ip(gid), b.my_ip(gid));
+    // B умеет дедуп: его caps приходят хвостом GROUP_STATE (MESH_INFO).
+    wait_until("B объявил caps::DUP", PATHS_T, || {
+        a.eng.groups.lock().unwrap()[&gid]
+            .members
+            .get(&b_ip)
+            .is_some_and(|p| proto::mesh::caps::has(p.mesh_caps, proto::mesh::caps::DUP))
+    });
+    // Два пути с конечной стоимостью: прямой (RTT из PONG) и сервер.
+    deliver(&a, &b, gid, "dup-warmup", T);
+    wait_until("два пути до B", PATHS_T, || {
+        available_paths(&a, b_ip) >= 2 && a.eng.paths.server_rtt().is_some()
+    });
+    let pkt = ipv4(a_ip, b_ip, b"dup-once");
+    a.eng.send_ip_packet(&pkt);
+    wait_until("пакет у B", T, || b.got(&pkt) >= 1);
+    // Вторая копия того же кадра приходит другим путём и отбрасывается дедупом.
+    std::thread::sleep(DUP_SETTLE);
+    assert_eq!(b.got(&pkt), 1, "дубликат инжектился дважды");
+    assert!(
+        b.eng.stats.dup_dropped.load(Ordering::Relaxed) >= 1,
+        "второй экземпляр не распознан как дубликат"
+    );
+    assert!(
+        a.eng.stats.dup_sent.load(Ordering::Relaxed) >= 1,
+        "копия не отправлена"
+    );
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_потерянный_ack_не_снимает_путь() {
+    // Дублирование по трём путям: прямой, сервер и релей через C. Копия,
+    // пришедшая последней, — повтор для получателя; до фикса #25 он отвечал
+    // NACK, релей пробрасывал его источнику, и тот снимал здоровый путь.
+    let dir = temp_dir("dupack");
+    let server = start_server(&dir, 47621);
+    let cfg = Config {
+        name: "alpha".into(),
+        mesh: crate::store::MeshConfig {
+            duplicate: true,
+            duplicate_paths: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let identity = proto::Identity::generate();
+    let mut a = Node::start_cfg(cfg, &server, identity).expect("A стартует");
+    let gid = a.create("dup-lost-ack");
+    let mut b = Node::start("bravo", &server);
+    b.join(gid);
+    let mut c = Node::start("charlie", &server);
+    c.join(gid);
+    let (a_ip, b_ip) = (a.my_ip(gid), b.my_ip(gid));
+    wait_until("состав из трёх", T, || {
+        a.eng.groups.lock().unwrap()[&gid].members.len() == 2
+    });
+    wait_until("mesh-сессии у A", MESH_T, || a.sessions() >= 2);
+    deliver(&a, &b, gid, "dupack-warmup", T);
+    // Все три пути: прямой, сервер и измеренный релей через C.
+    wait_until("три пути до B", MESH_T, || {
+        available_paths(&a, b_ip) >= 3 && a.eng.paths.server_rtt().is_some()
+    });
+    let before = a.eng.paths.current(b_ip);
+    assert!(before.is_some(), "путь до B не выбран");
+    let pkt = ipv4(a_ip, b_ip, b"dup-lost-ack");
+    a.eng.send_ip_packet(&pkt);
+    wait_until("пакет у B", T, || b.got(&pkt) >= 1);
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(b.got(&pkt), 1, "дубликат инжектился дважды");
+    assert!(
+        b.eng.stats.dup_dropped.load(Ordering::Relaxed) >= 1,
+        "копии не дошли до B — сценарий не проверен"
+    );
+    // Путь не снят: дубликат подтверждается (ACK), а не отвергается (NACK).
+    assert_eq!(a.eng.paths.current(b_ip), before, "дубликат снял путь");
+    let mut lost = false;
+    while let Ok(e) = a.eng.events.try_recv() {
+        if matches!(e, Event::PathLost { ip, .. } if ip == b_ip) {
+            lost = true;
+        }
+    }
+    assert!(!lost, "потерянный ACK снял здоровый путь");
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_поддельный_счётчик_не_заполняет_дедуп() {
+    // Кадр с верным заголовком, но чужим ключом и огромным счётчиком: AEAD не
+    // сходится — кольцо дедупа и окно повторов не трогаются, честный кадр
+    // проходит. Заполняй кольцо до проверки подлинности, подделка «съела» бы
+    // счётчики и глушила трафик.
+    let dir = temp_dir("dupforge");
+    let server = start_server(&dir, 47622);
+    let mut a = Node::start("alpha", &server);
+    let gid = a.create("dup-forge");
+    let mut b = Node::start("bravo", &server);
+    b.join(gid);
+    let (a_ip, b_ip) = (a.my_ip(gid), b.my_ip(gid));
+    wait_until("состав у B", T, || {
+        b.eng.groups.lock().unwrap()[&gid].members.len() == 1
+    });
+    let epoch = b.eng.groups.lock().unwrap()[&gid].epoch;
+    let forged_pkt = ipv4(a_ip, b_ip, b"forged");
+    let forged = proto::seal_group(
+        &[0xABu8; 32],
+        proto::grp::DATA,
+        &proto::GroupHeader {
+            gid,
+            src: a_ip,
+            dst: b_ip,
+            epoch,
+        },
+        500_000,
+        &forged_pkt,
+    );
+    // Отправляем с адреса A — правило «с адреса известного пира» пройдено,
+    // отсекает именно AEAD.
+    a.eng.send_raw(&forged, b.addr());
+    std::thread::sleep(Duration::from_millis(300));
+    let legit = ipv4(a_ip, b_ip, b"legit-after-forge");
+    a.eng.send_ip_packet(&legit);
+    wait_until("честный пакет у B", T, || b.got(&legit) >= 1);
+    std::thread::sleep(DUP_SETTLE);
+    assert_eq!(b.got(&legit), 1, "честный пакет доставлен не один раз");
+    assert_eq!(b.got(&forged_pkt), 0, "подделка инжектилась");
+    assert_eq!(
+        b.eng.stats.dup_dropped.load(Ordering::Relaxed),
+        0,
+        "подделка заполнила кольцо дедупа"
+    );
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
 /// Issue #27: сохранённый кэш `mesh.contacts` попадает в таблицу DHT при
 /// старте движка (раньше `Dht::load` был мёртвым кодом). Контакт из кэша —
 /// «чужой» пир, которого сервер в `MESH_SEED` не отдаёт, поэтому непустая

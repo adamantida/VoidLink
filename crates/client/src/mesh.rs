@@ -34,7 +34,7 @@
 //!   `inner`, ≤ [`mesh::MESH_MAX_HOPS`] хопов, ≤ [`MAX_PENDING_FORWARDS`]
 //!   кадров в полёте.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -73,8 +73,16 @@ pub const MAX_FORWARD_INNER: usize = proto::MAX_CTRL_PAYLOAD - mesh::MESH_FORWAR
 pub const FORWARD_GAP_MS: u64 = 1_500;
 /// Попыток отправки forward одному реле.
 pub const FORWARD_TRIES: u32 = 2;
-/// Максимум forward в полёте.
+/// Максимум forward в полёте (копий одного кадра — тоже: каждая копия
+/// считается отдельно, issue #25).
 pub const MAX_PENDING_FORWARDS: usize = 128;
+/// Сколько предыдущих хопов может ждать один и тот же forward (issue #25):
+/// дублированный кадр сходится в релее с двух путей, а копия к получателю
+/// уходит одна — подтверждение получают все ждущие.
+pub const FORWARD_WAITERS_MAX: usize = 4;
+/// Сколько помним «кадр уже подтверждён» (issue #25): отказ второй копии
+/// после успешной первой не должен снимать путь.
+pub const FORWARD_ACKED_TTL_MS: u64 = 10_000;
 /// Максимум ожидающих ROUTE/FIND_NODE.
 pub const MAX_PENDING_RPC: usize = 64;
 /// Сколько `visited` помним (предел разбора — у кодека).
@@ -190,11 +198,18 @@ struct PendingPing {
 }
 
 /// Отправленный forward, ждущий ACK/NACK.
+///
+/// Копия адресуется парой `(seq, to)` (issue #25): один кадр может лететь
+/// двумя релеями, и две копии — две независимые записи. ACK/NACK снимает
+/// только копию от того хопа, который его прислал.
 struct PendingForward {
     /// Кому мы его отправили (реле или конечный получатель).
     to: [u8; 32],
     /// Кто просил нас релеить (`None` — мы инициатор).
     prev: Option<[u8; 32]>,
+    /// Ещё просившие того же кадра через нас (дублирование сошлось в релее):
+    /// получат тот же ACK/NACK, что и `prev`, а копия к получателю — одна.
+    also: Vec<[u8; 32]>,
     /// Конечный получатель.
     dst_ed: [u8; 32],
     at_ms: u64,
@@ -337,7 +352,11 @@ pub struct MeshState {
     pings: HashMap<u64, PendingPing>,
     /// id запроса ROUTE → (цель, когда).
     routes: HashMap<u64, ([u8; 32], u64)>,
-    forwards: HashMap<u64, PendingForward>,
+    /// Ожидающие ACK/NACK копии forward: `(seq, кому отправлена)` → запись.
+    forwards: HashMap<(u64, [u8; 32]), PendingForward>,
+    /// Недавно подтверждённые кадры `(seq, когда)`: копия доставлена — отказ
+    /// оставшихся копий путь не снимает (issue #25).
+    acked: VecDeque<(u64, u64)>,
     /// Бюджет по реле-пирам.
     budgets: HashMap<[u8; 32], Budget>,
     next_id: u64,
@@ -371,6 +390,7 @@ impl MeshState {
             pings: HashMap::new(),
             routes: HashMap::new(),
             forwards: HashMap::new(),
+            acked: VecDeque::new(),
             budgets: HashMap::new(),
             next_id: 1,
             last_info_ms: 0,
@@ -388,6 +408,7 @@ impl MeshState {
             self.sessions.clear();
             self.pending_hs.clear();
             self.forwards.clear();
+            self.acked.clear();
         }
         self.enabled.store(on, Ordering::Relaxed);
     }
@@ -787,11 +808,16 @@ impl MeshState {
                 });
             }
             Rpc::ForwardAck { seq } => {
-                if let Some(f) = self.forwards.remove(&seq) {
+                if let Some(f) = self.forwards.remove(&(seq, ed)) {
+                    // Кадр доставлен хотя бы одной копией — путь жив (issue #25).
+                    self.mark_acked(seq, ctx.now_ms);
                     match f.prev {
                         // Средний хоп: подтверждаем предыдущему только теперь.
                         Some(prev) => {
-                            self.send_rpc(out, &prev, &Rpc::ForwardAck { seq }, ctx.now_ms)
+                            self.send_rpc(out, &prev, &Rpc::ForwardAck { seq }, ctx.now_ms);
+                            for p in &f.also {
+                                self.send_rpc(out, p, &Rpc::ForwardAck { seq }, ctx.now_ms);
+                            }
                         }
                         None => out.events.push(MeshEvent::ForwardOk {
                             dst_ed: f.dst_ed,
@@ -801,26 +827,26 @@ impl MeshState {
                 }
             }
             Rpc::ForwardNack { seq, code: c } => {
-                if let Some(f) = self.forwards.remove(&seq) {
-                    match f.prev {
-                        Some(prev) => {
+                if let Some(f) = self.forwards.remove(&(seq, ed)) {
+                    // Копии этого кадра ещё в полёте (дублирование, issue #25):
+                    // путь снимаем только когда не осталось ни одной.
+                    let in_flight = self.forwards.keys().any(|(s, _)| *s == seq);
+                    let mut upstream: Vec<[u8; 32]> = Vec::new();
+                    if let Some(prev) = f.prev {
+                        upstream.push(prev);
+                        upstream.extend(f.also.iter().copied());
+                        // Промежуточному хопу тоже сообщаем: он ждёт ACK и без
+                        // NACK повторял бы кадр, пока не истечёт таймаут.
+                        for p in upstream.iter().filter(|p| **p != f.to) {
                             let reply = Rpc::ForwardNack { seq, code: c };
-                            self.send_rpc(out, &prev, &reply, ctx.now_ms);
-                        }
-                        None => {
-                            out.events.push(MeshEvent::ForwardFailed {
-                                dst_ed: f.dst_ed,
-                                code: c,
-                            });
+                            self.send_rpc(out, p, &reply, ctx.now_ms);
                         }
                     }
-                    // Промежуточному хопу тоже сообщаем: он ждёт ACK и без
-                    // NACK повторял бы кадр, пока не истечёт таймаут.
-                    if let Some(prev) = f.prev
-                        && f.to != prev
-                    {
-                        let reply = Rpc::ForwardNack { seq, code: c };
-                        self.send_rpc(out, &prev, &reply, ctx.now_ms);
+                    if f.prev.is_none() && !in_flight && !self.acked_recently(seq, ctx.now_ms) {
+                        out.events.push(MeshEvent::ForwardFailed {
+                            dst_ed: f.dst_ed,
+                            code: c,
+                        });
                     }
                 }
             }
@@ -829,6 +855,25 @@ impl MeshState {
                 out.events.push(MeshEvent::Down { ed, reason: "bye" });
             }
         }
+    }
+
+    /// Кадр `seq` уже подтверждён кем-то из копий (issue #25): отказ
+    /// оставшихся копий не должен снимать путь.
+    fn acked_recently(&mut self, seq: u64, now_ms: u64) -> bool {
+        while let Some((_, at)) = self.acked.front() {
+            if now_ms.saturating_sub(*at) < FORWARD_ACKED_TTL_MS {
+                break;
+            }
+            self.acked.pop_front();
+        }
+        self.acked.iter().any(|(s, _)| *s == seq)
+    }
+
+    fn mark_acked(&mut self, seq: u64, now_ms: u64) {
+        if self.acked.len() >= MAX_PENDING_FORWARDS {
+            self.acked.pop_front();
+        }
+        self.acked.push_back((seq, now_ms));
     }
 
     fn send_rpc(&mut self, out: &mut MeshOut, to: &[u8; 32], rpc: &Rpc, now_ms: u64) {
@@ -955,6 +1000,18 @@ impl MeshState {
                 None => return Err(code::NO_ROUTE),
             },
         };
+        // Дублированный кадр сошёлся в нас с двух путей (issue #25): копия к
+        // получателю уже в полёте — вторую не шлём, но запоминаем, кому ещё
+        // должны ACK/NACK, иначе этот хоп повторял бы кадр до таймаута.
+        if let Some(p) = self.forwards.get_mut(&(seq, to_ed)) {
+            if p.prev != Some(from_ed)
+                && p.also.len() < FORWARD_WAITERS_MAX
+                && !p.also.contains(&from_ed)
+            {
+                p.also.push(from_ed);
+            }
+            return Ok(());
+        }
         // Бюджет: и входящий (нам), и исходящий (дальше) — наша полоса.
         self.charge(&from_ed, f.inner.len() as u64, ctx, now)?;
         self.charge(&to_ed, f.inner.len() as u64, ctx, now)?;
@@ -970,10 +1027,11 @@ impl MeshState {
         };
         let frame = next.to_frame().map_err(|_| code::BAD)?;
         self.forwards.insert(
-            seq,
+            (seq, to_ed),
             PendingForward {
                 to: to_ed,
                 prev: Some(from_ed),
+                also: Vec::new(),
                 dst_ed: f.dst_ed,
                 at_ms: now,
                 tries: 0,
@@ -1022,10 +1080,11 @@ impl MeshState {
         };
         let frame = f.to_frame().map_err(|_| code::BAD)?;
         self.forwards.insert(
-            seq,
+            (seq, hop.ed),
             PendingForward {
                 to: hop.ed,
                 prev: None,
+                also: Vec::new(),
                 dst_ed,
                 at_ms: now,
                 tries: 0,
@@ -1143,7 +1202,7 @@ impl MeshState {
         for (ed, reason) in dead {
             self.sessions.remove(&ed);
             self.forwards
-                .retain(|_, f| f.to != ed && f.prev != Some(ed));
+                .retain(|(_, to), f| *to != ed && f.prev != Some(ed) && !f.also.contains(&ed));
             out.events.push(MeshEvent::Down { ed, reason });
         }
         // Просроченные ожидания RPC — не копим.
@@ -1151,30 +1210,44 @@ impl MeshState {
             .retain(|_, p| now.saturating_sub(p.at_ms) < PING_TIMEOUT_MS * 2);
         self.routes
             .retain(|_, (_, at)| now.saturating_sub(*at) < PING_TIMEOUT_MS * 2);
-        // 5. Повторы forward и отказ после FORWARD_TRIES.
-        let mut failed: Vec<(u64, [u8; 32], u8)> = Vec::new();
-        for (seq, f) in self.forwards.iter_mut() {
+        // 5. Повторы forward и отказ после FORWARD_TRIES. Копии одного кадра
+        //    (дублирование, issue #25) повторяются независимо: у каждой свой
+        //    хоп, счётчик попыток и время.
+        let mut failed: Vec<(u64, [u8; 32], [u8; 32], u8)> = Vec::new();
+        for ((seq, to), f) in self.forwards.iter_mut() {
             if now.saturating_sub(f.at_ms) < FORWARD_GAP_MS {
                 continue;
             }
             if f.tries >= FORWARD_TRIES {
-                failed.push((*seq, f.dst_ed, code::REJECTED));
+                failed.push((*seq, *to, f.dst_ed, code::REJECTED));
                 continue;
             }
             f.tries += 1;
             f.at_ms = now;
             out.send(f.addr, f.frame.clone());
         }
-        for (seq, dst_ed, c) in failed {
-            if let Some(f) = self.forwards.remove(&seq) {
-                // Ожидание ACK не срослось: сообщаем и нам, и предыдущему хопу.
-                if let Some(prev) = f.prev {
-                    let nack = Rpc::ForwardNack { seq, code: c };
-                    self.send_rpc(&mut out, &prev, &nack, now);
+        for (seq, to, dst_ed, c) in failed {
+            let Some(f) = self.forwards.remove(&(seq, to)) else {
+                continue;
+            };
+            // Ожидание ACK не срослось: сообщаем предыдущим хопам.
+            if let Some(prev) = f.prev {
+                let nack = Rpc::ForwardNack { seq, code: c };
+                self.send_rpc(&mut out, &prev, &nack, now);
+                for p in &f.also {
+                    self.send_rpc(&mut out, p, &nack, now);
                 }
-                out.events
-                    .push(MeshEvent::ForwardFailed { dst_ed, code: c });
             }
+            // Копии того же кадра ещё в полёте — путь снимать рано.
+            if self.forwards.keys().any(|(s, _)| *s == seq) {
+                continue;
+            }
+            // Другая копия уже дошла — этот отказ путь не снимает (issue #25).
+            if self.acked_recently(seq, now) {
+                continue;
+            }
+            out.events
+                .push(MeshEvent::ForwardFailed { dst_ed, code: c });
         }
         out
     }
@@ -1674,6 +1747,77 @@ mod tests {
             Some(MeshEvent::ForwardOk { dst_ed, .. }) if *dst_ed == c.id.ed_pub()
         ));
         assert!(a.st.stats().relay_bytes > 0);
+    }
+
+    #[test]
+    fn повтор_forward_на_двух_релеях_не_затирает_запись() {
+        // Источник шлёт один и тот же кадр двумя релеями (дублирование путей,
+        // issue #25): записи о копиях не затирают друг друга, ACK одной копии
+        // не снимает вторую, а отказ второй после успешной первой путь не
+        // снимает (иначе дублирование само снимало бы здоровый путь).
+        let mut a = peer(4001); // источник
+        let mut b = peer(4002); // релей 1
+        let mut c = peer(4003); // релей 2
+        let now = 1_000;
+        handshake(&mut a, &mut b, now);
+        handshake(&mut a, &mut c, now);
+        let inner = proto::seal_group(
+            &[3u8; 32],
+            proto::grp::DATA,
+            &proto::GroupHeader {
+                gid: 1,
+                src: 2,
+                dst: 3,
+                epoch: 1,
+            },
+            0,
+            b"dup",
+        );
+        let seq = forward_seq(&inner);
+        let ca = [contact(&b), contact(&c)];
+        let ma = [b.id.ed_pub(), c.id.ed_pub()];
+        let a_ctx = ctx(&a.id, &ca, &ma, now + 10);
+        let (to1, _) =
+            a.st.start_forward(&a_ctx, [9u8; 32], &contact(&b), &inner)
+                .expect("копия через B");
+        let (to2, _) =
+            a.st.start_forward(&a_ctx, [9u8; 32], &contact(&c), &inner)
+                .expect("копия через C");
+        assert_eq!((to1, to2), (b.addr, c.addr));
+        assert_eq!(a.st.forwards.len(), 2, "две копии — две записи");
+        assert!(a.st.forwards.contains_key(&(seq, b.id.ed_pub())));
+        assert!(a.st.forwards.contains_key(&(seq, c.id.ed_pub())));
+        // ACK от B снимает только его копию.
+        let mut out = MeshOut::default();
+        b.st.send_rpc(&mut out, &a.id.ed_pub(), &Rpc::ForwardAck { seq }, now + 20);
+        let (typ, body) = proto::split_frame(&out.sends[0].1).unwrap();
+        let out =
+            a.st.on_frame(&ctx(&a.id, &ca, &ma, now + 20), b.addr, typ, body);
+        assert!(matches!(
+            out.events.first(),
+            Some(MeshEvent::ForwardOk { dst_ed, .. }) if *dst_ed == [9u8; 32]
+        ));
+        assert_eq!(a.st.forwards.len(), 1, "копия через C осталась");
+        assert!(a.st.forwards.contains_key(&(seq, c.id.ed_pub())));
+        // NACK от C: кадр уже доставлен копией B — путь не снимаем.
+        let mut out = MeshOut::default();
+        c.st.send_rpc(
+            &mut out,
+            &a.id.ed_pub(),
+            &Rpc::ForwardNack {
+                seq,
+                code: code::REJECTED,
+            },
+            now + 30,
+        );
+        let (typ, body) = proto::split_frame(&out.sends[0].1).unwrap();
+        let out =
+            a.st.on_frame(&ctx(&a.id, &ca, &ma, now + 30), c.addr, typ, body);
+        assert!(a.st.forwards.is_empty(), "обе копии закрыты");
+        assert!(
+            out.events.is_empty(),
+            "отказ второй копии не снимает доставленный путь"
+        );
     }
 
     #[test]
