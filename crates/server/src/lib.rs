@@ -1663,7 +1663,6 @@ fn snapshot(
             .collect(),
         // Дружбы (issue #24) — состояние `State::friends`.
         friends: s.friends.persisted(),
-        ..Default::default()
     }
 }
 

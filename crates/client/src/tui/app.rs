@@ -5715,6 +5715,7 @@ mod tests {
                 name: "bravo".into(),
                 path: PathKind::Server,
                 rtt_ms: Some(48),
+                manual: false,
             }],
             &Snapshot::default(),
         );
@@ -5769,6 +5770,7 @@ mod tests {
                     name: "bravo".into(),
                     path: PathKind::Direct,
                     rtt_ms: Some(7),
+                    manual: false,
                 },
             ],
             &Snapshot::default(),
