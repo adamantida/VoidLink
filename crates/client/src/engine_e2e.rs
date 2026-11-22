@@ -439,6 +439,39 @@ fn ipv4(src: u32, dst: u32, data: &[u8]) -> Vec<u8> {
 
 const T: Duration = Duration::from_secs(10);
 
+impl Node {
+    /// Состояние друга в `client.json` движка (issue #24).
+    fn friend_state(&self, pk: &[u8; 32]) -> Option<crate::store::FriendState> {
+        let hex = proto::hex_of(pk);
+        self.eng
+            .cfg
+            .lock()
+            .unwrap()
+            .friends
+            .iter()
+            .find(|f| f.pubkey == hex)
+            .map(|f| f.state)
+    }
+
+    /// Ник друга в `client.json` (кэш из `FRIEND_LIST`).
+    fn friend_nick(&self, pk: &[u8; 32]) -> Option<String> {
+        let hex = proto::hex_of(pk);
+        self.eng
+            .cfg
+            .lock()
+            .unwrap()
+            .friends
+            .iter()
+            .find(|f| f.pubkey == hex)
+            .map(|f| f.nick.clone())
+    }
+
+    /// Сколько записей в списке друзей движка.
+    fn friends_len(&self) -> usize {
+        self.eng.cfg.lock().unwrap().friends.len()
+    }
+}
+
 /// Правило потерь посредника: (к серверу?, тип фрейма, сколько фреймов
 /// каждого типа клиент отправил, включая этот) → потерять.
 type DropRule = Box<dyn FnMut(bool, u8, &HashMap<u8, usize>) -> bool + Send>;
@@ -3254,4 +3287,242 @@ fn e2e_встречные_подсказки_федерации_не_ломаю�
     b.stop();
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+// ---------- друзья (issue #24) ----------
+
+#[test]
+fn e2e_заявка_в_друзья_принятие_и_взаимность() {
+    let dir = temp_dir("friend-accept");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    // A просит дружбы: заявка уходит серверу, а не в свой конфиг.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    // B видит заявку с ником, а не с кодом.
+    b.wait("B получил заявку", T, |e| {
+        matches!(e, Event::FriendRequest { pubkey, name, expires_in }
+            if *pubkey == a_pub && name == "alpha" && *expires_in > 0)
+    });
+    // Инициатор — «ждёт ответа», цель — «пришла заявка».
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::PendingOut)
+    );
+    assert_eq!(
+        b.friend_state(&a_pub),
+        Some(crate::store::FriendState::PendingIn)
+    );
+
+    // Принятие: оба узнают, у обоих дружба. Принявший и так знает (он нажал
+    // «принять») — ему событие не нужно, состояние ставится сразу.
+    b.eng.cmds.send(Cmd::AcceptFriend(a_pub)).unwrap();
+    a.wait("A: заявку приняли", T, |e| {
+        matches!(e, Event::FriendAccepted { pubkey, name }
+            if *pubkey == b_pub && name == "bravo")
+    });
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::Accepted),
+        "у инициатора дружба"
+    );
+    assert_eq!(
+        b.friend_state(&a_pub),
+        Some(crate::store::FriendState::Accepted),
+        "у принявшего тоже — пара одна на двоих"
+    );
+    // Ник пришёл с сервера (кэш в client.json).
+    assert_eq!(a.friend_nick(&b_pub).as_deref(), Some("bravo"));
+    assert_eq!(b.friend_nick(&a_pub).as_deref(), Some("alpha"));
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_заявка_офлайн_цели_доставляется_после_hello() {
+    let dir = temp_dir("friend-offline");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let a_pub = a.eng.my_pub;
+
+    // B ещё не запущен: заявка ждёт на сервере (взаимность для офлайн-цели —
+    // ради этого сервер и хранит заявки).
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut b = Node::start_as("bravo", &server, b_id);
+    b.wait("B: заявка пришла после HELLO", T, |e| {
+        matches!(e, Event::FriendRequest { pubkey, name, .. }
+            if *pubkey == a_pub && name == "alpha")
+    });
+    // B видит её в списке как входящую, а A — как исходящую.
+    assert_eq!(
+        b.friend_state(&a_pub),
+        Some(crate::store::FriendState::PendingIn)
+    );
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::PendingOut)
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_отказ_в_друзья_уведомляет_инициатора() {
+    let dir = temp_dir("friend-decline");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    b.wait(
+        "B получил заявку",
+        T,
+        |e| matches!(e, Event::FriendRequest { pubkey, .. } if *pubkey == a_pub),
+    );
+    b.eng.cmds.send(Cmd::DeclineFriend(a_pub)).unwrap();
+    a.wait("A: заявку отклонили", T, |e| {
+        matches!(e, Event::FriendDeclined { pubkey, name }
+            if *pubkey == b_pub && name == "bravo")
+    });
+    // У обоих заявки больше нет, дружбы тоже.
+    assert_eq!(a.friend_state(&b_pub), None);
+    assert_eq!(b.friend_state(&a_pub), None);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_удаление_друга_снимает_запись_у_обоих() {
+    let dir = temp_dir("friend-remove");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    // Сначала дружба.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    b.wait(
+        "B получил заявку",
+        T,
+        |e| matches!(e, Event::FriendRequest { pubkey, .. } if *pubkey == a_pub),
+    );
+    b.eng.cmds.send(Cmd::AcceptFriend(a_pub)).unwrap();
+    a.wait("A: дружба", T, |e| {
+        matches!(e, Event::FriendAccepted { .. })
+    });
+
+    // Снимает инициатор — у второй стороны запись тоже уходит.
+    a.eng.cmds.send(Cmd::RemoveFriend(b_pub)).unwrap();
+    b.wait(
+        "B: дружбу сняли",
+        T,
+        |e| matches!(e, Event::FriendRemoved { pubkey } if *pubkey == a_pub),
+    );
+    assert_eq!(a.friend_state(&b_pub), None);
+    assert_eq!(b.friend_state(&a_pub), None);
+    assert_eq!(b.friends_len(), 0);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_заявка_себе_и_повтор_не_создают_дубликата() {
+    let dir = temp_dir("friend-self");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let mut b = Node::start("bravo", &server);
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    let (a_pub, b_pub) = (a.eng.my_pub, b.eng.my_pub);
+
+    // Себе — отказ, записи нет.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: a_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    a.wait(
+        "A: себя нельзя",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("себя")),
+    );
+    assert_eq!(a.friend_state(&a_pub), None);
+    assert_eq!(a.friends_len(), 0);
+
+    // Повтор заявки: заявка одна, продлевается срок. У цели второго окна
+    // нет — это тот же человек, ответ на прежнее окно уже был бы.
+    a.eng
+        .cmds
+        .send(Cmd::AddFriend {
+            pubkey: b_pub,
+            alias: String::new(),
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(a.friends_len(), 1, "повтор не плодит записей");
+    assert_eq!(
+        a.friend_state(&b_pub),
+        Some(crate::store::FriendState::PendingOut)
+    );
+    assert_eq!(a.friend_state(&a_pub), None);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }

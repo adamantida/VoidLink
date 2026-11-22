@@ -4013,6 +4013,12 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         // числе когда её нет в сети. Локально сразу помечаем «ждёт ответа»,
         // чтобы панель не ждала списка.
         Cmd::AddFriend { pubkey, alias } => {
+            // Себя в друзья не добавить: сервер ответил бы ошибкой, но
+            // оптимистичная запись уже легла бы в конфиг.
+            if pubkey == env.identity.ed_pub() {
+                env.emit(Event::Error("нельзя добавить себя в друзья".into()));
+                return;
+            }
             if !alias.trim().is_empty() {
                 let hex = proto::hex_of(&pubkey);
                 let a = alias.clone();
@@ -4577,9 +4583,36 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 // Отказ подтверждён: окно покрывает ключ, а заявки в нём нет.
                 st.declining_friends
                     .retain(|pk, _| !list.covers(pk) || list.items.iter().any(|i| i.pk == *pk));
+                // Состояния до сверки: по разнице узнаём, кто стал другом —
+                // вторая сторона приняла заявку, пока мы были офлайн, или
+                // принять успели на другом устройстве.
+                let before: Vec<([u8; 32], store::FriendState)> =
+                    st.friends.list().iter().map(|f| (f.pk, f.state)).collect();
                 let removed = st.friends.on_synced(&list.items, &from, complete, now);
                 for f in &removed {
                     env.emit(Event::FriendRemoved { pubkey: f.pk });
+                }
+                for f in st.friends.list() {
+                    let was = before.iter().find(|(pk, _)| *pk == f.pk).map(|(_, s)| *s);
+                    let was_accepted = was == Some(store::FriendState::Accepted);
+                    if f.state == store::FriendState::Accepted && !was_accepted {
+                        env.emit(Event::FriendAccepted {
+                            pubkey: f.pk,
+                            name: f.nick.clone(),
+                        });
+                    }
+                    // Заявка, пришедшая в наше отсутствие: офлайн-цель узнаёт о
+                    // ней только из списка. `expires_in: 0` — «срок неизвестен»
+                    // (в FRIEND_LIST его нет).
+                    if f.state == store::FriendState::PendingIn
+                        && was != Some(store::FriendState::PendingIn)
+                    {
+                        env.emit(Event::FriendRequest {
+                            pubkey: f.pk,
+                            name: f.nick.clone(),
+                            expires_in: 0,
+                        });
+                    }
                 }
                 st.sync_friends_cfg(env);
                 if let Some(n) = next {
