@@ -1022,7 +1022,7 @@ churn рассылок, надгробие кика с `rev` из `KICKED`, ли
   `SetRelayEnabled`/`SetMeshEnabled`/`ProbeServer`, события `PathChanged`/
   `PathLost`/`ProbeResult`/`RelayStats`, конфиг `mesh` и `pinned_paths`,
   клиентская федерация (`SERVER_HINT` раз в 5 мин, `FED_GROUPS`, `:joinfed`).
-- Тесты: `cargo test --workspace` — **695** (`--list`, Windows; см.
+- Тесты: `cargo test --workspace` — **702** (`--list`, Windows; см.
   [TESTING.md](TESTING.md), §1). Ещё ≥ 26 тестов в unix-only файлах
   (`#![cfg(unix)]`) добавляются на Linux/macOS.
 
@@ -1192,6 +1192,6 @@ churn рассылок, надгробие кика с `rev` из `KICKED`, ли
    `.vl`, IPv6, TCP-фолбэк, метрики, профили, расширенный TUI, CI на трёх ОС.
 8. Этап 9 (✅): контракт протокола v4+ и таблица путей (T1), проба и
    офлайн-TUI (T2), mesh/DHT (T3), федерация T4 (T4a/T4b1/T4b2 + T4c —
-   встречные `SRV_HELLO`), финальная документация (T5); 695 тестов.
+   встречные `SRV_HELLO`), финальная документация (T5); 702 теста.
 9. Дальше (⏳): ручная проверка на Windows, реальный NAT и TUN на
    Linux/macOS, MSI, кнопки в toast, smoke службы в CI.

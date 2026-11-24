@@ -572,6 +572,7 @@ sequenceDiagram
 | Состояние | Где живёт | Кто меняет | Защита |
 |---|---|---|---|
 | `sessions`, `by_pub`, `by_ip` | `State` | Воркеры (HELLO, JOIN, LEAVE), `housekeeping` (истечение) | `RwLock<State>` |
+| `Session.transport` + реестр TCP | `State`, `TcpSender` | Создание сессии, приём TCP-соединения | `RwLock<State>` + фильтр приёма: адрес живого UDP-клиента не занимает TCP и наоборот |
 | `groups`, `next_gid`, `invite_ttl_ms` | `State` | Воркеры (администрирование), `housekeeping` (истечение приглашений) | `RwLock<State>` |
 | Ключ сервера, `links` (цепочка ротации) | `Shared` | Только при старте и `rotate-key` | Неизменны при работе: подпись и DH без блокировки |
 | Счётчики сессии (отправка) | `Session` | Воркеры | Атомики |
