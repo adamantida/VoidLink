@@ -23,7 +23,7 @@ test`, CI), лаборатория NAT на сетевых пространст�
 
 ```bash
 # весь workspace (как в CI); счёт тестов для бейджа README:
-cargo test --workspace -- --list     # 702 на Windows (+38 unix-only на Linux/macOS)
+cargo test --workspace -- --list     # 702 на Windows (+39 unix-only на Linux/macOS)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
