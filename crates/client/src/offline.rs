@@ -61,33 +61,111 @@ fn now_ms() -> u64 {
 
 // ---------------------------------------------------------------- очередь
 
+/// Версия формата `ui-pending.json`: 2 — у позиционных команд (`DelServer`,
+/// `SetPrimaryServer`) сохранён адрес сервера (DES-01).
+const PENDING_VERSION: u32 = 2;
+
+fn pending_version() -> u32 {
+    PENDING_VERSION
+}
+
 /// Содержимое `ui-pending.json`: команды в порядке отправки.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PendingFile {
-    #[serde(default = "one")]
+    #[serde(default = "pending_version")]
     v: u32,
+    #[serde(default)]
+    commands: Vec<Pending>,
+}
+
+/// Формат v1: только команды, без адреса сервера.
+#[derive(Debug, Deserialize)]
+struct PendingFileV1 {
     #[serde(default)]
     commands: Vec<Cmd>,
 }
 
-fn one() -> u32 {
-    1
+/// Сервер, к которому относится позиционная команда: адрес и метка из
+/// нашего конфига. При воспроизведении сервер ищется по ним — у демона
+/// может быть другой порядок списка (DES-01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ServerRef {
+    addr: String,
+    #[serde(default)]
+    label: String,
+}
+
+impl ServerRef {
+    /// Индекс сервера в списке: по адресу, иначе по метке (если она одна).
+    fn find(&self, servers: &[CfgServer]) -> Option<usize> {
+        if let Some(i) = servers.iter().position(|s| s.addr == self.addr) {
+            return Some(i);
+        }
+        let mut by_label = servers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !self.label.is_empty() && s.label == self.label);
+        match (by_label.next(), by_label.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        }
+    }
+}
+
+/// Правка в очереди: команда и — для позиционных — сервер, к которому она
+/// относится.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Pending {
+    cmd: Cmd,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<ServerRef>,
+}
+
+impl Pending {
+    fn new(cmd: Cmd, target: Option<ServerRef>) -> Self {
+        Self { cmd, target }
+    }
+
+    /// Команда в терминах конфига демона: позиционная ищет свой сервер по
+    /// адресу/метке. `None` — сервера у демона нет, отправлять нечего.
+    fn replay(&self, daemon: &[CfgServer]) -> Option<Cmd> {
+        let Some(target) = self.target.as_ref() else {
+            return Some(self.cmd.clone());
+        };
+        let idx = target.find(daemon)?;
+        match self.cmd {
+            Cmd::DelServer { .. } => Some(Cmd::DelServer { idx }),
+            Cmd::SetPrimaryServer { .. } => Some(Cmd::SetPrimaryServer { idx }),
+            ref other => Some(other.clone()),
+        }
+    }
+}
+
+impl From<Cmd> for Pending {
+    fn from(cmd: Cmd) -> Self {
+        Self::new(cmd, None)
+    }
 }
 
 /// Прочитать очередь (битый/чужой файл — пустая очередь, без паники).
-fn load_pending(dir: &Path) -> VecDeque<Cmd> {
+fn load_pending(dir: &Path) -> VecDeque<Pending> {
     let raw = match std::fs::read(dir.join(PENDING_FILE)) {
         Ok(raw) => raw,
         Err(_) => return VecDeque::new(),
     };
-    match serde_json::from_slice::<PendingFile>(&raw) {
-        Ok(p) => p.commands.into(),
+    if let Ok(p) = serde_json::from_slice::<PendingFile>(&raw) {
+        return p.commands.into();
+    }
+    // Очередь, записанная до DES-01 (v1): адреса сервера нет — позиционные
+    // команды пойдут по индексу, как раньше.
+    match serde_json::from_slice::<PendingFileV1>(&raw) {
+        Ok(p) => p.commands.into_iter().map(Pending::from).collect(),
         Err(_) => VecDeque::new(),
     }
 }
 
 /// Записать очередь атомарно (tmp + rename) или удалить файл, если она пуста.
-fn save_pending(dir: &Path, cmds: &VecDeque<Cmd>) {
+fn save_pending(dir: &Path, cmds: &VecDeque<Pending>) {
     let path = dir.join(PENDING_FILE);
     if cmds.is_empty() {
         let _ = std::fs::remove_file(&path);
@@ -95,7 +173,7 @@ fn save_pending(dir: &Path, cmds: &VecDeque<Cmd>) {
     }
     let _ = std::fs::create_dir_all(dir);
     let file = PendingFile {
-        v: 1,
+        v: PENDING_VERSION,
         commands: cmds.iter().cloned().collect(),
     };
     let Ok(raw) = serde_json::to_vec_pretty(&file) else {
@@ -122,7 +200,7 @@ struct Shared {
     /// В демоне живой движок (`remote` без движка — всё ещё офлайн).
     live: AtomicBool,
     /// Очередь на применение демоном.
-    pending: Mutex<VecDeque<Cmd>>,
+    pending: Mutex<VecDeque<Pending>>,
     /// События офлайн-режима (Notice/Error/Disconnected) + пробы.
     events: Mutex<VecDeque<Event>>,
     /// История кольца демона на момент подключения — один раз, в лог без
@@ -253,21 +331,53 @@ impl Shared {
     }
 
     /// Отправить очередь демону по порядку; успешные убрать.
+    ///
+    /// Позиционные `DelServer`/`SetPrimaryServer` пересчитываются по
+    /// сохранённому адресу: у демона может быть другой порядок серверов
+    /// (DES-01). Снимок демона приходит с задержкой, поэтому индексы
+    /// следующих команд считаем по своей копии его списка.
     fn flush(&self, eng: &dyn EngineApi) {
+        let mut daemon = self.daemon_servers(eng);
         loop {
-            let cmd = match lock(&self.pending).front() {
+            let entry = match lock(&self.pending).front() {
                 Some(c) => c.clone(),
                 None => break,
+            };
+            let cmd = match entry.replay(daemon.as_deref().unwrap_or_default()) {
+                Some(c) => c,
+                None => {
+                    // Сервера из команды у демона нет — удалять/назначать
+                    // нечего; снимаем её, иначе она застрянет в очереди
+                    // навсегда и перекроет остаток.
+                    let addr = entry.target.as_ref().map(|t| t.addr.as_str());
+                    self.push(Event::Notice(format!(
+                        "сервер {} у демона не найден — правка пропущена",
+                        addr.unwrap_or("?")
+                    )));
+                    lock(&self.pending).pop_front();
+                    self.persist_pending();
+                    continue;
+                }
             };
             if eng.send(cmd.clone()).is_err() {
                 // Демон пропал на середине: остаток очереди ждёт следующего.
                 self.persist_pending();
                 return;
             }
+            if let Some(list) = daemon.as_mut() {
+                predict_servers(list, &cmd);
+            }
             lock(&self.pending).pop_front();
             self.persist_pending();
         }
         self.persist_pending();
+    }
+
+    /// Список серверов демона — только если в очереди есть позиционные
+    /// команды (иначе снимок не нужен).
+    fn daemon_servers(&self, eng: &dyn EngineApi) -> Option<Vec<CfgServer>> {
+        let needed = lock(&self.pending).iter().any(|p| p.target.is_some());
+        needed.then(|| eng.snapshot().cfg.servers.clone())
     }
 
     /// Принять демона (с движком или без): история — в лог, очередь — по
@@ -295,25 +405,7 @@ impl Shared {
                 None => "демон доступен, движок не запущен".into(),
             }));
         }
-        if same {
-            if !lock(&self.pending).is_empty() {
-                lock(&self.pending).clear();
-                self.persist_pending();
-                self.push(Event::Notice(
-                    "демон поднялся с нашим конфигом — отложенные правки уже применены".into(),
-                ));
-            } else if live {
-                self.push(Event::Notice("демон доступен".into()));
-            }
-            return;
-        }
-        let n = self.pending_len();
-        if n > 0 && live {
-            self.push(Event::Notice(format!(
-                "демон доступен — применяем отложенные правки ({n})"
-            )));
-        }
-        self.flush(eng.as_ref());
+        self.adopt_pending(eng.as_ref(), same, live);
         // Серверы, добавленные локально (`%APPDATA%`), досылаем демону: у
         // службы и `console` свой каталог данных, иначе они «терялись».
         if live {
@@ -321,6 +413,26 @@ impl Shared {
                 self.push(Event::Notice(notice));
             }
         }
+    }
+
+    /// Очередь при появлении демона: отправляем всё, что он не подтвердил.
+    ///
+    /// Совпавший `CfgView` — не повод выбрасывать очередь: активного сервера
+    /// в нём нет, и смена сервера терялась молча (CLNT-03). Убирает команду из
+    /// очереди только `flush` — после того как демон её принял.
+    fn adopt_pending(&self, eng: &dyn EngineApi, same: bool, live: bool) {
+        let n = self.pending_len();
+        if n > 0 && live {
+            let what = if same {
+                "демон поднялся с нашим конфигом — отправляем отложенные правки"
+            } else {
+                "демон доступен — применяем отложенные правки"
+            };
+            self.push(Event::Notice(format!("{what} ({n})")));
+        } else if same && live {
+            self.push(Event::Notice("демон доступен".into()));
+        }
+        self.flush(eng);
     }
 
     /// Правка конфига без движка: применить, сохранить, поставить в очередь.
@@ -353,13 +465,16 @@ impl Shared {
             Cmd::UnpinPath { ip } => format!("закрепление {} снято", proto::ip_str(*ip)),
             _ => String::new(),
         };
-        let saved = {
+        let (saved, target) = {
             let mut cfg = lock(&self.cfg);
+            // Сервер позиционной команды запоминаем до правки: при
+            // воспроизведении ищем его по адресу, а не по индексу (DES-01).
+            let target = server_target(&cfg, &cmd);
             apply_cfg_cmd(&mut cfg, cmd.clone());
-            cfg.clone()
+            (cfg.clone(), target)
         };
         self.persist_cfg(&saved);
-        lock(&self.pending).push_back(cmd);
+        lock(&self.pending).push_back(Pending::new(cmd, target));
         self.persist_pending();
         self.push(Event::Notice(if notice.is_empty() {
             "правка сохранена (офлайн)".into()
@@ -509,6 +624,54 @@ pub fn apply_cfg_cmd(c: &mut Config, cmd: Cmd) {
         }
         Cmd::UnpinPath { ip } => {
             c.pinned_paths.remove(&crate::path::ip_key(ip));
+        }
+        _ => {}
+    }
+}
+
+/// Сервер, к которому относится позиционная команда (`DelServer`,
+/// `SetPrimaryServer`): адрес и метка из нашего конфига. В очередь кладём
+/// именно его — индекс в чужом конфиге бьёт по другой записи (DES-01).
+fn server_target(cfg: &Config, cmd: &Cmd) -> Option<ServerRef> {
+    let idx = match cmd {
+        Cmd::DelServer { idx } | Cmd::SetPrimaryServer { idx } => *idx,
+        _ => return None,
+    };
+    let s = cfg.servers.get(idx)?;
+    Some(ServerRef {
+        addr: s.addr.clone(),
+        label: s.label.clone(),
+    })
+}
+
+/// Что станет со списком серверов демона после команды: прогноз для
+/// индексов следующих команд очереди (снимок демона приходит с задержкой).
+fn predict_servers(servers: &mut Vec<CfgServer>, cmd: &Cmd) {
+    match cmd {
+        Cmd::AddServer {
+            addr,
+            pubkey,
+            label,
+        } => {
+            let hex = proto::hex_of(pubkey);
+            match servers.iter_mut().find(|s| s.addr == *addr) {
+                Some(s) => {
+                    s.pubkey = hex;
+                    s.label = label.clone();
+                }
+                None => servers.push(CfgServer {
+                    addr: addr.clone(),
+                    pubkey: hex,
+                    label: label.clone(),
+                }),
+            }
+        }
+        Cmd::DelServer { idx } if *idx < servers.len() => {
+            servers.remove(*idx);
+        }
+        Cmd::SetPrimaryServer { idx } if *idx < servers.len() => {
+            let s = servers.remove(*idx);
+            servers.insert(0, s);
         }
         _ => {}
     }
@@ -950,7 +1113,7 @@ mod tests {
         assert_eq!(on_disk.name, "новое имя");
         let q = load_pending(&d);
         assert_eq!(q.len(), 1);
-        assert!(matches!(q[0], Cmd::SetName(ref n) if n == "новое имя"));
+        assert!(matches!(q[0].cmd, Cmd::SetName(ref n) if n == "новое имя"));
         drop(eng);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1131,11 +1294,13 @@ mod tests {
     }
 
     /// Движок-приёмник: команды в `sent`; `fail_at` — номер, на котором
-    /// «демон пропал» (0 — первая же).
+    /// «демон пропал» (0 — первая же); `servers` — конфиг демона (порядок
+    /// серверов у него свой).
     struct SinkEngine {
         sent: Mutex<Vec<Cmd>>,
         me: Me,
         fail_at: Option<usize>,
+        servers: Vec<CfgServer>,
     }
 
     impl SinkEngine {
@@ -1144,13 +1309,28 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 me,
                 fail_at: None,
+                servers: Vec::new(),
+            }
+        }
+
+        /// Демон с собственным порядком серверов в конфиге.
+        fn with_servers(me: Me, servers: Vec<CfgServer>) -> Self {
+            SinkEngine {
+                servers,
+                ..Self::new(me)
             }
         }
     }
 
     impl EngineApi for SinkEngine {
         fn snapshot(&self) -> Arc<Snapshot> {
-            Arc::new(Snapshot::default())
+            Arc::new(Snapshot {
+                cfg: CfgView {
+                    servers: self.servers.clone(),
+                    ..CfgView::default()
+                },
+                ..Snapshot::default()
+            })
         }
         fn poll_events(&self) -> Vec<Event> {
             Vec::new()
@@ -1177,8 +1357,31 @@ mod tests {
         }
     }
 
+    /// Очередь из команд без адреса сервера (как в формате v1).
+    fn queue(cmds: Vec<Cmd>) -> VecDeque<Pending> {
+        cmds.into_iter().map(Pending::from).collect()
+    }
+
+    /// Запись конфига: адрес и метка (ключ — постоянный, hex на 32 байта).
+    fn stored(addr: &str, label: &str) -> StoredServer {
+        StoredServer {
+            addr: addr.into(),
+            pubkey: "aa".repeat(32),
+            label: label.into(),
+        }
+    }
+
+    /// Сервер в снимке демона.
+    fn srv(addr: &str, label: &str) -> CfgServer {
+        CfgServer {
+            addr: addr.into(),
+            pubkey: "aa".repeat(32),
+            label: label.into(),
+        }
+    }
+
     /// `Shared` без фонового потока — для проверки `flush` напрямую.
-    fn shared(dir: &Path, cfg: Config, pending: VecDeque<Cmd>) -> Shared {
+    fn shared(dir: &Path, cfg: Config, pending: VecDeque<Pending>) -> Shared {
         let mut probe_cfg = cfg.clone();
         let id = store::ensure_identity(&mut probe_cfg);
         Shared {
@@ -1204,7 +1407,7 @@ mod tests {
     #[test]
     fn очередь_отправляется_по_порядку_и_очищается() {
         let d = temp_dir("flush");
-        let cmds: VecDeque<Cmd> = VecDeque::from(vec![
+        let cmds = queue(vec![
             Cmd::AddServer {
                 addr: "127.0.0.1:5599".into(),
                 pubkey: [1; 32],
@@ -1232,7 +1435,7 @@ mod tests {
     #[test]
     fn демон_пропал_посреди_очереди_остаток_ждёт() {
         let d = temp_dir("flushfail");
-        let cmds: VecDeque<Cmd> = VecDeque::from(vec![
+        let cmds = queue(vec![
             Cmd::SetName("tui".into()),
             Cmd::SetStatus("тут".into()),
         ]);
@@ -1245,9 +1448,161 @@ mod tests {
         assert_eq!(sh.pending_len(), 1);
         let left = load_pending(&d);
         assert_eq!(left.len(), 1);
-        assert!(matches!(&left[0], Cmd::SetStatus(s) if s == "тут"));
+        assert!(matches!(&left[0].cmd, Cmd::SetStatus(s) if s == "тут"));
         assert!(d.join(PENDING_FILE).exists());
         drop(sh);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Уведомления офлайн-режима (тексты).
+    fn notices(sh: &Shared) -> Vec<String> {
+        sh.drain()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Notice(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn очередь_со_сменой_сервера_не_теряется_при_совпавшем_конфиге() {
+        let d = temp_dir("samecfg");
+        let new: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+        let cfg = Config {
+            servers: vec![
+                stored("10.0.0.1:7000", "старый"),
+                stored("10.0.0.2:7000", "новый"),
+            ],
+            active_server: "10.0.0.2:7000".into(),
+            ..Config::default()
+        };
+        // Офлайн-правка: переключение на второй сервер.
+        let cmds = queue(vec![Cmd::SwitchServer {
+            addr: new,
+            pubkey: [0xaa; 32],
+            label: "новый".into(),
+        }]);
+        save_pending(&d, &cmds);
+        let sh = shared(&d, cfg, cmds);
+        let eng = SinkEngine::new(sh.me.clone());
+        // Демон поднялся с нашим конфигом: `CfgView` совпал, но активного
+        // сервера в нём нет — очередь отправляем, а не выбрасываем (CLNT-03).
+        sh.adopt_pending(&eng, true, true);
+        let sent = eng.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "смена сервера ушла демону: {sent:?}");
+        assert!(
+            matches!(&sent[0], Cmd::SwitchServer { addr, .. } if *addr == new),
+            "{sent:?}"
+        );
+        assert_eq!(sh.pending_len(), 0, "снята только подтверждённая команда");
+        assert!(!d.join(PENDING_FILE).exists());
+        // Уведомление — про поднявшийся демон, без «правки уже применены».
+        let notes = notices(&sh);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("поднялся с нашим конфигом")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("уже применены")),
+            "{notes:?}"
+        );
+        drop(sh);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn удаление_сервера_по_адресу_при_другом_порядке_у_демона() {
+        let d = temp_dir("deladdr");
+        let cfg = Config {
+            servers: vec![
+                stored("10.0.0.1:7000", "первый"),
+                stored("10.0.0.2:7000", "второй"),
+            ],
+            ..Config::default()
+        };
+        let sh = shared(&d, cfg, VecDeque::new());
+        // Офлайн удаляем второй сервер нашего списка (индекс 1).
+        sh.apply_local(Cmd::DelServer { idx: 1 }).unwrap();
+        assert_eq!(sh.cfg().servers.len(), 1, "локально удалён именно второй");
+        assert_eq!(sh.cfg().servers[0].addr, "10.0.0.1:7000");
+        // В очередь кладётся адрес, а не индекс.
+        let q = load_pending(&d);
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            q[0].target.as_ref().map(|t| t.addr.as_str()),
+            Some("10.0.0.2:7000")
+        );
+        // У демона другой порядок: тот же сервер стоит нулевым.
+        let eng = SinkEngine::with_servers(
+            sh.me.clone(),
+            vec![
+                srv("10.0.0.2:7000", "второй"),
+                srv("10.0.0.1:7000", "первый"),
+            ],
+        );
+        sh.flush(&eng);
+        let sent = eng.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            matches!(sent[0], Cmd::DelServer { idx: 0 }),
+            "у демона удаляется второй сервер, а не первый: {sent:?}"
+        );
+        assert_eq!(sh.pending_len(), 0);
+        drop(sh);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn назначение_главного_сервера_по_адресу() {
+        let d = temp_dir("primaryaddr");
+        let cfg = Config {
+            servers: vec![
+                stored("10.0.0.1:7000", "первый"),
+                stored("10.0.0.2:7000", "второй"),
+            ],
+            active_server: "10.0.0.1:7000".into(),
+            ..Config::default()
+        };
+        let sh = shared(&d, cfg, VecDeque::new());
+        sh.apply_local(Cmd::SetPrimaryServer { idx: 1 }).unwrap();
+        assert_eq!(sh.cfg().servers[0].addr, "10.0.0.2:7000");
+        assert_eq!(sh.cfg().active_server, "10.0.0.2:7000");
+        // У демона третий сервер вклинился: «второй» — под индексом 2.
+        let eng = SinkEngine::with_servers(
+            sh.me.clone(),
+            vec![
+                srv("10.0.0.1:7000", "первый"),
+                srv("10.0.0.3:7000", "третий"),
+                srv("10.0.0.2:7000", "второй"),
+            ],
+        );
+        sh.flush(&eng);
+        let sent = eng.sent.lock().unwrap().clone();
+        assert!(
+            matches!(sent[0], Cmd::SetPrimaryServer { idx: 2 }),
+            "назначается «второй», а не чужой сервер: {sent:?}"
+        );
+        drop(sh);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn старая_очередь_v1_читается() {
+        let d = temp_dir("v1");
+        // Файл, записанный до DES-01: команды без адреса сервера.
+        std::fs::write(
+            d.join(PENDING_FILE),
+            r#"{"v":1,"commands":[{"SetName":"старое"},{"DelServer":{"idx":0}}]}"#.as_bytes(),
+        )
+        .unwrap();
+        let q = load_pending(&d);
+        assert_eq!(q.len(), 2, "очередь не потеряна при обновлении");
+        assert!(matches!(q[0].cmd, Cmd::SetName(ref n) if n == "старое"));
+        assert!(q[0].target.is_none());
+        assert!(matches!(q[1].cmd, Cmd::DelServer { idx: 0 }));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

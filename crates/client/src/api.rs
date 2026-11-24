@@ -146,7 +146,12 @@ impl LocalEngine {
     pub fn snapshot_now(&self) -> Snapshot {
         let now = Instant::now();
         let groups = GroupSnap::from_groups(&lock(&self.groups), &self.paths, now);
-        let meta = MetaSnap::from_meta(&lock(&self.meta), now);
+        let mut meta = MetaSnap::from_meta(&lock(&self.meta), now);
+        // Поток движка мог умереть (паника в rx): без этой проверки «в сети»
+        // горело бы вечно, а команды уходили в мёртвый канал (DES-02).
+        if !self.engine().alive() {
+            meta.connected = false;
+        }
         let cfg = CfgView::from_cfg(&lock(&self.cfg));
         let fed_groups = FedGroupSnap::from_infos(&lock(&self.meta).fed_groups);
         Snapshot {
