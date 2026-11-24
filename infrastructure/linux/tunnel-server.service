@@ -1,9 +1,11 @@
 # systemd-юнит сервера VoidLink (tunnel-server).
 # Установка: infrastructure/linux/install-server.sh (или вручную в
 # /etc/systemd/system/, затем systemctl daemon-reload && systemctl enable --now tunnel-server).
-# Адрес и доп. флаги — в /etc/default/tunnel-server. Сейчас есть только
-# --workers и -q (лимиты и --metrics — с протоколом v3; неизвестный флаг
-# сервер примет за адрес и не стартует). С -q в журнале не будет Server code.
+# Адрес и доп. флаги — в /etc/default/tunnel-server. Полный список — `tunnel-server
+# --help`: --workers, лимиты (--relay-*/--ctrl-*/--hello-*/--plain-*/--join-*),
+# --metrics <addr>, --lease-ttl-days, --tcp/--no-tcp, --federate/--peer/--fed-pool.
+# Неизвестный флаг сервер отвергает («неизвестный флаг») и не стартует; первый
+# позиционный аргумент — адрес прослушивания. С -q в журнале не будет Server code.
 #   TUNNEL_LISTEN=0.0.0.0:5555
 #   TUNNEL_ARGS=--workers 4
 [Unit]
@@ -27,8 +29,10 @@ ExecStart=/opt/tunnel/tunnel-server ${TUNNEL_LISTEN} --data /var/lib/tunnel $TUN
 
 Restart=on-failure
 RestartSec=2s
-# SIGTERM: обработчика в сервере пока нет — процесс завершается сразу,
-# теряются изменения после последнего периодического сохранения (~3 с)
+# SIGTERM/SIGINT: обработчик есть — crates/server/src/signals.rs, ставится в
+# main.rs:141 до старта воркеров. По сигналу воркеры, TCP и метрики
+# останавливаются, делается финальный save_now, код выхода 0 (main.rs:149).
+# TimeoutStopSec ниже — с запасом на финальное сохранение.
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=15s

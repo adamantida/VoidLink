@@ -5,6 +5,11 @@ on:
   push:
     branches: [ "master" ]
 
+# Токен GITHUB_TOKEN — только чтение: workflow ничего не публикует и не
+# комментирует (аудит 2026-11, SEC-07).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1

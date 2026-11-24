@@ -245,12 +245,16 @@ ctrl-разбора; федеративные (`0x40..=0x4F`) уходят в `f
 - `tcp.rs` — TCP-фолбэк на том же порту, что UDP (включён по умолчанию,
   `--no-tcp` выключает): тот же кадр, рамка `u16 LE длина`.
 - `metrics.rs` — атомарные счётчики и HTTP-эндпоинт `/metrics` (Prometheus) и
-  `/healthz` (только std). Включается флагом `--metrics <addr>`; метрики:
-  `voidlink_sessions`, `voidlink_groups`, `voidlink_members`,
-  `voidlink_invites_pending`, `voidlink_relayed_frames_total`,
-  `voidlink_dropped_frames_total`, `voidlink_hello_total`,
-  `voidlink_challenge_total`, `voidlink_ctrl_frames_total`,
-  `voidlink_bytes_relayed_total`, `voidlink_probes_total`.
+  `/healthz` (только std). Включается флагом `--metrics <addr>`; **18 метрик**
+  (`Metrics::entries` → `[_; 18]`, `crates/server/src/metrics.rs:134`):
+  сессии и группы — `voidlink_sessions`, `voidlink_groups`, `voidlink_members`,
+  `voidlink_invites_pending`, `voidlink_leases`; релей и рукопожатие —
+  `voidlink_relayed_frames_total`, `voidlink_dropped_frames_total`,
+  `voidlink_bytes_relayed_total`, `voidlink_hello_total`,
+  `voidlink_challenge_total`, `voidlink_ctrl_frames_total`; аренды и проба —
+  `voidlink_leases_expired_total`, `voidlink_probes_total`; федерация —
+  `voidlink_fed_peers`, `voidlink_fed_groups`, `voidlink_fed_addr_claims`,
+  `voidlink_fed_relayed_total`, `voidlink_fed_hint_rejected_total`.
 - `probe.rs` — проба доступности (`PROBE_REQ` → `PROBE_RESP`, этап 9):
   открытым текстом, без сессии, ровно 64 байта запроса, ответ 24/56 байт
   (не длиннее запроса), разброс времени 120 с, лимит по IP и `plain`-бюджет,
