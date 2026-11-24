@@ -6680,7 +6680,10 @@ mod tests {
         const WINDOW: u64 = 200;
         /// Бюджет на весь прогон: раннеры разные по скорости, важно лишь,
         /// что релей не встал.
-        const BUDGET: Duration = Duration::from_secs(30);
+        // Не бенчмарк: проверяется, что релей не встал. Запас большой —
+        // раннеры разные, а 30 с на медленной виртуалке выгорали целиком
+        // (аудит 2026-11, CORE-12).
+        const BUDGET: Duration = Duration::from_secs(120);
         let limits = Limits {
             relay_rate: 1e7,
             relay_burst: 1e7,
