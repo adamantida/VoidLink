@@ -274,6 +274,13 @@ impl DaemonEngine {
         let st = Arc::new(store::Store::new(data_dir));
         let mut cfg = st.load().map_err(|e| format!("чтение конфига: {e:#}"))?;
         let fresh = cfg.identity.is_none();
+        if fresh {
+            // Файл есть, но identity в нём нет: сохраняем копию до записи
+            // новой — иначе прежнее содержимое теряется безвозвратно.
+            if let Err(e) = st.backup() {
+                log(Level::Warn, &format!("резервная копия client.json: {e:#}"));
+            }
+        }
         let identity = store::ensure_identity(&mut cfg);
         if fresh {
             st.save(&cfg)

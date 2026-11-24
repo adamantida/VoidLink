@@ -143,6 +143,9 @@ pub struct Limits {
     pub session_timeout: Duration,
     /// Групп во владении одной identity.
     pub max_owned_groups: usize,
+    /// Одновременных сессий на сервере: identity бесплатны, и без предела
+    /// память росла бы от одного HELLO3 (аудит 2026-11, SEC-06).
+    pub max_sessions: usize,
     /// Срок жизни приглашения.
     pub invite_ttl: Duration,
     /// Приглашений и банов на группу: без предела любой владелец раздувал бы
@@ -190,6 +193,7 @@ impl Default for Limits {
             join_burst: 10.0,
             session_timeout: Duration::from_secs(30),
             max_owned_groups: 16,
+            max_sessions: 10_000,
             invite_ttl: Duration::from_secs(7 * 24 * 3600),
             max_invites_per_group: 256,
             max_bans_per_group: 1024,
@@ -405,16 +409,32 @@ impl Server {
         let tcp = if cfg.tcp {
             let on_frame: tcp::FrameHandler = {
                 let sh = shared.clone();
-                Arc::new(move |peer, frame| handle_datagram(&sh, peer.addr(), frame))
+                Arc::new(move |peer, frame| {
+                    handle_datagram(&sh, peer.addr(), Transport::Tcp, frame)
+                })
             };
             let on_close: tcp::CloseHandler = {
                 let sh = shared.clone();
-                Arc::new(move |peer| drop_session_at(&sh, peer.addr()))
+                Arc::new(move |peer| drop_session_at(&sh, peer.addr(), Transport::Tcp))
             };
-            match tcp::TcpTransport::start_with_close(
+            // TCP-клиент не занимает адрес живой UDP-сессии: иначе сервер
+            // отправлял бы кадры той сессии (включая ключи групп) в это
+            // TCP-соединение. Симметрично UDP-HELLO3 не принимается, если по
+            // адресу уже есть живое TCP-соединение (см. handle_hello3).
+            let filter: tcp::AdmitFilter = {
+                let sh = shared.clone();
+                Arc::new(move |addr: SocketAddr| {
+                    let s = sh.state.read().unwrap();
+                    !s.sessions
+                        .get(&addr)
+                        .is_some_and(|ses| ses.transport == Transport::Udp)
+                })
+            };
+            match tcp::TcpTransport::start_filtered(
                 addr,
                 on_frame,
                 on_close,
+                filter,
                 tcp::TcpLimits::default(),
             ) {
                 Ok(t) => {
@@ -526,6 +546,36 @@ pub struct RotatedKey {
 /// звено дописывается в `server.json`, дальше сервер работает с новым
 /// ключом. Запущенный на том же каталоге сервер новый ключ не затирает, а
 /// сохраняет (см. `keep_rotated_key`): он вступает в силу с перезапуском.
+/// Снять TOFU-пин федерации из `server.json` (`tunnel-server unpeer`).
+///
+/// `key` — адрес пира (`ip:port`) или hex его ed25519-ключа. Возвращает
+/// число снятых пинов: 0 — такого пина не было. Нужен, когда таблица пиров
+/// заполнена чужими `SRV_HELLO` и федерация с настоящим пиром невозможна
+/// (CORE-01); при заполнении сервер и сам вытесняет самый старый пин без
+/// живой сессии.
+pub fn unpeer(data_dir: &Path, key: &str) -> Result<usize> {
+    let store = persist::Store::new(data_dir);
+    let _lock = store
+        .lock()
+        .with_context(|| format!("блокировка server.json в {}", data_dir.display()))?;
+    let Some(mut p) = store.load()? else {
+        anyhow::bail!(
+            "в {} нет server.json — снимать нечего (сервер ещё не запускался?)",
+            data_dir.display()
+        );
+    };
+    let before = p.federation.peers.len();
+    let key = key.trim();
+    p.federation
+        .peers
+        .retain(|peer| !(peer.addr == key || peer.ed.eq_ignore_ascii_case(key)));
+    let removed = before - p.federation.peers.len();
+    if removed > 0 {
+        store.save(&p)?;
+    }
+    Ok(removed)
+}
+
 pub fn rotate_key(data_dir: &Path) -> Result<RotatedKey> {
     anyhow::ensure!(
         data_dir.join("server.json").exists(),
@@ -628,8 +678,20 @@ fn ip_take(
         .take(rate, burst)
 }
 
+/// Транспорт, по которому пришла сессия. Один и тот же ip:port может
+/// одновременно быть UDP-клиентом и TCP-соединением (разные пространства
+/// адресов), поэтому сессия помнит свой транспорт, а кадры чужого транспорта
+/// её не обслуживают.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Transport {
+    Udp,
+    Tcp,
+}
+
 struct Session {
     ed_pub: [u8; 32],
+    /// Транспорт, по которому пришла сессия (см. Transport).
+    transport: Transport,
     /// Эфемерный ключ клиента этой попытки: повтор HELLO3 с ним же с того же
     /// адреса — потерянный WELCOME, а не новое подключение.
     eph_pub: [u8; 32],
@@ -1070,10 +1132,18 @@ fn refresh_gauges(sh: &Shared) {
 }
 
 /// TCP-соединение закрылось: его сессия — офлайн сразу, не по таймауту.
-fn drop_session_at(sh: &Shared, addr: SocketAddr) {
+fn drop_session_at(sh: &Shared, addr: SocketAddr, via: Transport) {
     let mut out = Outbox::new();
     {
         let mut s = sh.state.write().unwrap();
+        // Снимаем только сессию своего транспорта: закрытие TCP-соединения не
+        // должно убивать живую UDP-сессию с тем же ip:port.
+        if s.sessions
+            .get(&addr)
+            .is_some_and(|ses| ses.transport != via)
+        {
+            return;
+        }
         let Some(ses) = s.remove_session(&addr) else {
             return;
         };
@@ -2072,17 +2142,17 @@ fn worker(sh: Arc<Shared>) {
                 continue;
             }
         };
-        handle_datagram(&sh, src, &buf[..n]);
+        handle_datagram(&sh, src, Transport::Udp, &buf[..n]);
     }
 }
 
-fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
+fn handle_datagram(sh: &Shared, src: SocketAddr, via: Transport, datagram: &[u8]) {
     let Ok((typ, body)) = proto::split_frame(datagram) else {
         sh.drop_frame();
         return;
     };
     if proto::grp::is_group(typ) {
-        relay_group(sh, src, datagram);
+        relay_group(sh, src, via, datagram);
     } else if typ == ctrl::PROBE_REQ {
         // Проба доступности: открытым текстом, без сессии и рукопожатия,
         // ответ не длиннее запроса (§3.7).
@@ -2102,7 +2172,7 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
                 None => sh.drop_frame(),
             }
         } else {
-            handle_hello3(sh, src, body);
+            handle_hello3(sh, src, via, body);
         }
     } else if proto::mesh::is_mesh(typ) {
         // Mesh-кадры — пир ↔ пир: серверу они не адресованы (пир не
@@ -2121,7 +2191,7 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         // мусор.
         sh.drop_frame();
     } else {
-        handle_ctrl_frame(sh, src, typ, body);
+        handle_ctrl_frame(sh, src, via, typ, body);
     }
 }
 
@@ -2135,7 +2205,7 @@ fn send_reset(sh: &Shared, src: SocketAddr) {
 
 // ---------- relay ----------
 
-fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
+fn relay_group(sh: &Shared, src: SocketAddr, via: Transport, datagram: &[u8]) {
     let Ok((_, h)) = proto::parse_group_header(datagram) else {
         sh.drop_frame();
         return;
@@ -2149,6 +2219,12 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
             send_reset(sh, src);
             return;
         };
+        // Адрес принадлежит сессии другого транспорта — это не наш клиент.
+        if ses.transport != via {
+            drop(s);
+            sh.drop_frame();
+            return;
+        }
         ses.last_seen.store(sh.now_ms(), Ordering::Relaxed);
         let Some(g) = s.groups.get(&h.gid) else {
             return;
@@ -2291,6 +2367,11 @@ fn group_state(s: &State, g: &Group, viewer: &[u8; 32]) -> GroupState {
         .filter_map(|(pk, m)| {
             let (_, ses) = s.session_of(pk)?;
             if !mesh_fresh(ses) {
+                return None;
+            }
+            // Невидимка не раскрывается и здесь: наличие записи = «онлайн»,
+            // плюс статический x-ключ для mesh-рукопожатия. Себе — видно.
+            if ses.invisible && pk != viewer {
                 return None;
             }
             let x_pub = ses.x_pub?;
@@ -3010,32 +3091,27 @@ fn join_fed(
             anyhow::ensure!(!g.full(), "группа заполнена");
         }
         let ip = s.ip_for(*me).context("нет свободных адресов на сервере")?;
-        let (own, origin, owner, rev) = {
+        let (own, owner, rev) = {
             let g = &s.groups[&gid];
-            (g.fed_origin.is_none(), g.fed_origin, g.owner, g.rev)
+            (g.fed_origin.is_none(), g.owner, g.rev)
         };
-        {
+        // Те же лимиты, что у JOIN_GROUP: каждый вход не-участника — ротация
+        // ключа (у владельца сразу, у копии — по его команде), поэтому
+        // чехарда JOIN/LEAVE через федерацию ломала бы трафик группы так же.
+        // Владелец группы не лимитируется (как и в JOIN_GROUP).
+        if owner != *me {
+            let now = unix_ms();
             let g = s.groups.get_mut(&gid).unwrap();
-            g.insert_member(
-                *me,
-                Member {
-                    ip,
-                    name: uname.clone(),
-                    status: ustatus.clone(),
-                },
-            );
-            if own {
-                // Владелец здесь: вход — как JOIN_GROUP (ротация ключа).
-                g.rotate(false);
-                g.bump();
+            if g.left
+                .get(me)
+                .is_some_and(|t| now.saturating_sub(*t) < duration_ms(REJOIN_COOLDOWN))
+            {
+                anyhow::bail!("недавно вышли из группы — повторите вход позже");
             }
-        }
-        if own {
-            s.fed_dirty.insert(gid);
-        } else if origin.is_some() {
-            // Копия: вход подтверждает владелец — заявка ему (он ротирует
-            // ключ и пришлёт дельту).
-            federation::request_join(sh, uuid, &owner, *me, ip, rev, out);
+            anyhow::ensure!(
+                g.joins.take(sh.limits.join_rate, sh.limits.join_burst),
+                "слишком много входов в группу — повторите позже"
+            );
         }
         // Адрес вошедшего — в общий пул: пиры должны знать, где он живёт
         // (иначе релей до него не найдёт сервер).
@@ -3046,13 +3122,46 @@ fn join_fed(
             ts_ms: unix_ms(),
         };
         federation::publish_claims(sh, &[claim], out);
-        sh.log(format!(
-            "join_fed: {} → {} \"{}\" as {}",
-            uname,
-            hex(uuid),
-            s.groups[&gid].name,
-            ip_str(ip)
-        ));
+        if own {
+            // Свой сервер владеет группой: вход — как JOIN_GROUP (ротация).
+            {
+                let g = s.groups.get_mut(&gid).unwrap();
+                g.insert_member(
+                    *me,
+                    Member {
+                        ip,
+                        name: uname.clone(),
+                        status: ustatus.clone(),
+                    },
+                );
+                g.rotate(false);
+                g.bump();
+            }
+            s.fed_dirty.insert(gid);
+            sh.log(format!(
+                "join_fed: {} → {} \"{}\" as {}",
+                uname,
+                hex(uuid),
+                s.groups[&gid].name,
+                ip_str(ip)
+            ));
+        } else {
+            // Копия: членство и ключ даёт владелец. Оптимистичной вставки нет:
+            // иначе забаненный на владельце получал бы GROUP_STATE с ключом
+            // эпохи, а отказ владельца (баны не реплицируются) никто бы не
+            // снял — участник-фантом остался бы в группе навсегда.
+            federation::request_join(sh, uuid, &owner, *me, ip, rev, out);
+            sh.log(format!(
+                "join_fed: {} → {} \"{}\" — ждём подтверждения владельца",
+                uname,
+                hex(uuid),
+                s.groups[&gid].name
+            ));
+            // Клиенту — только список групп: состояния (и ключа) ещё нет.
+            push_group_list(s, src, &s.sessions[&src], out);
+            sh.list_dirty.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
     }
     push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
     push_group_list(s, src, &s.sessions[&src], out);
@@ -3102,8 +3211,11 @@ fn push_update(
         // Mesh-хвост kind 1 (§4.2): ключ и возможности изменившегося
         // участника. Старые клиенты хвост игнорируют, v4-сервер его не шлёт.
         let mesh = match change {
+            // Невидимка не попадает и в хвост дельты (BIZ-03): запись
+            // раскрывала бы факт онлайна и статический x-ключ.
             Change::Member(who) => s
                 .session_of(who)
+                .filter(|(_, x)| !x.invisible)
                 .and_then(|(_, x)| x.x_pub.map(|x_pub| (x_pub, x.caps)))
                 .map(|(x_pub, caps)| {
                     vec![pl::MeshEntry {
@@ -3392,7 +3504,15 @@ fn admin_info(s: &State, g: &Group) -> AdminInfo {
 /// HELLO3 (раздел 2): версия → cookie → подпись → сессия. Ответ без
 /// верного cookie — только маленький CHALLENGE; неверная подпись, мусор и
 /// ключи малого порядка отбрасываются молча.
-fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
+fn handle_hello3(sh: &Shared, src: SocketAddr, via: Transport, body: &[u8]) {
+    // Адрес занят живым TCP-соединением — UDP-клиент с тем же ip:port это не
+    // он (и наоборот: TCP-соединение не принимается на адрес UDP-сессии, см.
+    // фильтр в start_server). Иначе кадры одной сессии уходили бы чужому
+    // транспорту.
+    if via == Transport::Udp && sh.tcp.get().is_some_and(|t| t.is_live(tcp::Peer::Tcp(src))) {
+        sh.drop_frame();
+        return;
+    }
     match hs::hello_version(body) {
         None => {
             sh.drop_frame();
@@ -3492,7 +3612,14 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
         } else if s.eph_retired(&h.ed_pub, &h.eph_pub) {
             sh.drop_frame();
         } else {
-            install_session(sh, &mut s, src, &h, keys, welcome, &mut out);
+            install_session(
+                sh,
+                &mut s,
+                src,
+                &h,
+                SessionInit { keys, welcome, via },
+                &mut out,
+            );
         }
     }
     sh.dirty.store(true, Ordering::Relaxed);
@@ -3521,16 +3648,36 @@ fn push_hello_replay(sh: &Shared, src: SocketAddr, ses: &Session, out: &mut Outb
     out.push((src, ses.welcome.clone()));
 }
 
+/// Что нужно, чтобы поставить сессию: сеансовые ключи, готовый WELCOME и
+/// транспорт, по которому пришёл HELLO3.
+struct SessionInit {
+    keys: proto::DirKeys,
+    welcome: Vec<u8>,
+    via: Transport,
+}
+
 fn install_session(
     sh: &Shared,
     s: &mut State,
     src: SocketAddr,
     h: &Hello3,
-    keys: proto::DirKeys,
-    welcome: Vec<u8>,
+    init: SessionInit,
     out: &mut Outbox,
 ) {
     let ed = h.ed_pub;
+    // Предел числа сессий: бесплатные identity иначе копили бы память.
+    // Переподключение известной identity и свой адрес — не считаются.
+    if s.sessions.len() >= sh.limits.max_sessions
+        && !s.sessions.contains_key(&src)
+        && !s.by_pub.contains_key(&ed)
+    {
+        sh.log(format!(
+            "сессия отклонена: лимит {} одновременных сессий",
+            sh.limits.max_sessions
+        ));
+        sh.drop_frame();
+        return;
+    }
     let name = match clean(&h.name, NAME_MAX_CHARS) {
         n if n.is_empty() => "anon".to_string(),
         n => n,
@@ -3568,11 +3715,12 @@ fn install_session(
         src,
         Session {
             ed_pub: ed,
+            transport: init.via,
             eph_pub: h.eph_pub,
             name: name.clone(),
             status: status.clone(),
-            keys,
-            welcome: welcome.clone(),
+            keys: init.keys,
+            welcome: init.welcome.clone(),
             welcome_at: AtomicU64::new(sh.now_ms()),
             tx: AtomicU64::new(0),
             msg_id: AtomicU32::new(0),
@@ -3594,7 +3742,7 @@ fn install_session(
     s.leases.touch(&ed, unix_ms());
     let inv = if h.invisible() { ", invisible" } else { "" };
     sh.log(format!("online: {name} ({}) @ {src}{inv}", short(&ed)));
-    out.push((src, welcome));
+    out.push((src, init.welcome));
     // HELLO участника — ротация ключа всех его групп (клиент ключи не
     // хранит). Ему — GROUP_STATE целиком, остальным — дельта kind 1.
     for gid in s.groups_of(&ed) {
@@ -3692,7 +3840,7 @@ fn is_urgent(typ: u8) -> bool {
     )
 }
 
-fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
+fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, via: Transport, typ: u8, body: &[u8]) {
     metrics::Metrics::inc(&sh.metrics.ctrl_frames, 1);
     // Быстрый путь — под блокировкой на чтение: сессия, окно повторов,
     // расшифровка, лимит.
@@ -3704,6 +3852,13 @@ fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
             send_reset(sh, src);
             return;
         };
+        // Адрес принадлежит сессии другого транспорта (TCP и UDP — разные
+        // пространства адресов): это не наш клиент, RESET не шлём.
+        if ses.transport != via {
+            drop(s);
+            sh.drop_frame();
+            return;
+        }
         // Дешёвая предпроверка до AEAD: явный повтор или слишком старый.
         if !proto::ctrl_counter(body).is_some_and(|c| ses.rx.lock().unwrap().check(c)) {
             sh.drop_frame();
@@ -4682,16 +4837,30 @@ mod tests {
     }
 
     /// Просит у ядра увеличенный буфер приёма UDP: длинное сообщение сервера
-    /// (GROUP_STATE группы на 253 участника — ~215 КБ, ~175 кусков FRAG)
-    /// приходит залпом, дефолтных 64 КБ на Windows не хватает и лишние
-    /// датаграммы ядро выбрасывает — сборка не завершается никогда. Ошибка не
-    /// критична: остаётся дефолт.
+    /// (GROUP_STATE группы на 253 участника — ~205 КБ, ~180 кусков FRAG)
+    /// приходит залпом, дефолтных буферов ОС не хватает, лишние датаграммы
+    /// ядро выбрасывает — сборка не завершается никогда. Ошибка не критична:
+    /// остаётся дефолт.
     ///
-    /// Только Windows: на Linux (`net.core.rmem_default`) и macOS дефолт уже
-    /// ≥ 128 КБ, тест там исторически зелёный, а `libc` в этом крейте нет —
-    /// лишнюю зависимость ради одного теста не тянем.
+    /// Раньше стояло «на Linux дефолта хватает, тест там зелёный» — это
+    /// неверно: при `net.core.rmem_default = 212992` залп на ~205 КБ теряется,
+    /// и тест детерминированно падал на Linux 6.17 (аудит 2026-11, CORE-11).
     #[cfg(unix)]
-    fn set_recv_buffer(_sock: &UdpSocket, _bytes: usize) {}
+    fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `sock` жив всё время вызова, `len` — корректный `c_int`,
+        // размер переданного значения совпадает с `optlen`.
+        unsafe {
+            let len = bytes as libc::c_int;
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const len).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 
     /// Windows-вариант: `SO_RCVBUF` через Winsock (`std` сеттера не даёт).
     #[cfg(windows)]
@@ -5930,6 +6099,77 @@ mod tests {
     }
 
     #[test]
+    fn невидимка_не_попадает_в_mesh_секцию() {
+        let (server, dir) = test_server("mesh-invisible");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let st = a.create("mesh", false);
+        let gid = st.gid;
+        let b = Raw::connect_with(
+            srv,
+            "bravo",
+            &proto::Identity::generate(),
+            hs::HELLO_FLAG_INVISIBLE,
+        );
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        let bx = [0xBBu8; 32];
+        b.send(
+            ctrl::MESH_INFO,
+            &payloads::enc_mesh_info(&bx, proto::mesh::caps::MESH),
+        );
+        b.sync();
+        // Другому участнику невидимка в mesh-секции не видна.
+        a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        let st_a = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap();
+        assert!(
+            !st_a.mesh.iter().any(|e| e.x_pub == bx),
+            "невидимка раскрыт в mesh-секции"
+        );
+        // Себе — видна: иначе клиент не строил бы mesh-сессии.
+        b.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        let st_b = payloads::dec_group_state(&b.expect(ctrl::GROUP_STATE)).unwrap();
+        assert!(
+            st_b.mesh.iter().any(|e| e.x_pub == bx),
+            "невидимка не видит себя в своей mesh-секции"
+        );
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn join_fed_расходует_лимит_входов() {
+        let dir = temp_dir("fed-join-rate");
+        let server = start_fed(&dir);
+        let uuid = [0x6Au8; 16];
+        fed_apply_group(
+            &server.shared,
+            &proto::federation::FedGroup {
+                uuid,
+                owner: [7u8; 32],
+                gid: 77,
+                name: "remote".into(),
+                private: false,
+                key: [0x11; 32],
+                epoch: 1,
+                rev: 1,
+                members: vec![],
+                deleted: false,
+            },
+            &[0xAA; 32],
+        );
+        let c = Raw::connect(server.addr, "rate-user");
+        // burst = 10: полтора десятка попыток подряд упираются в лимит.
+        for _ in 0..15 {
+            c.send(ctrl::JOIN_FED, &uuid);
+        }
+        let e = c.error();
+        assert!(e.contains("слишком много входов"), "{e}");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn invisible_кандидаты_и_presence() {
         let (server, dir) = test_server("presence");
         let srv = server.addr;
@@ -6219,6 +6459,7 @@ mod tests {
                     addr,
                     Session {
                         ed_pub: pk,
+                        transport: Transport::Udp,
                         eph_pub: [0; 32],
                         name: long_text('n'),
                         status: long_text('s'),
@@ -6439,7 +6680,10 @@ mod tests {
         const WINDOW: u64 = 200;
         /// Бюджет на весь прогон: раннеры разные по скорости, важно лишь,
         /// что релей не встал.
-        const BUDGET: Duration = Duration::from_secs(30);
+        // Не бенчмарк: проверяется, что релей не встал. Запас большой —
+        // раннеры разные, а 30 с на медленной виртуалке выгорали целиком
+        // (аудит 2026-11, CORE-12).
+        const BUDGET: Duration = Duration::from_secs(120);
         let limits = Limits {
             relay_rate: 1e7,
             relay_burst: 1e7,
@@ -6482,8 +6726,11 @@ mod tests {
         // полёте помещаются в буфер приёма любой ОС (на Windows он 64 КБ),
         // иначе часть фреймов теряется на стороне получателя.
         for i in 0..N {
+            // Пауза, а не `yield_now`: busy-wait отбирал кванты у читателя и
+            // на медленных раннерах бюджет выгорал целиком (аудит 2026-11,
+            // CORE-12).
             while i as u64 > got.load(Ordering::Relaxed) + WINDOW && t0.elapsed() < BUDGET {
-                thread::yield_now();
+                thread::sleep(Duration::from_micros(200));
             }
             a.sock.send_to(&frame, srv).unwrap();
         }
@@ -7823,8 +8070,38 @@ mod tests {
         assert_eq!(item.gid, local_gid);
         assert_eq!(item.members, 1);
 
-        // JOIN_FED → локальный gid и обычный GROUP_STATE.
+        // JOIN_FED на копии: только заявка владельцу. Членства и ключа до его
+        // согласия нет — баны не реплицируются, иначе забаненный получал бы
+        // ключ эпохи, а отказ владельца никто бы не снял.
         c.send(ctrl::JOIN_FED, &uuid);
+        let (_, list_payload) = c.until(ctrl::GROUP_LIST);
+        let list = payloads::dec_group_list(&list_payload).unwrap();
+        assert!(
+            list.iter().any(|g| g.gid == local_gid),
+            "нет в GROUP_LIST: {list:?}"
+        );
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(
+                !s.groups[&local_gid].members.contains_key(&c.pk),
+                "участник добавлен до согласия владельца"
+            );
+        }
+        // Владелец подтвердил вход: дельта с новым участником.
+        fed_apply_delta(
+            &server.shared,
+            &proto::federation::FedGroupDelta {
+                uuid,
+                owner: remote_owner,
+                rev: 8,
+                base_rev: 7,
+                changes: vec![proto::federation::FedChange::MemberAdd {
+                    pk: c.pk,
+                    ip: ovl(9, 10),
+                }],
+            },
+            &[0xAA; 32],
+        );
         let st = c.state();
         assert_eq!(st.gid, local_gid);
         assert_eq!(st.owner, remote_owner);
@@ -7833,13 +8110,6 @@ mod tests {
             st.members.iter().any(|m| m.pubkey == c.pk && m.ip != 0),
             "вошедший не в составе: {:?}",
             st.members
-        );
-        // Группа появилась в списке клиента.
-        c.send(ctrl::LIST_GROUPS, &[]);
-        let list = payloads::dec_group_list(&c.expect(ctrl::GROUP_LIST)).unwrap();
-        assert!(
-            list.iter().any(|g| g.gid == local_gid),
-            "нет в GROUP_LIST: {list:?}"
         );
 
         // Приватная копия: вход без приглашения — ошибка.
@@ -7862,6 +8132,101 @@ mod tests {
         d.send(ctrl::JOIN_FED, &priv_uuid);
         let e = d.error();
         assert!(e.contains("приватная"), "{e}");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpeer_снимает_пин_по_адресу_и_ключу() {
+        let dir = temp_dir("unpeer");
+        let st = persist::Store::new(&dir);
+        let mut p = persist::Persisted::default();
+        let ed = "ab".repeat(32);
+        p.federation.peers.push(persist::PPeer {
+            addr: "192.0.2.7:5555".into(),
+            ed: ed.clone(),
+            x: "cd".repeat(32),
+            added_at: 1,
+        });
+        st.save(&p).unwrap();
+        // По hex-ключу (регистр не важен).
+        assert_eq!(unpeer(&dir, &ed.to_uppercase()).unwrap(), 1);
+        assert_eq!(unpeer(&dir, "192.0.2.7:5555").unwrap(), 0);
+        // По адресу.
+        let mut p = persist::Persisted::default();
+        p.federation.peers.push(persist::PPeer {
+            addr: "192.0.2.7:5555".into(),
+            ed: ed.clone(),
+            x: "cd".repeat(32),
+            added_at: 1,
+        });
+        st.save(&p).unwrap();
+        assert_eq!(unpeer(&dir, "192.0.2.7:5555").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[should_panic(expected = "нет WELCOME")]
+    fn лимит_сессий_отклоняет_новую() {
+        let (server, dir) = test_server_with(
+            "max-sessions",
+            Limits {
+                max_sessions: 1,
+                ..Limits::default()
+            },
+        );
+        let _a = Raw::connect(server.addr, "alpha");
+        // Вторая identity при лимите 1 не получает WELCOME.
+        let _b = Raw::connect(server.addr, "bravo");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn закрытие_tcp_не_снимает_udp_сессию() {
+        let (server, dir) = test_server("transport-drop");
+        let a = Raw::connect(server.addr, "alpha");
+        a.sync();
+        let addr = a.sock.local_addr().unwrap();
+        // Закрытие TCP-соединения с того же ip:port не должно убивать UDP-сессию.
+        drop_session_at(&server.shared, addr, Transport::Tcp);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(
+                s.sessions.contains_key(&addr),
+                "UDP-сессия снята закрытием TCP-соединения"
+            );
+        }
+        // Свой транспорт снимает.
+        drop_session_at(&server.shared, addr, Transport::Udp);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(!s.sessions.contains_key(&addr));
+        }
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn кадр_чужого_транспорта_не_обслуживает_сессию() {
+        let (server, dir) = test_server("transport-mismatch");
+        let a = Raw::connect(server.addr, "alpha");
+        a.sync();
+        let addr = a.sock.local_addr().unwrap();
+        // Свежий счётчик, но чужие ключи: под своим транспортом сервер
+        // ответит RESET, под чужим — молча отбросит (это не наш клиент).
+        let bad = proto::seal_ctrl(&[9u8; 32], 5, ctrl::LIST_GROUPS, &[]);
+        // RESET — открытый кадр: drain() его пропускает, читаем напрямую.
+        handle_datagram(&server.shared, addr, Transport::Tcp, &bad);
+        assert!(
+            recv_plain(&a.sock, ctrl::RESET, Duration::from_millis(250)).is_none(),
+            "кадр чужого транспорта обслужен как кадр UDP-сессии"
+        );
+        handle_datagram(&server.shared, addr, Transport::Udp, &bad);
+        assert!(
+            recv_plain(&a.sock, ctrl::RESET, Duration::from_millis(500)).is_some(),
+            "свой транспорт не получил RESET на нерасшифровываемый кадр"
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

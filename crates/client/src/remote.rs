@@ -357,9 +357,15 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
             next_try = Instant::now() + RECONNECT_EVERY;
             if let Ok(Some(mut c)) = ep.connect(ClientKind::Tui, HANDSHAKE_TIMEOUT) {
                 if Me::from_json(c.me()).as_ref() != Some(&me) {
+                    // Демон поднялся с другой identity: шапка, copy code и
+                    // owner_is_me считались бы по чужому ключу. Не подписываемся
+                    // вовсе — показываем «нет связи», пока TUI не перезапустят
+                    // (аудит 2026-11, FRNT-1).
+                    sh.down.store(true, Ordering::SeqCst);
                     sh.push(Event::Error(
                         "демон работает с другой identity — перезапустите TUI".into(),
                     ));
+                    continue;
                 }
                 if let Ok((snap, _seen, editable)) = subscribe(&mut c, HANDSHAKE_TIMEOUT) {
                     *lock(&sh.snap) = Arc::new(snap);

@@ -2692,6 +2692,7 @@ name = "tunnel-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rand 0.10.4",
  "serde",
  "serde_json",

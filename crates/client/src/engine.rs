@@ -131,6 +131,13 @@ const DECLINE_RETRY: Duration = Duration::from_secs(1);
 const DECLINE_GIVE_UP: Duration = Duration::from_secs(20);
 /// GET_GROUP — не чаще раза в секунду на группу (раздел 7).
 const GET_GROUP_EVERY: Duration = Duration::from_secs(1);
+/// Через сколько повторять GET_GROUP, если состояние группы так и не пришло
+/// (потерян кусок FRAG или сам кадр): ретрансмиссии у FRAG нет, а следующий
+/// GROUP_LIST — только через LIST_EVERY (15 с). Аудит 2026-11, CLNT-05.
+const GET_GROUP_RETRY: Duration = Duration::from_secs(2);
+/// Больше стольких попыток подряд не делаем: дальше чинит периодический
+/// GROUP_LIST.
+const GET_GROUP_TRIES: u8 = 3;
 /// Как часто повторять своё состояние серверу — CANDIDATES (заодно с
 /// проверкой, не сменился ли LAN-адрес), STATUS и PRESENCE. Ответа на них
 /// нет, а повтор без изменения сервер не считает изменением: потерянная
@@ -1143,9 +1150,18 @@ pub struct Engine {
     /// Колбэк сохранения конфига (UI может править client.json напрямую).
     save: Arc<dyn Fn(&Config) + Send + Sync>,
     env: Arc<Env>,
+    /// Потоки движка (rx и cmd). Если любой завершился (паника), туннеля нет,
+    /// а meta.connected сам об этом не узнает (аудит 2026-11, DES-02).
+    threads: Arc<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Engine {
+    /// Живы ли потоки движка. Ложь — туннель мёртв: показывать «в сети»
+    /// нельзя, команды уходят в никуда.
+    pub fn alive(&self) -> bool {
+        self.threads.iter().all(|h| !h.is_finished())
+    }
+
     /// Сохраняет конфиг через колбэк движка.
     pub fn save_config(&self, cfg: &Config) -> Result<()> {
         (self.save)(cfg);
@@ -1625,6 +1641,74 @@ fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
     }
 }
 
+/// Группы, чей GET_GROUP ушёл, состояние так и не пришло, а попытки ещё
+/// есть: пора перезапросить. Потерянный кусок FRAG не ретранслируется, и без
+/// повтора группа оставалась бы без ключа до следующего GROUP_LIST (15 с).
+fn retry_due(tries: &HashMap<u32, (Instant, u8)>, want: &HashSet<u32>, now: Instant) -> Vec<u32> {
+    let mut due = Vec::new();
+    for (gid, (sent, n)) in tries {
+        if *n < GET_GROUP_TRIES
+            && !want.contains(gid)
+            && now.duration_since(*sent) >= GET_GROUP_RETRY
+        {
+            due.push(*gid);
+        }
+    }
+    due
+}
+
+/// Фактический размер буфера приёма: ядро молча урезает запрос по
+/// `net.core.rmem_max` (Linux) — и тогда большой GROUP_STATE теряется.
+#[cfg(unix)]
+fn recv_buffer(sock: &UdpSocket) -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    let mut len: libc::c_int = 0;
+    let mut optlen = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `sock` жив, `len`/`optlen` нужных типов и размеров.
+    let rc = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw mut len).cast(),
+            &mut optlen,
+        )
+    };
+    (rc == 0 && len > 0).then_some(len as usize)
+}
+
+#[cfg(windows)]
+fn recv_buffer(sock: &UdpSocket) -> Option<usize> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SO_RCVBUF, SOL_SOCKET, getsockopt};
+    let mut len: i32 = 0;
+    let mut optlen = size_of::<i32>() as i32;
+    // SAFETY: те же требования, что у `set_recv_buffer` выше.
+    let rc = unsafe {
+        getsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (&raw mut len).cast(),
+            &mut optlen,
+        )
+    };
+    (rc == 0 && len > 0).then_some(len as usize)
+}
+
+/// Предупредить, если ядро урезало буфер приёма (CLNT-01): запрос 4 МиБ молча
+/// режется по `rmem_max`, и симптом — «состояние группы не пришло».
+fn warn_if_small_buffer(sock: &UdpSocket) {
+    if let Some(got) = recv_buffer(sock)
+        && got < UDP_RECV_BUF
+    {
+        eprintln!(
+            "[net] SO_RCVBUF: запрошено {UDP_RECV_BUF} Б, ядро дало {got} Б — \
+             большие GROUP_STATE могут теряться (проверьте net.core.rmem_max)"
+        );
+    }
+}
+
 /// Адрес интерфейса, через который виден сервер: `connect` UDP-сокета
 /// только выбирает маршрут, пакетов не шлёт.
 fn local_ip_towards(server: SocketAddr) -> Option<IpAddr> {
@@ -1901,6 +1985,7 @@ impl CtrlConn {
         let sock = Arc::new(UdpSocket::bind(bind_addr(server)).context("bind udp")?);
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
         set_recv_buffer(&sock, UDP_RECV_BUF);
+        warn_if_small_buffer(&sock);
         let flags = hello_flags(cfg);
         let mut hs = Handshake::new();
         let started = Instant::now();
@@ -2345,6 +2430,7 @@ pub fn start_with_tun(
     let sock = Arc::new(UdpSocket::bind(bind_addr(server)).context("bind udp")?);
     sock.set_read_timeout(Some(RX_POLL)).ok();
     set_recv_buffer(&sock, UDP_RECV_BUF);
+    warn_if_small_buffer(&sock);
 
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
     let paths = Arc::new(PathTable::new(&pinned));
@@ -2379,11 +2465,13 @@ pub fn start_with_tun(
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
 
+    let rx_handle;
+    let cmd_handle;
     // Приём — отдельный поток с самого начала: он же доставит WELCOME.
     {
         let env = env.clone();
         let in_tx = in_tx.clone();
-        thread::Builder::new()
+        rx_handle = thread::Builder::new()
             .name("rx".into())
             .spawn(move || rx_loop(env, in_tx))
             .context("spawn rx thread")?;
@@ -2391,7 +2479,7 @@ pub fn start_with_tun(
     // Команды UI → общий входной канал движка.
     {
         let in_tx = in_tx.clone();
-        thread::Builder::new()
+        cmd_handle = thread::Builder::new()
             .name("cmd".into())
             .spawn(move || {
                 for c in cmd_rx {
@@ -2441,6 +2529,7 @@ pub fn start_with_tun(
         cfg,
         save,
         env,
+        threads: Arc::new(vec![rx_handle, cmd_handle]),
     })
 }
 
@@ -2607,6 +2696,8 @@ struct State {
     last_decline: Instant,
     /// Группы, чьё полное состояние нужно запросить (GET_GROUP).
     want_group: HashSet<u32>,
+    /// Отправленные GET_GROUP, ждущие состояния: gid → (когда, попыток).
+    get_tries: HashMap<u32, (Instant, u8)>,
     /// Номер серверной сессии (растёт на каждую новую): ревизии групп
     /// сравнимы только в пределах одной.
     sess_gen: u64,
@@ -2688,6 +2779,7 @@ impl State {
             declining: HashMap::new(),
             last_decline: now,
             want_group: HashSet::new(),
+            get_tries: HashMap::new(),
             sess_gen: 0,
             tombs: HashMap::new(),
             autojoin_due: false,
@@ -2968,6 +3060,7 @@ fn restore(env: &Env, st: &mut State) {
     st.autojoin_due = true;
     // Новая сессия: прошлые запросы GET_GROUP не в счёт.
     st.last_get.clear();
+    st.get_tries.clear();
     let leaving: Vec<u32> = st.leaving.keys().copied().collect();
     for gid in leaving {
         st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
@@ -3284,7 +3377,13 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
             for gid in due {
                 st.want_group.remove(&gid);
                 st.last_get.insert(gid, now);
+                let n = st.get_tries.get(&gid).map_or(0, |(_, n)| *n) + 1;
+                st.get_tries.insert(gid, (now, n));
                 st.send_ctrl(env, ctrl::GET_GROUP, &payloads::enc_gid(gid));
+            }
+            // Повтор, если состояние не пришло (потерянный FRAG-кадр).
+            for gid in retry_due(&st.get_tries, &st.want_group, now) {
+                st.want_group.insert(gid);
             }
         }
         if let Some((on, first, last)) = st.presence
@@ -4779,6 +4878,7 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
     st.declining.clear();
     st.invite_sync = None;
     st.want_group.clear();
+    st.get_tries.clear();
     st.tombs.clear();
     st.autojoin_due = false;
     st.last_get.clear();
@@ -6446,6 +6546,26 @@ mod tests {
     fn open_frame(sess: &mut CtrlSession, frame: &[u8]) -> Option<Option<(u8, Vec<u8>)>> {
         let (typ, body) = proto::split_frame(frame).unwrap();
         sess.open(typ, body, Instant::now())
+    }
+
+    #[test]
+    fn повтор_get_group_по_потерянному_состоянию() {
+        let now = Instant::now();
+        let mut tries: HashMap<u32, (Instant, u8)> = HashMap::new();
+        tries.insert(1, (now, 1)); // только что отправлен
+        tries.insert(2, (now - Duration::from_secs(3), 1)); // созрел
+        tries.insert(3, (now - Duration::from_secs(3), GET_GROUP_TRIES)); // исчерпал
+        let want: HashSet<u32> = HashSet::new();
+        let due = retry_due(&tries, &want, now);
+        assert!(
+            due.contains(&2),
+            "созревший повтор не запланирован: {due:?}"
+        );
+        assert!(!due.contains(&1), "повтор раньше срока");
+        assert!(!due.contains(&3), "попытки исчерпаны");
+        // Уже в очереди — не дублируем.
+        let want: HashSet<u32> = [2u32].into_iter().collect();
+        assert!(retry_due(&tries, &want, now).is_empty());
     }
 
     #[test]

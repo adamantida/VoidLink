@@ -137,6 +137,8 @@ enum Action {
     Reject(String),
     /// Пир закреплён (TOFU) — таблицу надо сохранить на диск.
     Pinned(String),
+    /// Пир откреплён (вытеснение по лимиту) — тоже сохранить.
+    Unpinned(String),
     /// Обычное событие в лог.
     Info(String),
     /// Применить реплицированную запись группы к состоянию сервера
@@ -635,9 +637,29 @@ impl Fed {
         };
         if !self.pins.contains_key(&hello.ed) {
             if self.pins.len() >= MAX_PEERS {
-                return Ok(vec![Action::Reject(format!(
-                    "SRV_HELLO с {src}: таблица пиров заполнена ({MAX_PEERS})"
-                ))]);
+                // Таблица заполнена: вытесняем самый старый пин, с которым нет
+                // живой сессии. Иначе 64 чужих SRV_HELLO занимали бы все слоты
+                // навсегда и федерация с настоящим пиром была бы невозможна
+                // (CORE-01: пины TOFU раньше не удалялись вообще).
+                let victim = self
+                    .pins
+                    .values()
+                    .filter(|p| !self.sessions.contains_key(&p.ed))
+                    .min_by_key(|p| p.added_at)
+                    .map(|p| p.ed);
+                let Some(victim) = victim else {
+                    return Ok(vec![Action::Reject(format!(
+                        "SRV_HELLO с {src}: таблица пиров заполнена ({MAX_PEERS}), у всех пиров живая сессия"
+                    ))]);
+                };
+                if let Some(old) = self.pins.remove(&victim) {
+                    self.addrs.remove(&old.addr);
+                    out.push(Action::Unpinned(format!(
+                        "вытеснен пин {} ({}) — таблица заполнена",
+                        crate::short(&victim),
+                        old.addr
+                    )));
+                }
             }
             let pin = Pin {
                 addr: src,
@@ -1349,6 +1371,11 @@ fn apply(sh: &Shared, actions: Vec<Action>) {
                 sh.log(format!("federation: ОТКАЗ — {why}"));
             }
             Action::Pinned(msg) => {
+                sh.log(format!("federation: {msg}"));
+                sh.dirty.store(true, Ordering::Relaxed);
+                sh.save_soon();
+            }
+            Action::Unpinned(msg) => {
                 sh.log(format!("federation: {msg}"));
                 sh.dirty.store(true, Ordering::Relaxed);
                 sh.save_soon();
@@ -2421,6 +2448,48 @@ mod tests {
         let pins = a2.shared.fed.lock().unwrap().pins.clone();
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[&b.pubkey], pin);
+    }
+
+    #[test]
+    fn таблица_пиров_вытесняет_самый_старый_пин_без_сессии() {
+        // MAX_PEERS пинов, added_at растёт: вытесняться должен самый старый.
+        let pins: Vec<Pin> = (0..MAX_PEERS)
+            .map(|i| {
+                let mut ed = [0u8; 32];
+                ed[0] = i as u8;
+                ed[1] = 1;
+                Pin {
+                    addr: format!("192.0.2.{}:5555", i + 1).parse().unwrap(),
+                    ed,
+                    x: [i as u8; 32],
+                    added_at: i as u64 + 1,
+                }
+            })
+            .collect();
+        let mut fed = Fed::new(true, pins, &[], &[]);
+        let me = Identity::generate();
+        let peer = Identity::generate();
+        let eph = EphemeralKey::generate();
+        let hello = SrvHello::new(&peer, eph.public(), [7u8; 16], 1_000, 0);
+        let acts = fed
+            .on_hello(
+                &me,
+                "198.51.100.9:5555".parse().unwrap(),
+                &hello.encode(),
+                1_000,
+                1_000,
+            )
+            .unwrap();
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::Unpinned(_))),
+            "нет вытеснения: {acts:?}"
+        );
+        assert!(acts.iter().any(|a| matches!(a, Action::Pinned(_))));
+        assert_eq!(fed.pins.len(), MAX_PEERS, "новый пин не встал");
+        let mut oldest = [0u8; 32];
+        oldest[1] = 1; // i = 0
+        assert!(!fed.pins.contains_key(&oldest), "вытеснен не самый старый");
+        assert!(fed.pins.contains_key(&peer.ed_pub()));
     }
 
     #[test]

@@ -14,3 +14,8 @@ signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_Networking_WinSock"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Тестовая обвязка поднимает SO_RCVBUF (CORE-11): без этого залп GROUP_STATE
+# на 253 участника теряется на дефолтном net.core.rmem_default.
+libc = "0.2"

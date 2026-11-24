@@ -1,6 +1,7 @@
 //! Управление Wintun-адаптером: загрузка dll, создание, адреса, файрвол.
 
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -11,17 +12,32 @@ pub fn load_wintun_dll(explicit: Option<&str>) -> Result<wintun::Wintun> {
     if let Some(p) = explicit {
         return unsafe { wintun::load_from_path(p) }.context(format!("cannot load {p}"));
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let p = dir.join("wintun.dll");
-        if p.exists() {
-            return unsafe { wintun::load_from_path(&p) }
-                .context(format!("cannot load {}", p.display()));
-        }
+    // Только рядом с exe: поиск по CWD/PATH в процессе с правами
+    // администратора (`run` требует их) позволял бы обычному пользователю
+    // подложить DLL в текущий каталог и получить код от администратора.
+    // Служба грузит DLL так же — см. `winsvc::service_wintun_dll`.
+    let p = default_dll_path()?;
+    unsafe { wintun::load_from_path(&p) }.context(format!("cannot load {}", p.display()))
+}
+
+/// Путь к `wintun.dll` по умолчанию: только рядом с exe. Поиска по CWD/PATH
+/// нет — в процессе с правами администратора это был бы DLL-хайджекинг.
+fn default_dll_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("не удалось определить путь к exe")?;
+    dll_next_to(&exe)
+}
+
+/// Ядро `default_dll_path` без обращения к окружению (тестируется отдельно).
+fn dll_next_to(exe: &Path) -> Result<PathBuf> {
+    let dir = exe.parent().context("у exe нет родительского каталога")?;
+    let p = dir.join("wintun.dll");
+    if !p.exists() {
+        anyhow::bail!(
+            "wintun.dll не найден рядом с {}; положи DLL в каталог установки или укажи --dll",
+            exe.display()
+        );
     }
-    unsafe { wintun::load_from_path("wintun.dll") }
-        .context("wintun.dll not found (положи рядом с exe или укажи --dll)")
+    Ok(p)
 }
 
 /// Создаёт (или открывает существующий) адаптер.
@@ -79,4 +95,23 @@ pub fn allow_firewall(adapter_name: &str) {
             &format!("interface={adapter_name}"),
         ])
         .output();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dll_берётся_только_рядом_с_exe() {
+        let dir = std::env::temp_dir().join(format!("vl-dll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("tunnel-client.exe");
+        let err = dll_next_to(&exe).unwrap_err().to_string();
+        assert!(err.contains("рядом"), "нет подсказки про каталог: {err}");
+        // Подложенная «рядом» DLL принимается: это каталог установки.
+        std::fs::write(dir.join("wintun.dll"), b"not a real dll").unwrap();
+        assert_eq!(dll_next_to(&exe).unwrap(), dir.join("wintun.dll"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

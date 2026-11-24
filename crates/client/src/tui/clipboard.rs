@@ -148,13 +148,30 @@ fn try_method(m: Method, text: &str, env: &Env) -> Result<(), String> {
             // clip.exe понимает UTF-16LE с BOM независимо от кодовой страницы.
             let mut data = vec![0xFF, 0xFE];
             data.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
-            pipe("clip.exe", &[], &data)
+            pipe(&system32("clip.exe"), &[], &data)
         }
         Method::PbCopy => pipe("pbcopy", &[], text.as_bytes()),
         Method::WlCopy => pipe("wl-copy", &[], text.as_bytes()),
         Method::Xclip => pipe("xclip", &["-selection", "clipboard"], text.as_bytes()),
         Method::Xsel => pipe("xsel", &["--clipboard", "--input"], text.as_bytes()),
     }
+}
+
+/// Полный путь к системной утилите Windows.
+///
+/// `Command::new("clip.exe")` ищет по CWD и `PATH`, а TUI умеет работать
+/// повышенным (embedded-режим): подложенный в рабочий каталог `clip.exe` дал бы
+/// код от администратора (аудит 2026-11, FRNT-4). Так же поступает `winsvc`
+/// с `powershell.exe`.
+#[cfg(windows)]
+fn system32(name: &str) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    format!("{root}\\System32\\{name}")
+}
+
+#[cfg(not(windows))]
+fn system32(name: &str) -> String {
+    name.to_string()
 }
 
 /// Запускает утилиту, пишет данные в stdin и ждёт успешного завершения.

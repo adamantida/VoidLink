@@ -847,5 +847,5 @@ Server code устроен так же, но кодирует ключ серв�
 
 - [INSTALL.md](INSTALL.md): установка на Windows и Linux/macOS.
 - [SERVER.md](SERVER.md): развёртывание сервера и выдача server code.
-- [PROTOCOL.md](PROTOCOL.md): протокол v3, которым клиент и сервер обмениваются.
+- [PROTOCOL.md](PROTOCOL.md): протокол v4, которым клиент и сервер обмениваются.
 - [TESTING.md](TESTING.md): как запускать тесты клиента.

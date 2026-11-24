@@ -95,8 +95,10 @@ pub struct Config {
     /// флаг `--adapter` важнее). Применяется после перезапуска.
     #[serde(default)]
     pub adapter: String,
-    /// Путь к `wintun.dll` (пусто — рядом с exe или из PATH; флаг `--dll`
-    /// важнее). Применяется после перезапуска.
+    /// Путь к `wintun.dll` (пусто — только рядом с exe; флаг `--dll`
+    /// важнее). Поиска по CWD/PATH нет: повышенный процесс не должен грузить
+    /// DLL из каталога, доступного обычному пользователю. Применяется после
+    /// перезапуска.
     #[serde(default)]
     pub dll: String,
     /// Mesh-оверлей (этап 9): включён ли, релеит ли этот клиент и сколько
@@ -377,6 +379,7 @@ pub fn default_dir() -> PathBuf {
 impl Store {
     pub fn new(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
+        restrict_dir(dir);
         Self {
             path: dir.join("client.json"),
         }
@@ -389,17 +392,72 @@ impl Store {
                 migrate_friends(&mut cfg);
                 Ok(cfg)
             }
-            Err(_) => Ok(Config::default()),
+            // Файла нет — первый запуск. Любая другая ошибка (EACCES/EIO,
+            // sharing violation антивируса) — отказ, а не «конфига нет»:
+            // иначе демон создал бы новую identity и затёр существующую,
+            // потеряв friend code, серверы и друзей безвозвратно.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(e).context(format!("не прочитать {}", self.path.display())),
         }
+    }
+
+    /// Копия текущего `client.json` рядом (`client.json.bak`), если её ещё
+    /// нет: самая первая копия и есть настоящая identity, поэтому более
+    /// поздние её не перезаписывают. Ошибка не фатальна — вызывающий решает.
+    pub fn backup(&self) -> Result<()> {
+        let bak = self.path.with_extension("json.bak");
+        if bak.exists() || !self.path.exists() {
+            return Ok(());
+        }
+        std::fs::copy(&self.path, &bak)?;
+        restrict_file(&bak);
+        Ok(())
     }
 
     pub fn save(&self, cfg: &Config) -> Result<()> {
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(cfg)?)?;
+        let bytes = serde_json::to_vec_pretty(cfg)?;
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(&bytes)?;
+            // Identity в этом файле — единственная копия ключей: без fsync
+            // падение питания оставляло бы пустой tmp и битый client.json.
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
+        restrict_file(&self.path);
         Ok(())
     }
 }
+
+/// Каталог данных — только владельцу (Unix). На Windows каталог службы
+/// закрывает ACL, у портативного режима — профиль пользователя.
+#[cfg(unix)]
+fn restrict_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_dir: &Path) {}
+
+/// Файл с ключами — только владельцу (Unix).
+#[cfg(unix)]
+fn restrict_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) {}
 
 /// Миграция списка друзей при загрузке `client.json` (issue #24).
 ///
@@ -514,6 +572,69 @@ pub fn resolve_peer(cfg: &Config, token: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Временный каталог под тест: имя уникально по pid и метке.
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vl-store-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn нет_файла_это_первый_запуск() {
+        let dir = temp("missing");
+        let st = Store::new(&dir);
+        let cfg = st.load().expect("отсутствие файла — не ошибка");
+        assert!(cfg.identity.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ошибка_чтения_не_выдаётся_за_первый_запуск() {
+        let dir = temp("readerr");
+        // client.json — каталог: чтение вернёт ошибку, отличную от NotFound.
+        std::fs::create_dir_all(dir.join("client.json")).unwrap();
+        let st = Store::new(&dir);
+        assert!(
+            st.load().is_err(),
+            "ошибка чтения выдана за первый запуск: демон создал бы новую identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn бэкап_делается_один_раз() {
+        let dir = temp("backup");
+        let st = Store::new(&dir);
+        st.save(&Config::default()).unwrap();
+        st.backup().unwrap();
+        let bak = dir.join("client.json.bak");
+        let first = std::fs::read(&bak).expect("бэкап не создан");
+        // Повторная запись и повторный бэкап не должны затирать первую копию.
+        st.save(&Config::default()).unwrap();
+        st.backup().unwrap();
+        assert_eq!(std::fs::read(&bak).unwrap(), first, "бэкап перезаписан");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn каталог_и_файл_только_для_владельца() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("perm");
+        let st = Store::new(&dir);
+        st.save(&Config::default()).unwrap();
+        let dm = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let fm = std::fs::metadata(dir.join("client.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dm, 0o700, "каталог данных: {dm:o}");
+        assert_eq!(fm, 0o600, "client.json: {fm:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn старый_конфиг_получает_умолчания() {

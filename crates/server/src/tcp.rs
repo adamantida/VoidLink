@@ -69,6 +69,19 @@ pub type FrameHandler = Arc<dyn Fn(Peer, &[u8]) + Send + Sync>;
 /// Не вызывается для соединений, закрытых через `TcpSender::close` или `stop`.
 pub type CloseHandler = Arc<dyn Fn(Peer) + Send + Sync>;
 
+/// Фильтр приёма соединений: `false` — соединение закрывается сразу и в
+/// реестр не попадает. Сервер так не даёт TCP-клиенту занять адрес, который
+/// уже принадлежит живой UDP-сессии (TCP и UDP — разные пространства адресов,
+/// один `ip:port` может быть занят в обоих).
+pub type AdmitFilter = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
+/// Обработчики и фильтр приёма, общие для всех соединений.
+struct Hooks {
+    handler: FrameHandler,
+    on_close: CloseHandler,
+    filter: AdmitFilter,
+}
+
 /// Максимальный размер кадра по умолчанию (v3: payload'ы режутся FRAG по 1100 байт).
 pub const DEFAULT_MAX_FRAME: usize = 4096;
 
@@ -209,7 +222,13 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Слушать `listen`, отдавать входящие кадры в `handler`.
     pub fn start(listen: SocketAddr, handler: FrameHandler, limits: TcpLimits) -> io::Result<Self> {
-        Self::start_with_close(listen, handler, Arc::new(|_| {}), limits)
+        Self::start_filtered(
+            listen,
+            handler,
+            Arc::new(|_| {}),
+            Arc::new(|_| true),
+            limits,
+        )
     }
 
     /// Как `start`, плюс `on_close` при закрытии соединения клиентом/по простою.
@@ -217,6 +236,18 @@ impl TcpTransport {
         listen: SocketAddr,
         handler: FrameHandler,
         on_close: CloseHandler,
+        limits: TcpLimits,
+    ) -> io::Result<Self> {
+        Self::start_filtered(listen, handler, on_close, Arc::new(|_| true), limits)
+    }
+
+    /// Как `start_with_close`, плюс фильтр приёма `filter`: `false` —
+    /// соединение закрывается, не попадая в реестр.
+    pub fn start_filtered(
+        listen: SocketAddr,
+        handler: FrameHandler,
+        on_close: CloseHandler,
+        filter: AdmitFilter,
         limits: TcpLimits,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(listen)?;
@@ -236,7 +267,9 @@ impl TcpTransport {
             let stop = stop.clone();
             thread::Builder::new()
                 .name("tcp-accept".into())
-                .spawn(move || accept_loop(listener, sender, handler, on_close, limits, stop))?
+                .spawn(move || {
+                    accept_loop(listener, sender, handler, on_close, filter, limits, stop)
+                })?
         };
         Ok(TcpTransport {
             local_addr,
@@ -279,9 +312,15 @@ fn accept_loop(
     sender: TcpSender,
     handler: FrameHandler,
     on_close: CloseHandler,
+    filter: AdmitFilter,
     limits: TcpLimits,
     stop: Arc<AtomicBool>,
 ) {
+    let hooks = Hooks {
+        handler,
+        on_close,
+        filter,
+    };
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -290,7 +329,7 @@ fn accept_loop(
                     continue;
                 }
                 // Превышение лимитов и ошибки сокета — молча.
-                let _ = admit(stream, peer, &sender, &handler, &on_close, &limits);
+                let _ = admit(stream, peer, &sender, &hooks, &limits);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
             // Например, EMFILE: не крутим цикл вхолостую.
@@ -306,10 +345,15 @@ fn admit(
     stream: TcpStream,
     peer: SocketAddr,
     sender: &TcpSender,
-    handler: &FrameHandler,
-    on_close: &CloseHandler,
+    hooks: &Hooks,
     limits: &TcpLimits,
 ) -> io::Result<()> {
+    // Адрес уже занят другим транспортом (живая UDP-сессия) — соединение не
+    // принимаем: иначе кадры той сессии уходили бы в этот TCP-сокет.
+    if !(hooks.filter)(peer) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return Err(io::Error::other("адрес занят другим транспортом"));
+    }
     stream.set_nodelay(true)?;
     let tick = READ_TICK
         .min(limits.idle_timeout)
@@ -340,8 +384,8 @@ fn admit(
     }
 
     let reader_reg = reg.clone();
-    let handler = handler.clone();
-    let on_close = on_close.clone();
+    let handler = hooks.handler.clone();
+    let on_close = hooks.on_close.clone();
     let max_frame = limits.max_frame;
     let idle = limits.idle_timeout;
     let spawned = thread::Builder::new()
@@ -454,6 +498,31 @@ mod tests {
 
     fn loopback() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    #[test]
+    fn фильтр_приёма_закрывает_соединение() {
+        use std::sync::atomic::AtomicUsize;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h: FrameHandler = {
+            let hits = hits.clone();
+            Arc::new(move |_p: Peer, _f: &[u8]| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let t = TcpTransport::start_filtered(
+            loopback(),
+            h,
+            Arc::new(|_| {}),
+            Arc::new(|_| false),
+            TcpLimits::default(),
+        )
+        .unwrap();
+        let mut s = TcpStream::connect(t.local_addr()).unwrap();
+        let _ = s.write_all(&encode_frame(&[1, 2, 3]));
+        assert!(is_closed(&mut s), "соединение не закрыто фильтром");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "кадр дошёл до обработчика");
+        assert_eq!(t.sender().conn_count(), 0, "соединение попало в реестр");
     }
 
     /// Обработчик, складывающий кадры в канал.

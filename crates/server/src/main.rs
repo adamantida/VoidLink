@@ -15,6 +15,7 @@ const USAGE: &str = "\
 Использование:
   tunnel-server [адрес=0.0.0.0:5555] [флаги]
   tunnel-server rotate-key [--data <dir>]
+  tunnel-server unpeer <addr|hex ed> [--data <dir>]
 
 Флаги:
   --data <dir>              каталог состояния (server.json), по умолчанию tunnel-data
@@ -90,10 +91,45 @@ fn rotate_key(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `unpeer <addr|hex ed> [--data <dir>]`: снять TOFU-пин федерации.
+fn unpeer_cmd(args: &[String]) -> Result<()> {
+    let mut data_dir: PathBuf = tunnel_server::default_data_dir().into();
+    let mut key: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                eprintln!("{USAGE}");
+                return Ok(());
+            }
+            "--data" => {
+                data_dir = value::<String>(args, i, "--data")?.into();
+                i += 1;
+            }
+            other if other.starts_with('-') => {
+                anyhow::bail!("unpeer: неизвестный аргумент {other:?}")
+            }
+            other => key = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let key = key.context("unpeer: нужен адрес пира или hex его ed25519-ключа")?;
+    let removed = tunnel_server::unpeer(&data_dir, &key)?;
+    match removed {
+        0 => println!("Пин не найден: {key}"),
+        n => println!("Снято пинов: {n}"),
+    }
+    println!("Если сервер запущен — изменение вступит в силу после перезапуска.");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("rotate-key") {
         return rotate_key(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("unpeer") {
+        return unpeer_cmd(&args[1..]);
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!("{USAGE}");
