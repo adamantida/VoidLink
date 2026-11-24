@@ -4764,16 +4764,30 @@ mod tests {
     }
 
     /// Просит у ядра увеличенный буфер приёма UDP: длинное сообщение сервера
-    /// (GROUP_STATE группы на 253 участника — ~215 КБ, ~175 кусков FRAG)
-    /// приходит залпом, дефолтных 64 КБ на Windows не хватает и лишние
-    /// датаграммы ядро выбрасывает — сборка не завершается никогда. Ошибка не
-    /// критична: остаётся дефолт.
+    /// (GROUP_STATE группы на 253 участника — ~205 КБ, ~180 кусков FRAG)
+    /// приходит залпом, дефолтных буферов ОС не хватает, лишние датаграммы
+    /// ядро выбрасывает — сборка не завершается никогда. Ошибка не критична:
+    /// остаётся дефолт.
     ///
-    /// Только Windows: на Linux (`net.core.rmem_default`) и macOS дефолт уже
-    /// ≥ 128 КБ, тест там исторически зелёный, а `libc` в этом крейте нет —
-    /// лишнюю зависимость ради одного теста не тянем.
+    /// Раньше стояло «на Linux дефолта хватает, тест там зелёный» — это
+    /// неверно: при `net.core.rmem_default = 212992` залп на ~205 КБ теряется,
+    /// и тест детерминированно падал на Linux 6.17 (аудит 2026-11, CORE-11).
     #[cfg(unix)]
-    fn set_recv_buffer(_sock: &UdpSocket, _bytes: usize) {}
+    fn set_recv_buffer(sock: &UdpSocket, bytes: usize) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `sock` жив всё время вызова, `len` — корректный `c_int`,
+        // размер переданного значения совпадает с `optlen`.
+        unsafe {
+            let len = bytes as libc::c_int;
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const len).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 
     /// Windows-вариант: `SO_RCVBUF` через Winsock (`std` сеттера не даёт).
     #[cfg(windows)]
@@ -6565,8 +6579,11 @@ mod tests {
         // полёте помещаются в буфер приёма любой ОС (на Windows он 64 КБ),
         // иначе часть фреймов теряется на стороне получателя.
         for i in 0..N {
+            // Пауза, а не `yield_now`: busy-wait отбирал кванты у читателя и
+            // на медленных раннерах бюджет выгорал целиком (аудит 2026-11,
+            // CORE-12).
             while i as u64 > got.load(Ordering::Relaxed) + WINDOW && t0.elapsed() < BUDGET {
-                thread::yield_now();
+                thread::sleep(Duration::from_micros(200));
             }
             a.sock.send_to(&frame, srv).unwrap();
         }
