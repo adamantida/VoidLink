@@ -222,6 +222,7 @@ pub struct Store {
 impl Store {
     pub fn new(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
+        restrict_dir(dir);
         Self {
             path: dir.join("server.json"),
         }
@@ -269,17 +270,72 @@ impl Store {
         Some((m.modified().ok()?, m.len()))
     }
 
-    /// Атомарная запись: tmp + rename.
+    /// Атомарная запись: tmp + rename. Права — только владельцу (Unix),
+    /// независимо от umask процесса: в файле лежат seed'ы сервера и ключи
+    /// всех групп, и при запуске вне юнита (без `UMask=0077`) он оказывался
+    /// читаемым всей машиной.
     pub fn save(&self, data: &Persisted) -> std::io::Result<()> {
         let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(data)?;
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
             f.write_all(&json)?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        restrict_file(&self.path);
         Ok(())
+    }
+}
+
+/// Каталог данных — только владельцу (Unix). На Windows каталог закрывает
+/// `winsvc::acl::secure_data_dir`.
+#[cfg(unix)]
+fn restrict_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_dir: &Path) {}
+
+/// `server.json` — только владельцу (Unix).
+#[cfg(unix)]
+fn restrict_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn server_json_и_каталог_только_для_владельца() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vl-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = Store::new(&dir);
+        st.save(&Persisted::default()).unwrap();
+        let dm = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let fm = std::fs::metadata(dir.join("server.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dm, 0o700, "каталог данных: {dm:o}");
+        assert_eq!(fm, 0o600, "server.json: {fm:o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

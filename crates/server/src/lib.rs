@@ -405,16 +405,32 @@ impl Server {
         let tcp = if cfg.tcp {
             let on_frame: tcp::FrameHandler = {
                 let sh = shared.clone();
-                Arc::new(move |peer, frame| handle_datagram(&sh, peer.addr(), frame))
+                Arc::new(move |peer, frame| {
+                    handle_datagram(&sh, peer.addr(), Transport::Tcp, frame)
+                })
             };
             let on_close: tcp::CloseHandler = {
                 let sh = shared.clone();
-                Arc::new(move |peer| drop_session_at(&sh, peer.addr()))
+                Arc::new(move |peer| drop_session_at(&sh, peer.addr(), Transport::Tcp))
             };
-            match tcp::TcpTransport::start_with_close(
+            // TCP-клиент не занимает адрес живой UDP-сессии: иначе сервер
+            // отправлял бы кадры той сессии (включая ключи групп) в это
+            // TCP-соединение. Симметрично UDP-HELLO3 не принимается, если по
+            // адресу уже есть живое TCP-соединение (см. handle_hello3).
+            let filter: tcp::AdmitFilter = {
+                let sh = shared.clone();
+                Arc::new(move |addr: SocketAddr| {
+                    let s = sh.state.read().unwrap();
+                    !s.sessions
+                        .get(&addr)
+                        .is_some_and(|ses| ses.transport == Transport::Udp)
+                })
+            };
+            match tcp::TcpTransport::start_filtered(
                 addr,
                 on_frame,
                 on_close,
+                filter,
                 tcp::TcpLimits::default(),
             ) {
                 Ok(t) => {
@@ -628,8 +644,20 @@ fn ip_take(
         .take(rate, burst)
 }
 
+/// Транспорт, по которому пришла сессия. Один и тот же ip:port может
+/// одновременно быть UDP-клиентом и TCP-соединением (разные пространства
+/// адресов), поэтому сессия помнит свой транспорт, а кадры чужого транспорта
+/// её не обслуживают.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Transport {
+    Udp,
+    Tcp,
+}
+
 struct Session {
     ed_pub: [u8; 32],
+    /// Транспорт, по которому пришла сессия (см. Transport).
+    transport: Transport,
     /// Эфемерный ключ клиента этой попытки: повтор HELLO3 с ним же с того же
     /// адреса — потерянный WELCOME, а не новое подключение.
     eph_pub: [u8; 32],
@@ -1070,10 +1098,18 @@ fn refresh_gauges(sh: &Shared) {
 }
 
 /// TCP-соединение закрылось: его сессия — офлайн сразу, не по таймауту.
-fn drop_session_at(sh: &Shared, addr: SocketAddr) {
+fn drop_session_at(sh: &Shared, addr: SocketAddr, via: Transport) {
     let mut out = Outbox::new();
     {
         let mut s = sh.state.write().unwrap();
+        // Снимаем только сессию своего транспорта: закрытие TCP-соединения не
+        // должно убивать живую UDP-сессию с тем же ip:port.
+        if s.sessions
+            .get(&addr)
+            .is_some_and(|ses| ses.transport != via)
+        {
+            return;
+        }
         let Some(ses) = s.remove_session(&addr) else {
             return;
         };
@@ -2072,17 +2108,17 @@ fn worker(sh: Arc<Shared>) {
                 continue;
             }
         };
-        handle_datagram(&sh, src, &buf[..n]);
+        handle_datagram(&sh, src, Transport::Udp, &buf[..n]);
     }
 }
 
-fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
+fn handle_datagram(sh: &Shared, src: SocketAddr, via: Transport, datagram: &[u8]) {
     let Ok((typ, body)) = proto::split_frame(datagram) else {
         sh.drop_frame();
         return;
     };
     if proto::grp::is_group(typ) {
-        relay_group(sh, src, datagram);
+        relay_group(sh, src, via, datagram);
     } else if typ == ctrl::PROBE_REQ {
         // Проба доступности: открытым текстом, без сессии и рукопожатия,
         // ответ не длиннее запроса (§3.7).
@@ -2102,7 +2138,7 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
                 None => sh.drop_frame(),
             }
         } else {
-            handle_hello3(sh, src, body);
+            handle_hello3(sh, src, via, body);
         }
     } else if proto::mesh::is_mesh(typ) {
         // Mesh-кадры — пир ↔ пир: серверу они не адресованы (пир не
@@ -2121,7 +2157,7 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         // мусор.
         sh.drop_frame();
     } else {
-        handle_ctrl_frame(sh, src, typ, body);
+        handle_ctrl_frame(sh, src, via, typ, body);
     }
 }
 
@@ -2135,7 +2171,7 @@ fn send_reset(sh: &Shared, src: SocketAddr) {
 
 // ---------- relay ----------
 
-fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
+fn relay_group(sh: &Shared, src: SocketAddr, via: Transport, datagram: &[u8]) {
     let Ok((_, h)) = proto::parse_group_header(datagram) else {
         sh.drop_frame();
         return;
@@ -2149,6 +2185,12 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
             send_reset(sh, src);
             return;
         };
+        // Адрес принадлежит сессии другого транспорта — это не наш клиент.
+        if ses.transport != via {
+            drop(s);
+            sh.drop_frame();
+            return;
+        }
         ses.last_seen.store(sh.now_ms(), Ordering::Relaxed);
         let Some(g) = s.groups.get(&h.gid) else {
             return;
@@ -3010,33 +3052,10 @@ fn join_fed(
             anyhow::ensure!(!g.full(), "группа заполнена");
         }
         let ip = s.ip_for(*me).context("нет свободных адресов на сервере")?;
-        let (own, origin, owner, rev) = {
+        let (own, owner, rev) = {
             let g = &s.groups[&gid];
-            (g.fed_origin.is_none(), g.fed_origin, g.owner, g.rev)
+            (g.fed_origin.is_none(), g.owner, g.rev)
         };
-        {
-            let g = s.groups.get_mut(&gid).unwrap();
-            g.insert_member(
-                *me,
-                Member {
-                    ip,
-                    name: uname.clone(),
-                    status: ustatus.clone(),
-                },
-            );
-            if own {
-                // Владелец здесь: вход — как JOIN_GROUP (ротация ключа).
-                g.rotate(false);
-                g.bump();
-            }
-        }
-        if own {
-            s.fed_dirty.insert(gid);
-        } else if origin.is_some() {
-            // Копия: вход подтверждает владелец — заявка ему (он ротирует
-            // ключ и пришлёт дельту).
-            federation::request_join(sh, uuid, &owner, *me, ip, rev, out);
-        }
         // Адрес вошедшего — в общий пул: пиры должны знать, где он живёт
         // (иначе релей до него не найдёт сервер).
         let claim = proto::federation::FedAddrClaim {
@@ -3046,13 +3065,46 @@ fn join_fed(
             ts_ms: unix_ms(),
         };
         federation::publish_claims(sh, &[claim], out);
-        sh.log(format!(
-            "join_fed: {} → {} \"{}\" as {}",
-            uname,
-            hex(uuid),
-            s.groups[&gid].name,
-            ip_str(ip)
-        ));
+        if own {
+            // Свой сервер владеет группой: вход — как JOIN_GROUP (ротация).
+            {
+                let g = s.groups.get_mut(&gid).unwrap();
+                g.insert_member(
+                    *me,
+                    Member {
+                        ip,
+                        name: uname.clone(),
+                        status: ustatus.clone(),
+                    },
+                );
+                g.rotate(false);
+                g.bump();
+            }
+            s.fed_dirty.insert(gid);
+            sh.log(format!(
+                "join_fed: {} → {} \"{}\" as {}",
+                uname,
+                hex(uuid),
+                s.groups[&gid].name,
+                ip_str(ip)
+            ));
+        } else {
+            // Копия: членство и ключ даёт владелец. Оптимистичной вставки нет:
+            // иначе забаненный на владельце получал бы GROUP_STATE с ключом
+            // эпохи, а отказ владельца (баны не реплицируются) никто бы не
+            // снял — участник-фантом остался бы в группе навсегда.
+            federation::request_join(sh, uuid, &owner, *me, ip, rev, out);
+            sh.log(format!(
+                "join_fed: {} → {} \"{}\" — ждём подтверждения владельца",
+                uname,
+                hex(uuid),
+                s.groups[&gid].name
+            ));
+            // Клиенту — только список групп: состояния (и ключа) ещё нет.
+            push_group_list(s, src, &s.sessions[&src], out);
+            sh.list_dirty.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
     }
     push_group_state(s, &s.groups[&gid], src, &s.sessions[&src], out);
     push_group_list(s, src, &s.sessions[&src], out);
@@ -3392,7 +3444,15 @@ fn admin_info(s: &State, g: &Group) -> AdminInfo {
 /// HELLO3 (раздел 2): версия → cookie → подпись → сессия. Ответ без
 /// верного cookie — только маленький CHALLENGE; неверная подпись, мусор и
 /// ключи малого порядка отбрасываются молча.
-fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
+fn handle_hello3(sh: &Shared, src: SocketAddr, via: Transport, body: &[u8]) {
+    // Адрес занят живым TCP-соединением — UDP-клиент с тем же ip:port это не
+    // он (и наоборот: TCP-соединение не принимается на адрес UDP-сессии, см.
+    // фильтр в start_server). Иначе кадры одной сессии уходили бы чужому
+    // транспорту.
+    if via == Transport::Udp && sh.tcp.get().is_some_and(|t| t.is_live(tcp::Peer::Tcp(src))) {
+        sh.drop_frame();
+        return;
+    }
     match hs::hello_version(body) {
         None => {
             sh.drop_frame();
@@ -3492,7 +3552,14 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
         } else if s.eph_retired(&h.ed_pub, &h.eph_pub) {
             sh.drop_frame();
         } else {
-            install_session(sh, &mut s, src, &h, keys, welcome, &mut out);
+            install_session(
+                sh,
+                &mut s,
+                src,
+                &h,
+                SessionInit { keys, welcome, via },
+                &mut out,
+            );
         }
     }
     sh.dirty.store(true, Ordering::Relaxed);
@@ -3521,13 +3588,20 @@ fn push_hello_replay(sh: &Shared, src: SocketAddr, ses: &Session, out: &mut Outb
     out.push((src, ses.welcome.clone()));
 }
 
+/// Что нужно, чтобы поставить сессию: сеансовые ключи, готовый WELCOME и
+/// транспорт, по которому пришёл HELLO3.
+struct SessionInit {
+    keys: proto::DirKeys,
+    welcome: Vec<u8>,
+    via: Transport,
+}
+
 fn install_session(
     sh: &Shared,
     s: &mut State,
     src: SocketAddr,
     h: &Hello3,
-    keys: proto::DirKeys,
-    welcome: Vec<u8>,
+    init: SessionInit,
     out: &mut Outbox,
 ) {
     let ed = h.ed_pub;
@@ -3568,11 +3642,12 @@ fn install_session(
         src,
         Session {
             ed_pub: ed,
+            transport: init.via,
             eph_pub: h.eph_pub,
             name: name.clone(),
             status: status.clone(),
-            keys,
-            welcome: welcome.clone(),
+            keys: init.keys,
+            welcome: init.welcome.clone(),
             welcome_at: AtomicU64::new(sh.now_ms()),
             tx: AtomicU64::new(0),
             msg_id: AtomicU32::new(0),
@@ -3594,7 +3669,7 @@ fn install_session(
     s.leases.touch(&ed, unix_ms());
     let inv = if h.invisible() { ", invisible" } else { "" };
     sh.log(format!("online: {name} ({}) @ {src}{inv}", short(&ed)));
-    out.push((src, welcome));
+    out.push((src, init.welcome));
     // HELLO участника — ротация ключа всех его групп (клиент ключи не
     // хранит). Ему — GROUP_STATE целиком, остальным — дельта kind 1.
     for gid in s.groups_of(&ed) {
@@ -3692,7 +3767,7 @@ fn is_urgent(typ: u8) -> bool {
     )
 }
 
-fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
+fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, via: Transport, typ: u8, body: &[u8]) {
     metrics::Metrics::inc(&sh.metrics.ctrl_frames, 1);
     // Быстрый путь — под блокировкой на чтение: сессия, окно повторов,
     // расшифровка, лимит.
@@ -3704,6 +3779,13 @@ fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
             send_reset(sh, src);
             return;
         };
+        // Адрес принадлежит сессии другого транспорта (TCP и UDP — разные
+        // пространства адресов): это не наш клиент, RESET не шлём.
+        if ses.transport != via {
+            drop(s);
+            sh.drop_frame();
+            return;
+        }
         // Дешёвая предпроверка до AEAD: явный повтор или слишком старый.
         if !proto::ctrl_counter(body).is_some_and(|c| ses.rx.lock().unwrap().check(c)) {
             sh.drop_frame();
@@ -6219,6 +6301,7 @@ mod tests {
                     addr,
                     Session {
                         ed_pub: pk,
+                        transport: Transport::Udp,
                         eph_pub: [0; 32],
                         name: long_text('n'),
                         status: long_text('s'),
@@ -7823,8 +7906,38 @@ mod tests {
         assert_eq!(item.gid, local_gid);
         assert_eq!(item.members, 1);
 
-        // JOIN_FED → локальный gid и обычный GROUP_STATE.
+        // JOIN_FED на копии: только заявка владельцу. Членства и ключа до его
+        // согласия нет — баны не реплицируются, иначе забаненный получал бы
+        // ключ эпохи, а отказ владельца никто бы не снял.
         c.send(ctrl::JOIN_FED, &uuid);
+        let (_, list_payload) = c.until(ctrl::GROUP_LIST);
+        let list = payloads::dec_group_list(&list_payload).unwrap();
+        assert!(
+            list.iter().any(|g| g.gid == local_gid),
+            "нет в GROUP_LIST: {list:?}"
+        );
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(
+                !s.groups[&local_gid].members.contains_key(&c.pk),
+                "участник добавлен до согласия владельца"
+            );
+        }
+        // Владелец подтвердил вход: дельта с новым участником.
+        fed_apply_delta(
+            &server.shared,
+            &proto::federation::FedGroupDelta {
+                uuid,
+                owner: remote_owner,
+                rev: 8,
+                base_rev: 7,
+                changes: vec![proto::federation::FedChange::MemberAdd {
+                    pk: c.pk,
+                    ip: ovl(9, 10),
+                }],
+            },
+            &[0xAA; 32],
+        );
         let st = c.state();
         assert_eq!(st.gid, local_gid);
         assert_eq!(st.owner, remote_owner);
@@ -7833,13 +7946,6 @@ mod tests {
             st.members.iter().any(|m| m.pubkey == c.pk && m.ip != 0),
             "вошедший не в составе: {:?}",
             st.members
-        );
-        // Группа появилась в списке клиента.
-        c.send(ctrl::LIST_GROUPS, &[]);
-        let list = payloads::dec_group_list(&c.expect(ctrl::GROUP_LIST)).unwrap();
-        assert!(
-            list.iter().any(|g| g.gid == local_gid),
-            "нет в GROUP_LIST: {list:?}"
         );
 
         // Приватная копия: вход без приглашения — ошибка.
@@ -7862,6 +7968,55 @@ mod tests {
         d.send(ctrl::JOIN_FED, &priv_uuid);
         let e = d.error();
         assert!(e.contains("приватная"), "{e}");
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn закрытие_tcp_не_снимает_udp_сессию() {
+        let (server, dir) = test_server("transport-drop");
+        let a = Raw::connect(server.addr, "alpha");
+        a.sync();
+        let addr = a.sock.local_addr().unwrap();
+        // Закрытие TCP-соединения с того же ip:port не должно убивать UDP-сессию.
+        drop_session_at(&server.shared, addr, Transport::Tcp);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(
+                s.sessions.contains_key(&addr),
+                "UDP-сессия снята закрытием TCP-соединения"
+            );
+        }
+        // Свой транспорт снимает.
+        drop_session_at(&server.shared, addr, Transport::Udp);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(!s.sessions.contains_key(&addr));
+        }
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn кадр_чужого_транспорта_не_обслуживает_сессию() {
+        let (server, dir) = test_server("transport-mismatch");
+        let a = Raw::connect(server.addr, "alpha");
+        a.sync();
+        let addr = a.sock.local_addr().unwrap();
+        // Свежий счётчик, но чужие ключи: под своим транспортом сервер
+        // ответит RESET, под чужим — молча отбросит (это не наш клиент).
+        let bad = proto::seal_ctrl(&[9u8; 32], 5, ctrl::LIST_GROUPS, &[]);
+        // RESET — открытый кадр: drain() его пропускает, читаем напрямую.
+        handle_datagram(&server.shared, addr, Transport::Tcp, &bad);
+        assert!(
+            recv_plain(&a.sock, ctrl::RESET, Duration::from_millis(250)).is_none(),
+            "кадр чужого транспорта обслужен как кадр UDP-сессии"
+        );
+        handle_datagram(&server.shared, addr, Transport::Udp, &bad);
+        assert!(
+            recv_plain(&a.sock, ctrl::RESET, Duration::from_millis(500)).is_some(),
+            "свой транспорт не получил RESET на нерасшифровываемый кадр"
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
