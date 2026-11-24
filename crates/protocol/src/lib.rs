@@ -27,7 +27,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::Rng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -283,7 +283,9 @@ impl Identity {
 
     pub fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<()> {
         let vk = VerifyingKey::from_bytes(pubkey)?;
-        vk.verify(msg, &ed25519_dalek::Signature::from_bytes(sig))
+        // verify_strict: отвергает немаллеабельные и неканонические подписи
+        // (аудит 2026-11, SEC-05). Обычный verify() их принимает.
+        vk.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(sig))
             .map_err(|_| anyhow!("bad signature"))
     }
 
