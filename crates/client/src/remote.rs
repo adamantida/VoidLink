@@ -839,7 +839,7 @@ mod tests {
         let text = render(&app, 140, 40);
         assert!(text.contains("игроки"), "нет группы из снимка:\n{text}");
         assert!(text.contains("демон"), "в шапке нет режима:\n{text}");
-        // Пилюля связи в шапке (docs/TUI.md §4): `● в сети`, а не «подключено».
+        // Пилюля связи в шапке (docs/CLIENT.md, раздел TUI): `● в сети`, а не «подключено».
         assert!(text.contains("● в сети"), "{text}");
         // Демон пропал — в шапке «демон недоступен».
         d.kill_conns();

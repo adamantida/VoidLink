@@ -40,24 +40,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Относительные ссылки
-        shell: bash
-        run: |
-          set -euo pipefail
-          fail=0
-          for f in README.md docs/*.md; do
-            dir=$(dirname "$f")
-            while IFS= read -r target; do
-              case "$target" in
-                http*|mailto:*|"") continue ;;
-              esac
-              if [ ! -f "$dir/$target" ]; then
-                echo "битая ссылка: $f -> $target"
-                fail=1
-              fi
-            done < <(grep -oE '\]\([^)]+\.md(#[^)]*)?\)' "$f" | sed -E 's/^\]\(//; s/\)$//; s/#.*$//' || true)
-          done
-          exit "$fail"
+      - name: Относительные ссылки и якоря
+        run: node .github/scripts/check-docs-links.mjs
 
   # Весь workspace на Linux: клиент (движок, TUI, CLI) кроссплатформенный,
   # tray и winsvc на не-Windows собираются заглушками (их тесты проверяют

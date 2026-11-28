@@ -3,7 +3,7 @@
 # veth + nftables) для проверки пробития NAT, релея и фолбэков VoidLink.
 #
 # Запуск: Linux, root (или CAP_NET_ADMIN), iproute2, nftables, ping, ss.
-# Подходит для CI-раннера (ubuntu) или одноразовой ВМ. См. docs/TESTING.md.
+# Подходит для CI-раннера (ubuntu) или одноразовой ВМ. См. docs/DEVELOPMENT.md.
 #
 #   sudo ./nat-lab.sh run <сценарий>     поднять сеть, сервер, клиентов, проверить, снести
 #   sudo ./nat-lab.sh up <сценарий>      только сеть
