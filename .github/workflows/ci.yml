@@ -33,6 +33,32 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+  # Относительные ссылки в README и docs/. Внешние ссылки не проверяются:
+  # нужна только навигация внутри репозитория, сеть не требуется.
+  docs-links:
+    name: docs · links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Относительные ссылки
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in README.md docs/*.md; do
+            dir=$(dirname "$f")
+            while IFS= read -r target; do
+              case "$target" in
+                http*|mailto:*|"") continue ;;
+              esac
+              if [ ! -f "$dir/$target" ]; then
+                echo "битая ссылка: $f -> $target"
+                fail=1
+              fi
+            done < <(grep -oE '\]\([^)]+\.md(#[^)]*)?\)' "$f" | sed -E 's/^\]\(//; s/\)$//; s/#.*$//' || true)
+          done
+          exit "$fail"
+
   # Весь workspace на Linux: клиент (движок, TUI, CLI) кроссплатформенный,
   # tray и winsvc на не-Windows собираются заглушками (их тесты проверяют
   # именно заглушки и чистую часть: пути, SDDL, скрипты).

@@ -12,9 +12,9 @@ Production-код не менялся; в ветке — только этот �
 > **Исторический документ.** Это отчёт приёмки этапа 9 на коммите `bcbf457`
 > (2026-11-20). Хэши коммитов, счёт тестов и ссылки `file:line` — снимок на дату
 > приёмки; текущее состояние сверяйте с кодом и с `docs/PLAN.md`,
-> `docs/TESTING.md`, `docs/CHANGELOG.md`. **Актуальный счёт тестов — 702 на
-> Windows и 741 на Linux** (`docs/CHANGELOG.md:78`, `docs/PLAN.md:1025`,
-> `docs/TESTING.md:26`); число `565` ниже — значение на момент приёмки, а не
+> `docs/TESTING.md`, `docs/CHANGELOG.md`. **Актуальный счёт тестов — 712 на
+> Windows и 751 на Linux** (см. §1 [TESTING.md](TESTING.md) и раздел
+> Unreleased в [CHANGELOG.md](CHANGELOG.md)); число `565` ниже — значение на момент приёмки, а не
 > текущее. Документ не переписывается: правки в него вносятся только как
 > пометки.
 
@@ -49,7 +49,7 @@ Production-код не менялся; в ветке — только этот �
 |---|---|---|---|
 | 1 | `cargo fmt --all -- --check` | **PASS**, exit 0 | без вывода |
 | 2 | `cargo clippy --workspace --all-targets -- -D warnings` | **PASS**, exit 0 | `Finished dev profile … in 43.24s`, предупреждений нет |
-| 3 | `cargo test --workspace -- --test-threads=1` | **PASS**, exit 0 | 565 тестов на Windows, 0 failed, 0 ignored — снимок `bcbf457`; актуально 702/741 (см. §1.1) |
+| 3 | `cargo test --workspace -- --test-threads=1` | **PASS**, exit 0 | 565 тестов на Windows, 0 failed, 0 ignored — снимок `bcbf457`; актуально 712/751 (см. §1.1) |
 | 4 | `cargo deny check` | **не выполнен**: `error: no such command: deny` (не установлен) | CI-джоба `deny` (`EmbarkStudios/cargo-deny-action@v2`, `deny.toml` не менялся с базы) |
 | 5 | `cargo audit` | **не выполнен**: `error: no such command: audit` (не установлен) | CI-джоба `audit` (`rustsec/audit-check@v2`) |
 
@@ -59,10 +59,9 @@ Production-код не менялся; в ветке — только этот �
 cargo test --workspace -- --list | grep -c ": test$"   → 565
 ```
 
-> Снимок на `bcbf457`. Актуальный счёт после приёмки — **702** на Windows и
-> **741** на Linux (`docs/CHANGELOG.md:78`, `docs/PLAN.md:1025`,
-> `docs/TESTING.md:26`); разница — тесты, добавленные после этапа 9. Таблица
-> ниже историческая и в сумме даёт 565.
+> Снимок на `bcbf457`. Актуальный счёт после приёмки — **712** на Windows и
+> **751** на Linux (см. баннер и §1 [TESTING.md](TESTING.md)); разница — тесты,
+> добавленные после этапа 9. Таблица ниже историческая и в сумме даёт 565.
 
 | Крейт | Тестов (Windows, `--all-targets --list`) |
 |---|---|
@@ -536,7 +535,7 @@ codegraph node "start_probe"       # Called by ← do_cmd / probe_local
 | B1–B8 (документация) | **исправлено** T8a | `f52c533`, merge `01bd7af`: PROTOCOL §12 под T4c, PLAN/TESTING/README/SERVER/SECURITY/TUI/CLIENT/NETWORKING/ARCHITECTURE/CHANGELOG/GLOSSARY синхронизированы с кодом |
 | Q1 (фаззинг федеративных декодеров) | **исправлено** T8b | `ea5596c`, merge `6290424`: `SRV_HELLO/ACK`, `FED_GROUP_PUSH/DELTA`, `FED_ADDR_PUSH/REVOKE`, `FED_RELAY/ACK/NACK` в `fuzz_tests.rs` |
 | Гейты на финальном `dev` | **PASS** | `01bd7af`: `fmt` 0, `clippy -D warnings` 0, `cargo test --workspace -- --test-threads=1` — 565 passed, 0 failed |
-| Счёт тестов | 565 на Windows — снимок на приёмку | на дату отчёта совпадал в README, TESTING, PLAN, CHANGELOG; **актуально 702 (Windows) / 741 (Linux)** |
+| Счёт тестов | 565 на Windows — снимок на приёмку | на дату отчёта совпадал в README, TESTING, PLAN, CHANGELOG; **актуально 712 (Windows) / 751 (Linux)** |
 
 Финальное состояние: `dev` = `c39d8d6` (после `01bd7af` — только правка вердикта в этом отчёте);
 код, приёмка и документация — **PASS**.
