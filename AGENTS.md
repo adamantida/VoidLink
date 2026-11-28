@@ -3,9 +3,10 @@
 
 In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
 
+- **Tool / MCP** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim, line-numbered source plus the call paths between them, including dynamic-dispatch hops grep cannot follow. Name a file or symbol in the query. If it is listed but deferred, load it by name via tool search.
 - **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
 
-If there is no `.codegraph/` directory, init the graph, and use
+No `.codegraph/` in this checkout (fresh clone, git worktree)? The index is per-checkout: run `codegraph init --yes` (≈6 s) — never fall back to grep on that account. Before searching after any edit, run `codegraph sync` (≈1 s); `codegraph status --strict` exits 1 while the index is stale.
 <!-- CODEGRAPH_END -->
 
 ## Проектные скиллы
@@ -15,5 +16,11 @@ If there is no `.codegraph/` directory, init the graph, and use
 
 - `voidlink-protocol` — изменение проводного формата: protocol → server → client → фаззинг → `PROTOCOL.md`;
 - `voidlink-testing` — гейты `fmt`/`clippy`/`test`, счёт для бейджа, e2e, NAT-лаборатория, ограничения Windows;
-- `voidlink-docs` — синхронизация 20 документов и инварианты (счёт тестов, версия протокола, лимиты);
+- `voidlink-docs` — синхронизация документации и инварианты (счёт тестов, версия протокола, лимиты);
 - `voidlink-windows` — служба `TunnelDaemon`, пайп и SDDL, Wintun, трей, ACL, MSI.
+
+## Память
+
+Проектная память ведётся в Hindsight (инструменты `hindsight_*`: страницы проекта,
+поиск, рефлексия, ingest документов). MCP-заметок basic-memory (`mcp__notes__*`)
+больше нет — не ищите и не пишите в них.
