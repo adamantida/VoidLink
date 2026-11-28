@@ -150,7 +150,7 @@ sudo ./target/release/tunnel-client --dir "$HOME/.tunnel-client" tui
 
 Туннелю нужны права root (на Linux достаточно `CAP_NET_ADMIN`); адаптер —
 `voidlink0` на Linux и `utunN` на macOS. Демон `tunnel-daemon console` на этих
-ОС — режим для разработки, см. [DAEMON](docs/CLIENT.md#демон-служба-и-трей).
+ОС — режим для разработки, см. [Демон и служба](docs/CLIENT.md#демон-служба-и-трей).
 
 ### 4. Проверка
 
@@ -159,7 +159,7 @@ ping 100.66.<a>.<b>       # по адресу
 ping bravo.vl            # по имени участника
 ```
 
-Подробно, включая удаление и обновление: [INSTALL](docs/CLIENT.md#установка).
+Подробно, включая удаление и обновление: [Установка](docs/CLIENT.md#установка).
 
 ## 🛡️ Безопасность
 
@@ -204,7 +204,7 @@ Workspace на Rust 2024, семь крейтов:
 | [`winsvc`](crates/winsvc) | Служба Windows: SCM, установка, ACL, удаление |
 | [`tray`](crates/tray) | `tunnel-tray`: значок, меню групп и приглашений, уведомления |
 
-Как устроены потоки, состояние и путь пакета — [ARCHITECTURE](docs/DEVELOPMENT.md#архитектура),
+Как устроены потоки, состояние и путь пакета — [Архитектура](docs/DEVELOPMENT.md#архитектура),
 проводной формат — [PROTOCOL](docs/PROTOCOL.md).
 
 ## ⌨️ Шпаргалка CLI
@@ -239,7 +239,7 @@ tunnel-server rotate-key [--data <dir>]
 tunnel-daemon console | service | install | uninstall [--purge]
 ```
 
-Подробно: [SERVER](docs/SERVER.md), [DAEMON](docs/CLIENT.md#демон-служба-и-трей).
+Подробно: [SERVER](docs/SERVER.md), [Демон и служба](docs/CLIENT.md#демон-служба-и-трей).
 </details>
 
 ## 📚 Документация
