@@ -11,7 +11,7 @@ No `.codegraph/` in this checkout (fresh clone, git worktree)? The index is per-
 
 ## Проектные скиллы
 
-В репозитории лежат скиллы этого проекта — `.dsh/skills/`; они подхватываются
+В репозитории лежит скилл этого проекта — `.dsh/skills/`; он подхватывается
 автоматически, когда задача совпадает по описанию:
 
 - `voidlink-windows` — служба `TunnelDaemon`, пайп и SDDL, Wintun, трей, ACL, MSI.
