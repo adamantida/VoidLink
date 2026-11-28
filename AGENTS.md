@@ -14,10 +14,10 @@ No `.codegraph/` in this checkout (fresh clone, git worktree)? The index is per-
 В репозитории лежат скиллы этого проекта — `.dsh/skills/`; они подхватываются
 автоматически, когда задача совпадает по описанию:
 
-- `voidlink-protocol` — изменение проводного формата: protocol → server → client → фаззинг → `PROTOCOL.md`;
-- `voidlink-testing` — гейты `fmt`/`clippy`/`test`, счёт для бейджа, e2e, NAT-лаборатория, ограничения Windows;
-- `voidlink-docs` — синхронизация документации и инварианты (счёт тестов, версия протокола, лимиты);
 - `voidlink-windows` — служба `TunnelDaemon`, пайп и SDDL, Wintun, трей, ACL, MSI.
+
+Маршруты изменений протокола, тестовые гейты и синхронизация документации
+описаны в `docs/DEVELOPMENT.md` (§11, «Тестирование», «Документация»).
 
 ## Память
 
