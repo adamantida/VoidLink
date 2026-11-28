@@ -276,7 +276,7 @@ tunnel-daemon console | service | install | uninstall [--purge]
 поверх демона, DNS и IPv6, TCP-фолбэк, метрики сервера. Этап 9: mesh/DHT,
 релей через участников (L2), федерация серверов (L3), проба доступности,
 офлайн-TUI, выбор и закрепление пути — всё в `master`, приёмка —
-[STAGE9_VERIFICATION.md](docs/archive/STAGE9_VERIFICATION.md).
+[STAGE9 (архив)](docs/archive/STAGE9_VERIFICATION.md).
 
 **В работе:** MSI-установщик, кнопки «Принять/Отклонить» в уведомлениях
 Windows. Полный план — [PLAN](docs/archive/PLAN.md), §9.
