@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/adamantida/VoidLink/security/policy
     about: Не открывайте публичный issue — напишите мейнтейнеру напрямую (SECURITY.md).
   - name: 📚 Документация и FAQ
-    url: https://github.com/adamantida/VoidLink/tree/master/docs
+    url: https://github.com/adamantida/VoidLink/blob/master/README.md#-документация
     about: Возможно, ответ уже есть — FAQ, решение проблем, сеть и NAT.

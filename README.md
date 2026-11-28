@@ -98,7 +98,7 @@
 
 Мышь, поиск, командная строка `:`, окна приглашений, экраны «Управление
 группой» и «Серверы», пять тем (тёмная, светлая, контрастная, янтарная, фьорд),
-горячие клавиши работают и в русской раскладке. Подробно — [TUI](docs/TUI.md).
+горячие клавиши работают и в русской раскладке. Подробно — [TUI](docs/CLIENT.md#tui).
 Колонка «путь» (direct / server / peer), офлайн-режим и федерация — этап 9
 (T2/T5).
 
@@ -150,7 +150,7 @@ sudo ./target/release/tunnel-client --dir "$HOME/.tunnel-client" tui
 
 Туннелю нужны права root (на Linux достаточно `CAP_NET_ADMIN`); адаптер —
 `voidlink0` на Linux и `utunN` на macOS. Демон `tunnel-daemon console` на этих
-ОС — режим для разработки, см. [DAEMON](docs/DAEMON.md).
+ОС — режим для разработки, см. [DAEMON](docs/CLIENT.md#демон-служба-и-трей).
 
 ### 4. Проверка
 
@@ -159,7 +159,7 @@ ping 100.66.<a>.<b>       # по адресу
 ping bravo.vl            # по имени участника
 ```
 
-Подробно, включая удаление и обновление: [INSTALL](docs/INSTALL.md).
+Подробно, включая удаление и обновление: [INSTALL](docs/CLIENT.md#установка).
 
 ## 🛡️ Безопасность
 
@@ -204,7 +204,7 @@ Workspace на Rust 2024, семь крейтов:
 | [`winsvc`](crates/winsvc) | Служба Windows: SCM, установка, ACL, удаление |
 | [`tray`](crates/tray) | `tunnel-tray`: значок, меню групп и приглашений, уведомления |
 
-Как устроены потоки, состояние и путь пакета — [ARCHITECTURE](docs/ARCHITECTURE.md),
+Как устроены потоки, состояние и путь пакета — [ARCHITECTURE](docs/DEVELOPMENT.md#архитектура),
 проводной формат — [PROTOCOL](docs/PROTOCOL.md).
 
 ## ⌨️ Шпаргалка CLI
@@ -239,21 +239,26 @@ tunnel-server rotate-key [--data <dir>]
 tunnel-daemon console | service | install | uninstall [--purge]
 ```
 
-Подробно: [SERVER](docs/SERVER.md), [DAEMON](docs/DAEMON.md).
+Подробно: [SERVER](docs/SERVER.md), [DAEMON](docs/CLIENT.md#демон-служба-и-трей).
 </details>
 
 ## 📚 Документация
 
-| Пользователям | Администраторам | Разработчикам |
-|---|---|---|
-| [Установка](docs/INSTALL.md) | [Сервер](docs/SERVER.md) | [Архитектура](docs/ARCHITECTURE.md) |
-| [Клиент и CLI](docs/CLIENT.md) | [Конфигурация](docs/CONFIG.md) | [Протокол v4+](docs/PROTOCOL.md) |
-| [TUI](docs/TUI.md) | [Служба и трей](docs/DAEMON.md) | [IPC](docs/IPC.md) |
-| [FAQ](docs/FAQ.md) | [Сеть и NAT](docs/NETWORKING.md) | [Разработка](docs/DEVELOPMENT.md) |
-| [Решение проблем](docs/TROUBLESHOOTING.md) | [Безопасность](docs/SECURITY.md) | [Тестирование](docs/TESTING.md) |
-| [Глоссарий](docs/GLOSSARY.md) | [История изменений](docs/CHANGELOG.md) | [План развития](docs/PLAN.md) |
+Восемь активных документов: эта страница — карта, дальше — по аудиториям. История этапов вынесена в [docs/archive](docs/archive/README.md).
 
-Порядок чтения по ролям — [docs/README](docs/README.md).
+| Документ | Для кого | Что внутри |
+|---|---|---|
+| [SERVER.md](docs/SERVER.md) | администратор | установка, флаги, server.json, аренды, группы, федерация, метрики |
+| [CLIENT.md](docs/CLIENT.md) | пользователь | установка, первый запуск, CLI, TUI, демон и служба Windows, client.json, сеть и пути |
+| [PROTOCOL.md](docs/PROTOCOL.md) | разработчик, ревьюер | кадры, рукопожатие, ключи групп, mesh, проба, федерация, адресация и MTU |
+| [SECURITY.md](docs/SECURITY.md) | ревьюер безопасности | модель угроз, ключи, гарантии и остаточные риски |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | разработчик | архитектура, сборка, тесты, IPC, глоссарий, правила документации |
+| [FAQ.md](docs/FAQ.md) | все | частые вопросы и диагностика по симптомам |
+| [CHANGELOG.md](docs/CHANGELOG.md) | все | история изменений |
+
+Порядок чтения: пользователь — CLIENT (включая TUI) и FAQ; администратор — SERVER, SECURITY и FAQ; разработчик — DEVELOPMENT, PROTOCOL и IPC (внутри DEVELOPMENT); ревьюер — SECURITY, PROTOCOL и DEVELOPMENT.
+
+> Имена файлов оставлены заглавными: репозиторий разрабатывается на Windows с регистронезависимой файловой системой, поэтому строчные имена и заглушки на старых путях одновременно невозможны. Строчные имена из #34 — отдельная задача при переезде на регистрозависимую ФС.
 
 ## 📈 Качество
 
@@ -271,10 +276,10 @@ tunnel-daemon console | service | install | uninstall [--purge]
 поверх демона, DNS и IPv6, TCP-фолбэк, метрики сервера. Этап 9: mesh/DHT,
 релей через участников (L2), федерация серверов (L3), проба доступности,
 офлайн-TUI, выбор и закрепление пути — всё в `master`, приёмка —
-[STAGE9_VERIFICATION.md](docs/STAGE9_VERIFICATION.md).
+[STAGE9_VERIFICATION.md](docs/archive/STAGE9_VERIFICATION.md).
 
 **В работе:** MSI-установщик, кнопки «Принять/Отклонить» в уведомлениях
-Windows. Полный план — [PLAN](docs/PLAN.md), §9.
+Windows. Полный план — [PLAN](docs/archive/PLAN.md), §9.
 
 > Протокол v4 несовместим с v3: сервер и клиенты обновляются вместе. Один адрес на пользователя
 > заменил отдельные адреса по группам. Расширения этапа 9 версию не меняют:
